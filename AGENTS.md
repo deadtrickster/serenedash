@@ -60,10 +60,17 @@ one view that shows whole statements re-fetch them, only while it is open.
 
 ## Dependencies
 
-`serenedash.py` is **stdlib only**. That is the property that lets it drop onto any box with a
-python3 and run against a production server, and it is not worth trading. Only `serenedash_mcp.py`
-has a dependency (`requirements.txt`), and it imports the collectors rather than reimplementing
-them — two copies of the thread accounting would drift within a week.
+This was a single stdlib-only file for a while, and that constraint was inherited from its own
+README rather than chosen. It cost more than it bought: reaching the server meant `docker exec psql`,
+which works for exactly one deployment shape and pays a process spawn per tick.
+
+It is a normal Python package now. `psycopg` is a real dependency and every target uses it, so
+reaching the server does not branch on where the server runs. `mcp` is an extra, because someone who
+wants the TUI should not have to install an agent protocol. Filesystem and /proc access still fork by
+target — those genuinely differ.
+
+One implementation of each collector, shared by the TUI and the MCP server. Two copies of the thread
+accounting would drift within a week.
 
 `perf-snap.sh` must pass `shellcheck` and `shfmt` before it ships.
 

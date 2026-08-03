@@ -1,19 +1,27 @@
 # serenedash
 
-Live terminal dashboard for a SereneDB server. Single file, stdlib only, no dependencies.
+Live terminal dashboard for a SereneDB server, and the same collectors over MCP.
 
 ![serenedash](serenedash.png)
 
-    ./serenedash.py                 refresh every 5s
-    ./serenedash.py --once          one frame (scripts, logs)
-    ./serenedash.py --perf-dir DIR  where perf-snap.sh writes captures
+    pip install -e .              # or: pip install -e ".[mcp]" for the MCP server
+
+    serenedash                    refresh every 5s
+    serenedash --once             one frame (scripts, logs)
+    serenedash --print-config     resolved settings, and which layer each came from
+
+Configuration is layered: flag > environment > config file > default. Nothing about a particular
+deployment is compiled in — see `serenedash.toml.example` and `.envrc.example`, and `--print-config`
+when you want to know which layer won. It reaches the server with psycopg over TCP whether serened
+runs in a container here, as a process here, or on another host (`target = docker | local | remote`).
 
 Every panel has a view behind it, keyed by its own name, and every view is a toggle:
 
 `q` quit · `s` storage · `m` memory · `a` activity · `t` threads · `p` profile · `g` call graph ·
-`c` config · `h` host · `l` legend · `j`/`k` scroll
+`c` config · `h` host · `d` doctor · `l` legend · `j`/`k` scroll
 
-`l` documents every label and number on the screen. It is the place to look first.
+`l` documents every label and number on the screen; `d` checks every precondition for a full
+picture and tells you what each missing one costs you. Those two are the place to look first.
 
 ## Panels
 
@@ -33,7 +41,7 @@ sparkline is its own bar over time.
 
 ## MCP
 
-`serenedash_mcp.py` exposes the same collectors as MCP tools, so an agent can read the server's
+`serenedash-mcp` exposes the same collectors as MCP tools, so an agent can read the server's
 state instead of being shown a screenshot of it.
 
 ![asking an agent how the server is doing](serenedash-mcp.png)
@@ -44,16 +52,13 @@ than believed — "72.6 GiB of orphaned temp files" arrives with the file count,
 leaks them, the live-spill figure it is *not* to be confused with, and the command to confirm
 nothing holds them open.
 
-`serenedash.py` stays stdlib-only; only the MCP server needs the dependency:
-
-    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-    .venv/bin/python serenedash_mcp.py              # read-only
-    .venv/bin/python serenedash_mcp.py --allow-write   # also exposes set_setting
+    pip install -e ".[mcp]"
+    serenedash-mcp                 # read-only
+    serenedash-mcp --allow-write   # also exposes set_setting
 
 For Claude Code, from the directory you start it in:
 
-    claude mcp add serenedash --scope project -- \
-      /path/to/.venv/bin/python /path/to/serenedash_mcp.py
+    claude mcp add serenedash -- /path/to/.venv/bin/serenedash-mcp
 
 Tools: `status` `storage` `memory` `activity` `threads` `profile` `callgraph` `host` `config`, plus
 `set_setting` under `--allow-write`. `status` is one round trip and leads with `findings` — each

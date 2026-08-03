@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "serenedash"
+version = "0.1.0"
+description = "A live terminal dashboard for a SereneDB server, and the same collectors over MCP"
+readme = "README.md"
+# 3.12 for backslashes inside f-strings, which the renderer uses throughout;
+# tomllib (3.11) is the other floor.
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "deadtrickster" }]
+keywords = ["duckdb", "serenedb", "monitoring", "observability", "tui", "perf", "mcp"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Monitoring",
+]
+
+# psycopg for every target, so reaching the server does not branch on where it runs. tomllib is
+# stdlib from 3.11, which is why that is the floor.
+dependencies = ["psycopg[binary]>=3.1"]
+
+[project.optional-dependencies]
+# The dashboard does not import mcp; only the server entry point does. Someone who just wants the
+# TUI should not have to install an agent protocol.
+mcp = ["mcp>=2.0.0"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+serenedash = "serenedash.tui:main"
+serenedash-mcp = "serenedash.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/deadtrickster/serenedash"
+Issues = "https://github.com/deadtrickster/serenedash/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/serenedash"]
+
+[tool.ruff]
+# 100 was the single-file style; splitting into modules added `system.`/`db.` qualifiers that push
+# a lot of those lines a character or two over. 110 fits them without inviting sprawl.
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = [
+    "E741",     # `l` for a line is the clearest name in a renderer full of lines
+    "B008",     # a cache dict as a default argument is the memoisation this file uses throughout
+    "B006",     # ditto - the mutable default IS the cache, and it is documented at each site
+    "SIM108",   # ternaries do not make a branch on a rendering rule easier to read
+    "SIM105",   # contextlib.suppress reads worse than try/except pass around a subprocess call
+    "SIM115",   # the ELF reader manages its own handle deliberately, seeking as it parses
+    "B023",     # loop-variable closures inside the frame builder are evaluated within the loop
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

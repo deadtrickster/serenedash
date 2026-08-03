@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor (backslashes in f-strings). Ubuntu 24.04 ships it, which is the
+        # deployment this is most likely to land on.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[mcp,dev]"
+      - run: ruff check src tests
+      - run: pytest
+
+  # The tests above are hermetic on purpose: no server, no container, no perf. This job proves the
+  # two entry points actually start, which no unit test can - a package that imports cleanly and
+  # dies on argv is the failure mode worth catching here.
+  entrypoints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[mcp]"
+      - name: serenedash --print-config resolves without a server
+        run: |
+          serenedash --print-config
+          serenedash --help > /dev/null
+      - name: the MCP server completes a handshake and lists its tools
+        run: |
+          python - <<'PY'
+          import asyncio, sys
+          from mcp import ClientSession, StdioServerParameters, stdio_client
+
+          async def main():
+              params = StdioServerParameters(command="serenedash-mcp")
+              async with stdio_client(params) as (r, w):
+                  async with ClientSession(r, w) as s:
+                      await s.initialize()
+                      tools = sorted(t.name for t in (await s.list_tools()).tools)
+                      print("tools:", ", ".join(tools))
+                      missing = {"status", "storage", "memory", "activity", "threads",
+                                 "profile", "host", "config"} - set(tools)
+                      if missing:
+                          sys.exit(f"missing tools: {sorted(missing)}")
+          asyncio.run(main())
+          PY
+
+  # Against a real serened. The hermetic suite proves the rendering rules; this proves the
+  # statements parse against the server's dialect and the panels hold on live data - which is the
+  # half that has actually been wrong.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      serenedb:
+        image: serenedb/serenedb:26.07.4
+        env:
+          POSTGRES_PASSWORD: ci-password
+        ports:
+          - 7890:7890
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[mcp,dev]"
+
+      - name: wait for the server to accept connections
+        env:
+          PGPASSWORD: ci-password
+        run: |
+          for i in $(seq 1 60); do
+            if serenedash --print-config > /dev/null 2>&1 && python -c "
+          import sys
+          from serenedash.config import load_config
+          from serenedash.db import sql_status
+          sys.exit(1 if sql_status(load_config()[0]) else 0)"; then
+              echo "up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server never came up"; docker ps -a; exit 1
+
+      - name: integration tests
+        env:
+          PGPASSWORD: ci-password
+          SERENEDASH_IT: "1"
+          # The service container is reachable on localhost; there is no container to exec into
+          # from the runner, so the filesystem and /proc panels degrade rather than fail.
+          SERENEDB_TARGET: remote
+          SERENEDB_HOST: 127.0.0.1
+        run: pytest -v
+
+      - name: a real frame renders end to end
+        env:
+          PGPASSWORD: ci-password
+          SERENEDB_TARGET: remote
+        run: serenedash --once
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: perf-snap.sh is shipped and run under sudo, so it gets linted like it matters
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck perf-snap.sh install.sh
+          bash -n perf-snap.sh install.sh

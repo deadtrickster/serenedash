@@ -28,21 +28,24 @@ number with no defined meaning.
 Requires the `mcp` package (see requirements.txt). serenedash.py itself stays stdlib-only.
 """
 import argparse
-import os
-import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import serenedash as dash                                       # noqa: E402
-from mcp.server import MCPServer                                # noqa: E402
+import re
+
+from mcp.server import MCPServer
+
+from . import config as _config
+from . import db, perf, system
+from .fmt import human
+from .hazards import HAZARDS, kernel_of
 
 # The same four layers the dashboard resolves, from the same loader — flag, environment, config
 # file, default. An MCP server is launched by a client with an environment it did not choose, so a
 # config file is often the only layer it has; reading env vars directly (as this did) meant the
 # global config was invisible to exactly the caller most likely to depend on it.
-_CFG, _PROV = dash.load_config()
-CONTAINER, PORT, PASSWORD = _CFG["container"], _CFG["port"], _CFG["password"]
-DATA, PERF = _CFG["data"], _CFG["perf_dir"]
+CFG, _PROV = _config.load_config()
+CONTAINER, PORT, PASSWORD = CFG["container"], CFG["port"], CFG["password"]
+DATA, PERF = CFG["data"], CFG["perf_dir"]
 
 server = MCPServer(
     name="serenedash",
@@ -60,7 +63,7 @@ def _sample(query_head: int = 400):
     still move the whole statement across — 1.84 MB per call on this deployment — to throw away
     99.9% of it; `left()` in the query means it is never sent.
     """
-    s = dash.sample(CONTAINER, PORT, PASSWORD, query_head=query_head)
+    s = db.sample(CFG, query_head=query_head)
     if s is None:
         return None, {"error": f"cannot reach {CONTAINER}:{PORT}",
                       "hint": "is the container running, and is PGPASSWORD right?"}
@@ -68,7 +71,7 @@ def _sample(query_head: int = 400):
 
 
 def _pid():
-    return dash.host_pid(CONTAINER)
+    return system.host_pid(CFG)
 
 
 def _threads(window: float = 1.0):
@@ -76,9 +79,9 @@ def _threads(window: float = 1.0):
     pid = _pid()
     if not pid:
         return [], 0.0, None
-    _, _, prev, t = dash.threads(pid, {}, time.time())
+    _, _, prev, t = system.threads(pid, {}, time.time())
     time.sleep(window)
-    rows, total, _, _ = dash.threads(pid, prev, t)
+    rows, total, _, _ = system.threads(pid, prev, t)
     return rows, total, pid
 
 
@@ -105,17 +108,17 @@ def status(thread_window: float = 1.0) -> dict:
     s, err = _sample()
     if err:
         return err
-    host = dash.hostinfo(_pid(), CONTAINER)
-    sz = dash.slow(CONTAINER, DATA)
+    host = system.hostinfo(_pid(), CONTAINER)
+    sz = system.slow(CFG, DATA)
     rows, tcpu, pid = _threads(thread_window)
-    newest, tops, by_tid = dash.perf_window(PERF)
+    newest, tops, by_tid = perf.perf_window(PERF)
     orph, orph_bytes, live_spill = _temp_split(sz, host)
 
     findings = []
     if orph_bytes:
         findings.append({
             "what": "orphaned temp files",
-            "detail": f"{len(orph)} files, {dash.human(orph_bytes)}, all older than the running "
+            "detail": f"{len(orph)} files, {human(orph_bytes)}, all older than the running "
                       f"serened. DuckDB deletes temp files only in a destructor and never sweeps "
                       f"at startup, so a killed server leaks them and no later run reclaims them.",
             "bytes_reclaimable": orph_bytes,
@@ -124,8 +127,8 @@ def status(thread_window: float = 1.0) -> dict:
     if (host.get("swap") or 0) > 0:
         findings.append({
             "what": "process memory paged out",
-            "detail": f"{dash.human(host['swap'])} of serened is in swap while duckdb_memory() "
-                      f"reports {dash.human(s['mem'])} held. Every touch of that memory is a disk "
+            "detail": f"{human(host['swap'])} of serened is in swap while duckdb_memory() "
+                      f"reports {human(s['mem'])} held. Every touch of that memory is a disk "
                       f"read, and memory_limit does not count it.",
             "swap_bytes": host.get("swap"), "rss_bytes": host.get("rss"),
         })
@@ -140,12 +143,12 @@ def status(thread_window: float = 1.0) -> dict:
     if ram and lim > ram * 0.75:
         findings.append({
             "what": "memory_limit oversubscribed",
-            "detail": f"memory_limit is {lim / ram * 100:.0f}% of the machine's {dash.human(ram)} "
+            "detail": f"memory_limit is {lim / ram * 100:.0f}% of the machine's {human(ram)} "
                       f"of RAM, which anything else on the box has to fit around.",
             "memory_limit_bytes": lim, "ram_total_bytes": ram,
         })
-    for name in sorted(dash.HAZARDS):
-        why, pred = dash.HAZARDS[name]
+    for name in sorted(HAZARDS):
+        why, pred = HAZARDS[name]
         warn = pred(str(s["settings"].get(name, "?")), s) if pred else None
         if warn:
             findings.append({"what": f"setting: {name}", "detail": warn,
@@ -159,7 +162,7 @@ def status(thread_window: float = 1.0) -> dict:
         "threads": _threads_out(rows, tcpu, by_tid, host, thread_window),
         "profile": _profile(newest, tops),
         "host": _host(host, s),
-        "config": {n: s["settings"].get(n) for n in sorted(dash.HAZARDS)},
+        "config": {n: s["settings"].get(n) for n in sorted(HAZARDS)},
     }
 
 
@@ -180,7 +183,7 @@ def _storage(s, sz, host):
         "spill_live_bytes": live_spill,
         "spill_orphaned_bytes": orph_bytes,
         "spill_orphaned_files": len(orph),
-        "blocks": dict(zip(("total", "used", "free", "size_bytes"), s["blocks"])),
+        "blocks": dict(zip(("total", "used", "free", "size_bytes"), s["blocks"], strict=True)),
     }
 
 
@@ -195,7 +198,7 @@ def _memory(s, host):
         "peak_resident_bytes": host.get("peak"),
         "note": "duckdb_memory() counts what the store believes it holds; resident is what is in "
                 "RAM now. A large gap is usually swap, which memory_limit does not account for.",
-        "pools": {tag: v for tag, v in s["memtags"]},
+        "pools": dict(s["memtags"]),
     }
 
 
@@ -250,7 +253,7 @@ def _threads_out(rows, tcpu, by_tid, host, window):
 def _profile(newest, tops):
     fam = {}
     for sym, pct in tops:
-        fam[dash.kernel_of(sym)] = fam.get(dash.kernel_of(sym), 0.0) + pct
+        fam[kernel_of(sym)] = fam.get(kernel_of(sym), 0.0) + pct
     tot = sum(fam.values()) or 1
     return {
         "capture": newest,
@@ -258,9 +261,9 @@ def _profile(newest, tops):
                 "over the whole profile, not over the symbols listed here.",
         "engines": {k: round(v / tot * 100, 1) for k, v in
                     sorted(fam.items(), key=lambda kv: -kv[1])},
-        "symbols": [{"symbol": dash.re.sub(r"^\[[.k]\]\s*", "", sym),
+        "symbols": [{"symbol": re.sub(r"^\[[.k]\]\s*", "", sym),
                      "kernel": sym.startswith("[k]"),
-                     "engine": dash.kernel_of(sym), "percent": round(pct, 2)}
+                     "engine": kernel_of(sym), "percent": round(pct, 2)}
                     for sym, pct in tops[:25]],
     }
 
@@ -291,7 +294,7 @@ def storage() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _storage(s, dash.slow(CONTAINER, DATA), dash.hostinfo(_pid(), CONTAINER))
+    return _storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER))
 
 
 @server.tool()
@@ -305,7 +308,7 @@ def memory() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _memory(s, dash.hostinfo(_pid(), CONTAINER))
+    return _memory(s, system.hostinfo(_pid(), CONTAINER))
 
 
 @server.tool()
@@ -340,8 +343,8 @@ def threads(window: float = 1.0) -> dict:
     rows, tcpu, pid = _threads(window)
     if not pid:
         return {"error": f"cannot resolve the host pid for {CONTAINER}"}
-    _, _, by_tid = dash.perf_window(PERF)
-    return _threads_out(rows, tcpu, by_tid, dash.hostinfo(pid, CONTAINER), window)
+    _, _, by_tid = perf.perf_window(PERF)
+    return _threads_out(rows, tcpu, by_tid, system.hostinfo(pid, CONTAINER), window)
 
 
 @server.tool()
@@ -351,7 +354,7 @@ def profile() -> dict:
     Empty when nothing has been recorded — the dashboard cannot record for itself (perf_event_paranoid
     blocks attaching to a container process without root), so this reads what perf-snap.sh wrote.
     """
-    newest, tops, _ = dash.perf_window(PERF)
+    newest, tops, _ = perf.perf_window(PERF)
     out = _profile(newest, tops)
     if not tops:
         out["hint"] = "no captures. run: sudo ./perf-snap.sh --container " + CONTAINER
@@ -368,7 +371,7 @@ def callgraph(limit: int = 40) -> dict:
     Args:
         limit: maximum lines of the graph to return.
     """
-    name, lines = dash.callstacks(PERF, limit=limit)
+    name, lines = perf.callstacks(PERF, limit=limit)
     return {"capture": name, "lines": lines,
             **({} if lines else {"hint": "no capture with call-graph data yet"})}
 
@@ -383,7 +386,7 @@ def host() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _host(dash.hostinfo(_pid(), CONTAINER), s)
+    return _host(system.hostinfo(_pid(), CONTAINER), s)
 
 
 @server.tool()
@@ -397,7 +400,7 @@ def config(name: str = "") -> dict:
     if err:
         return err
     if name:
-        rows = dash.psql(CONTAINER, PORT, PASSWORD,
+        rows = db.query(CFG,
                          ["select name, value, coalesce(description,''), input_type, scope "
                           f"from duckdb_settings() where name = '{name}'"])
         r = (rows[0] or [[]])[0] if rows else []
@@ -405,14 +408,14 @@ def config(name: str = "") -> dict:
             return {"error": f"no such setting: {name}"}
         out = {"name": r[0], "value": r[1], "description": r[2] if len(r) > 2 else "",
                "scope": r[4] if len(r) > 4 else None}
-        if r[0] in dash.HAZARDS:
-            why, pred = dash.HAZARDS[r[0]]
+        if r[0] in HAZARDS:
+            why, pred = HAZARDS[r[0]]
             out["why_it_matters"] = why
             out["verdict"] = (pred(r[1], s) if pred else None) or "nothing wrong on this server"
         return out
     out = {}
-    for n in sorted(dash.HAZARDS):
-        why, pred = dash.HAZARDS[n]
+    for n in sorted(HAZARDS):
+        why, pred = HAZARDS[n]
         val = str(s["settings"].get(n, "?"))
         out[n] = {"value": val, "why_it_matters": why,
                   "verdict": (pred(val, s) if pred else None) or "nothing wrong on this server"}
@@ -432,7 +435,7 @@ def _install_write_tools():
             name: setting name, validated as a plain identifier.
             value: new value, sent as a quoted literal.
         """
-        ok, msg = dash.apply_setting(CONTAINER, PORT, PASSWORD, name, value)
+        ok, msg = db.apply_setting(CFG, name, value)
         return {"ok": ok, "message": msg,
                 "note": "applies immediately and reverts on restart - put it in serened.conf to keep it"}
 
