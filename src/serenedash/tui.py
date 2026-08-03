@@ -14,7 +14,7 @@ from .fmt import C, HIST, NOCOLOR
 from .db import apply_setting, full_queries, query, sample
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
-from .symbols import doctor, register_symbols
+from .symbols import extract_container_binary, doctor, register_symbols
 from .views import (
     DETAIL,
     activity_frame,
@@ -321,7 +321,15 @@ def main():
                 shown = [None] * len(shown)
                 continue
             if k == "r" and view == "doctor" and dfix:
-                dmsg = register_symbols(dfix)
+                kind, arg = dfix
+                if kind == "extract":
+                    # docker cp first: the binary in the container is the one that produced the
+                    # capture, so no build has to be found or matched.
+                    dest, err = extract_container_binary(
+                        cfg, arg, os.path.join(cfg["perf_dir"], "binaries"))
+                    dmsg = (False, err) if err else register_symbols(dest)
+                else:
+                    dmsg = register_symbols(arg)
                 drows, dfix = doctor(cfg, a.perf_dir)
                 perf_window.__defaults__[-1].clear()   # drop parses made before symbols resolved
                 shown = [None] * len(shown)

@@ -108,6 +108,49 @@ def symbol_sources(want, paths, limit=400):
     return found
 
 
+def near_misses(want_paths, paths, limit=400):
+    """Local ELFs named like the ones the capture wants, whose build-id does NOT match.
+
+    This exists to answer the most expensive wrong guess in the whole feature: "I'll rebuild the
+    same version and point it at that". A build-id is a hash of the build, not of the source — three
+    builds of this project from one tree produced three different ids. A rebuild will never resolve
+    someone else's capture, and without saying so the failure looks like a broken search rather than
+    a category error.
+    """
+    wanted = {os.path.basename(p) for p in want_paths}
+    out, seen = [], 0
+    for base in paths or []:
+        for dirpath, _, names in os.walk(os.path.expanduser(base)):
+            for n in names:
+                if n not in wanted or seen >= limit:
+                    continue
+                seen += 1
+                bid = elf_build_id(os.path.join(dirpath, n))
+                if bid:
+                    out.append((os.path.join(dirpath, n), bid))
+    return out
+
+
+def extract_container_binary(cfg, dso_path, dest_dir):
+    """Copy the binary out of the container. Needs docker, not root.
+
+    The exact binary that produced the capture, by definition — no build tree to find and no version
+    to match. perf cannot use it in place: it reaches a container binary only through
+    /proc/<pid>/root, which is root-only, and that asymmetry is the whole reason an unprivileged
+    dashboard shows hex where perf-snap shows names. `docker cp` steps around it.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(dso_path))
+    try:
+        o = subprocess.run(["docker", "cp", f"{cfg['container']}:{dso_path}", dest],
+                           capture_output=True, text=True, timeout=900)
+        if o.returncode != 0:
+            return None, (o.stderr or o.stdout).strip()
+        return dest, None
+    except Exception as e:                                      # noqa: BLE001
+        return None, str(e)
+
+
 def register_symbols(path):
     """`perf buildid-cache --add`. Symlinks into ~/.debug — it does not copy the binary."""
     try:
@@ -134,13 +177,13 @@ def doctor(cfg, perf_dir):
     def have(prog):
         return shutil.which(prog) is not None
 
-    s = sample(cfg["container"], cfg["port"], cfg["password"], query_head=1)
+    s = sample(cfg, query_head=1)
     rows.append(("ok" if s else "fail", "server",
                  f"{cfg['container']}:{cfg['port']}" + ("" if s else " unreachable"),
                  "" if s else "check the container is running, and the password "
                               "(--print-config shows where yours came from)"))
 
-    pid = host_pid(cfg["container"])
+    pid = host_pid(cfg)
     rows.append(("ok" if pid else "warn", "host pid",
                  f"serened is pid {pid} on the host" if pid else
                  "cannot resolve the container's pid - the threads panel needs it",
@@ -159,7 +202,7 @@ def doctor(cfg, perf_dir):
                  f"{len(caps)} in {perf_dir}" if caps else f"none in {perf_dir}",
                  "" if caps else f"sudo ./perf-snap.sh --container {cfg['container']}"))
 
-    fix_cmd = None
+    fix = None                       # ("register", path) or ("extract", dso) - what `r` will do
     if caps:
         want = capture_build_ids(caps[0])
         missing = [(b, p) for b, p in want if not buildid_cached(b)]
@@ -172,20 +215,47 @@ def doctor(cfg, perf_dir):
             found = symbol_sources({b for b, _ in missing}, cfg.get("symbol_paths"))
             if found:
                 bid, path = next(iter(found.items()))
-                fix_cmd = path
+                fix = ("register", path)
                 rows.append(("warn", "symbols",
-                             f"build {bid[:12]}… is not registered, but a matching binary is on "
-                             f"this machine: {path}",
-                             "press r to register it - one command, no copy, resolves every "
-                             "capture from this build"))
+                             f"build {bid[:12]}… is not registered, but a matching binary is here: "
+                             f"{path}",
+                             "press r to register it - a symlink into ~/.debug, no copy, and every "
+                             "capture from this build resolves afterwards"))
+            elif cfg.get("target", "docker") == "docker":
+                # The container has the exact binary and docker can read it out without root.
+                dso = missing[0][1]
+                fix = ("extract", dso)
+                rows.append(("warn", "symbols",
+                             f"build {missing[0][0][:12]}… is not registered and no local build "
+                             f"matches, but the container has the exact binary at {dso}",
+                             "press r to copy it out with docker cp and register it. It is the "
+                             "binary that produced this capture, so nothing has to match"))
             else:
-                names = ", ".join(p for _, p in missing[:2])
-                rows.append(("fail", "symbols",
-                             f"no local binary matches {names}. perf can only name these for a "
-                             f"reader that can reach the binary through /proc/<pid>/root, ie root",
-                             "add the build tree holding that exact build to symbol_paths, then "
-                             "press r. A build-id match is a build match - the binary does not "
-                             "have to come from the machine the server runs on"))
+                misses = near_misses([p for _, p in missing], cfg.get("symbol_paths"))
+                if misses:
+                    p0, b0 = misses[0]
+                    rows.append(("fail", "symbols",
+                                 f"{p0} is the right name but build {b0[:12]}…, and the capture "
+                                 f"wants {missing[0][0][:12]}…. A build-id is a hash of the build, "
+                                 f"not of the source - rebuilding the same version does not "
+                                 f"reproduce one",
+                                 "you need the binary that produced the capture, its distro "
+                                 "debuginfo (same build-id), or debuginfod - not a local rebuild"))
+                elif os.environ.get("DEBUGINFOD_URLS"):
+                    rows.append(("info", "symbols",
+                                 f"no local match for {missing[0][0][:12]}…, but DEBUGINFOD_URLS is "
+                                 f"set - perf will try to fetch debuginfo for distro builds",
+                                 "for a self-built or vendor serened, copy that exact binary here "
+                                 "and add its directory to symbol_paths"))
+                else:
+                    rows.append(("fail", "symbols",
+                                 f"nothing here can name {', '.join(p for _, p in missing[:2])}. "
+                                 f"perf resolves a container binary only for a reader that can "
+                                 f"reach it through /proc/<pid>/root, ie root",
+                                 "copy the binary that produced the capture onto this machine and "
+                                 "add its directory to symbol_paths, or set DEBUGINFOD_URLS for a "
+                                 "distro build. A build-id match is a build match - the binary does "
+                                 "not have to come from the machine the server runs on"))
 
     try:
         with open("/proc/sys/kernel/kptr_restrict") as f:
@@ -207,4 +277,4 @@ def doctor(cfg, perf_dir):
                  f"perf_event_paranoid={para} - the dashboard reads captures, it does not record. "
                  f"perf-snap.sh does that under sudo",
                  ""))
-    return rows, fix_cmd
+    return rows, fix

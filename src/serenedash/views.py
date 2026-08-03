@@ -365,7 +365,7 @@ def memory_frame(s, hist, host, col, width, scroll):
     return out[scroll:]
 
 
-def doctor_frame(rows, fix_cmd, col, width, scroll, msg=None):
+def doctor_frame(rows, fix, col, width, scroll, msg=None):
     c = C if col else NOCOLOR
     W = max(70, width)
     mark = {"ok": (c["grn"], "ok  "), "warn": (c["yel"], "warn"),
@@ -382,8 +382,11 @@ def doctor_frame(rows, fix_cmd, col, width, scroll, msg=None):
                     textwrap.wrap(fix, max(30, W - 10), initial_indent="→ ",
                                   subsequent_indent="  ")]
         out.append("")
-    if fix_cmd:
-        out.append(f"  {c['yel']}r{c['r']} {c['dim']}registers {fix_cmd}{c['r']}")
+    if fix:
+        kind, arg = fix
+        what = (f"registers {arg}" if kind == "register"
+                else f"copies {arg} out of the container and registers it")
+        out.append(f"  {c['yel']}r{c['r']} {c['dim']}{what}{c['r']}")
     if msg:
         out += ["", f"  {c['grn'] if msg[0] else c['red']}{msg[1]}{c['r']}"]
     return out[scroll:]
