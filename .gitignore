@@ -1,0 +1,33 @@
+# Python bytecode and packaging artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# What perf-snap.sh produces. A capture is hundreds of megabytes and resolves
+# only against the exact build it was recorded from, so it is worth nothing in
+# anyone else's checkout.
+*.data
+*.symbols.txt
+manifest.tsv
+snap.log
+snap-*/
+perf.data*
+
+# The pid file serenedash writes so perf-snap can signal it when a capture lands
+.serenedash.pid
+
+# Generated from serenedash.desktop.in by install.sh
+serenedash.desktop
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
