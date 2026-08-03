@@ -34,7 +34,7 @@ that is blocked for everyone shows as a full column, while one slow worker shows
 those two have completely different causes. Today's embedding bottleneck is a column; an orphaned
 query is a row.
 
-Open question: for serendash specifically, "processes" may be the wrong noun. SereneDB exposes
+Open question: for serenedash specifically, "processes" may be the wrong noun. SereneDB exposes
 sessions, not stages, so the columns would have to come from query phase, which is not currently
 observable through `pg_stat_activity`. This may belong in ragdash instead, where the stages are
 real and named.
@@ -48,4 +48,4 @@ line(label, value, glyph, tail, lc, vc, va)
 
 Every row goes through one `line()` so the glyph column is a single ruler down the frame and the
 number after it lands on the same column in every panel. Labels truncate with `…`, not by clipping.
-serendash currently builds rows ad hoc and should adopt this before it grows more panels.
+serenedash currently builds rows ad hoc and should adopt this before it grows more panels.

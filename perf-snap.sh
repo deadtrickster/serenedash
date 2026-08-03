@@ -141,7 +141,7 @@ done
 owner="${SUDO_USER:-$(id -un)}"
 owner_home="$(getent passwd "$owner" | cut -d: -f6)"
 [ -n "$owner_home" ] || owner_home="$HOME"
-OUT_DIR="${OUT_DIR:-${SERENDASH_PERF_DIR:-$owner_home/.cache/serendash/perf}}"
+OUT_DIR="${OUT_DIR:-${SERENEDASH_PERF_DIR:-$owner_home/.cache/serenedash/perf}}"
 
 if [ "$LIST" -eq 1 ]; then
 	printf '  %-52s %8s  %s\n' CAPTURE SIZE 'PHASE (from the name)'
@@ -264,18 +264,18 @@ capture() { # capture SIGNATURE TRIGGER THREADS CPU WRITE VOL COMMITTED
 	notify_dashboard
 }
 
-# Tell a running serendash that a new capture is ready.
+# Tell a running serenedash that a new capture is ready.
 #
 # The dashboard rescans its perf directory on every tick anyway, so this only removes the
 # latency between a capture landing and it appearing. Deliberately best-effort: a stale pid
 # file, no dashboard running, or a dashboard owned by another user all fail silently, because
 # a profiler that stops profiling when nobody is watching would be a worse tool.
 notify_dashboard() {
-	local pf="$OUT_DIR/.serendash.pid" pid
+	local pf="$OUT_DIR/.serenedash.pid" pid
 	[ -r "$pf" ] || return 0
 	read -r pid <"$pf" 2>/dev/null || return 0
 	case "$pid" in '' | *[!0-9]*) return 0 ;; esac
-	kill -USR1 "$pid" 2>/dev/null && say "  signalled serendash (pid $pid)"
+	kill -USR1 "$pid" 2>/dev/null && say "  signalled serenedash (pid $pid)"
 	return 0
 }
 

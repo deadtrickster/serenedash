@@ -1,10 +1,10 @@
-# serendash
+# serenedash
 
 Live terminal dashboard for a SereneDB server. Single file, stdlib only, no dependencies.
 
-    ./serendash.py                 refresh every 5s
-    ./serendash.py --once          one frame (scripts, logs)
-    ./serendash.py --perf-dir DIR  where perf-snap.sh writes captures
+    ./serenedash.py                 refresh every 5s
+    ./serenedash.py --once          one frame (scripts, logs)
+    ./serenedash.py --perf-dir DIR  where perf-snap.sh writes captures
 
 Keys: `q` quit · `c` effective config · `s` call graph · `j`/`k` scroll.
 

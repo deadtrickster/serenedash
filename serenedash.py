@@ -570,7 +570,7 @@ def _on_usr1(_sig, _frm):
 def write_pidfile(perf_dir):
     try:
         os.makedirs(perf_dir, exist_ok=True)
-        p = os.path.join(perf_dir, ".serendash.pid")
+        p = os.path.join(perf_dir, ".serenedash.pid")
         with open(p, "w") as f:
             f.write(f"{os.getpid()}\n")
         return p
@@ -617,7 +617,7 @@ def main():
     ap.add_argument("--password", default=os.environ.get("PGPASSWORD", "oracle-sdb"))
     ap.add_argument("--data", default="/var/lib/serenedb")
     ap.add_argument("--perf-dir", default=os.environ.get(
-        "SERENDASH_PERF_DIR", os.path.expanduser("~/.cache/serendash/perf")),
+        "SERENEDASH_PERF_DIR", os.path.expanduser("~/.cache/serenedash/perf")),
         help="where perf-snap.sh writes captures. The dashboard reads them; it cannot record "
              "on its own because perf_event_paranoid blocks attaching to a container process "
              "without root, and making the whole dashboard run as root to get a panel is a bad "
