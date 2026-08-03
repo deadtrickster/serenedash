@@ -7,7 +7,7 @@
     ./serenedash.py --no-color
     ./serenedash.py --container oracle-serenedb --port 7890
 
-Keys: `q` / `Esc` quit.
+Keys: `q` quit · `c` effective config · `s` call graph · `j`/`k` scroll.
 
 Config precedence: flags, then SERENEDB_CONTAINER / SERENEDB_PORT / PGPASSWORD, then the defaults
 below. No dependencies — stdlib only.
@@ -102,6 +102,23 @@ HAZARDS = {
     "preserve_insertion_order": ("false lets large sorts/inserts avoid materialising in order, "
                                  "which cuts both spill volume and time", None),
 }
+
+
+
+# ── one column grid for every panel ─────────────────────────────────────────────────────────────
+#
+# Same discipline as ragdash: every row goes through line(), so the glyph column is a single ruler
+# down the frame and the number after it lands on the same screen column in every panel. Building
+# rows ad hoc is why the storage and memory bars used to start at different offsets.
+COL_LABEL, COL_VALUE, COL_BAR = 16, 10, 18
+
+
+def line(c, label, value="", glyph=None, tail="", lc=None, vc=None):
+    lab = f"{label[:COL_LABEL]:<{COL_LABEL}}"
+    val = value if len(value) <= COL_VALUE else value[:COL_VALUE - 1] + "…"
+    g = " " * COL_BAR if glyph is None else glyph
+    return (f"{lc or c['dim']}{lab}{c['r']}"
+            f"{vc or ''}{val:>{COL_VALUE}}{c['r']}  {g}  {tail}")
 
 
 def psql(container, port, password, sql, timeout=30):
@@ -369,30 +386,29 @@ def frame(s, prev, sz, hist, perf, thr, col, width):
             L.append(f"{c['dim']}│{c['r']} {r}" + " " * max(0, inner - min(vis, inner - 1) - 1) + f"{c['dim']}│{c['r']}")
         L.append(f"{c['dim']}└" + "─" * inner + f"┘{c['r']}")
 
-    # ── storage: the WAL ratio is the headline, not the sizes ───────────────────────────────────
+    # ── storage ─────────────────────────────────────────────────────────────────────────────────
     ratio = s["wal"] / s["size"] if s["size"] else 0
     wcol = c["red"] if ratio > 1 else (c["yel"] if ratio > 0.3 else c["grn"])
-    rows = [
-        f"{c['dim']}database{c['r']}  {c['b']}{human(s['size']):>8}{c['r']}   "
-        f"{c['dim']}wal{c['r']} {wcol}{human(s['wal']):>8}{c['r']}   "
-        f"{c['dim']}ratio{c['r']} {wcol}{ratio:5.2f}x{c['r']}  "
-        + (f"{c['red']}checkpoint is not completing{c['r']}" if ratio > 1 else
-           f"{c['dim']}wal/db{c['r']}"),
-    ]
+    rows = [line(c, "database", human(s["size"]), " " * COL_BAR,
+                 f"{c['dim']}wal{c['r']} {wcol}{human(s['wal'])}{c['r']}  "
+                 f"{wcol}{ratio:.2f}x{c['r']} "
+                 + (f"{c['red']}checkpoint not completing{c['r']}" if ratio > 1
+                    else f"{c['dim']}wal/db{c['r']}"), vc=c["b"])]
     tb, ub, fb, bs = s["blocks"]
     if tb:
-        rows.append(f"{c['dim']}blocks{c['r']}    {ub:,}/{tb:,} used  "
-                    f"{bar(ub / tb, 18, c['blu'] if col else '')} "
-                    f"{c['dim']}{fb:,} free @ {human(bs)}{c['r']}")
-    if sz:
-        for k, label in (("duck", "columnar"), ("index", "search idx"), ("temp", "spill")):
-            v = sz.get(k)
-            if v is None:
-                continue
-            tot = sz.get("total") or 1
-            hot = c["red"] if (k == "temp" and v > 2**30) else (c["blu"] if col else "")
-            rows.append(f"{c['dim']}{label:10}{c['r']}{human(v):>8}   "
-                        f"{bar(v / tot, 18, hot)} {c['dim']}of {human(tot)} on disk{c['r']}")
+        rows.append(line(c, "blocks", f"{ub:,}", bar(ub / tb, COL_BAR, c["blu"] if col else ""),
+                         f"{c['dim']}of {tb:,} @ {human(bs)}, {fb:,} free{c['r']}"))
+    # Only the store's own directories, and only if measured. A bar per directory that shares one
+    # filesystem repeats the same shape four times and says nothing.
+    for k, label in (("duck", "columnar"), ("index", "search idx"), ("temp", "spill")):
+        v = (sz or {}).get(k)
+        if v is None:
+            continue
+        tot = (sz or {}).get("total") or 1
+        hot = v > 2**30 and k == "temp"
+        rows.append(line(c, label, human(v),
+                         bar(v / tot, COL_BAR, (c["red"] if hot else c["blu"]) if col else ""),
+                         f"{c['red']}spilling{c['r']}" if hot else ""))
     box("storage", rows, "blu")
 
     # ── memory ──────────────────────────────────────────────────────────────────────────────────
@@ -400,80 +416,83 @@ def frame(s, prev, sz, hist, perf, thr, col, width):
     if s["memlimit"]:
         f = s["mem"] / s["memlimit"]
         mcol = c["red"] if f > 0.9 else (c["yel"] if f > 0.7 else c["grn"])
-        mrows.append(f"{c['dim']}in use{c['r']}    {c['b']}{human(s['mem']):>8}{c['r']}   "
-                     f"{bar(f, 18, mcol)} {f * 100:4.1f}% {c['dim']}of {human(s['memlimit'])}{c['r']}  "
-                     f"{c['mag']}{spark(hist['mem'])}{c['r']}")
+        mrows.append(line(c, "in use", human(s["mem"]), bar(f, COL_BAR, mcol),
+                          f"{f * 100:.1f}% {c['dim']}of {human(s['memlimit'])}{c['r']}  "
+                          f"{c['mag']}{spark(hist['mem'])}{c['r']}", vc=c["b"]))
+    # Tags below 1% of the total are inventory, not status — they never move and they crowd out
+    # the one that does.
+    tot_tag = sum(v for _, v in s["memtags"]) or 1
     top = max((v for _, v in s["memtags"]), default=1) or 1
-    for tag, v in s["memtags"][:5]:
-        if v <= 0:
+    hidden = 0
+    for tag, v in s["memtags"]:
+        if v / tot_tag < 0.01:
+            hidden += 1
             continue
-        mrows.append(f"{c['dim']}{tag[:16]:16}{c['r']}{human(v):>8}   {bar(v / top, 18, c['cyn'] if col else '')}")
+        mrows.append(line(c, tag, human(v), bar(v / top, COL_BAR, c["cyn"] if col else "")))
+    if hidden:
+        mrows.append(f"{c['dim']}{' ' * COL_LABEL}{hidden} tag(s) under 1% hidden{c['r']}")
     box("memory", mrows, "cyn")
 
     # ── activity ────────────────────────────────────────────────────────────────────────────────
     st = s["states"]
     act, idle = st.get("active", 0), st.get("idle", 0)
-    arows = [f"{c['dim']}sessions{c['r']}  {c['grn']}{act} active{c['r']}   "
-             f"{c['dim']}{idle} idle{c['r']}   "
-             + "   ".join(f"{c['dim']}{k}{c['r']} {v}" for k, v in sorted(st.items())
-                          if k not in ("active", "idle"))]
-    # A pinned core with nothing active is the orphaned-work signature — say so rather than
-    # leaving an empty panel that reads as "nothing is happening".
+    arows = [line(c, "sessions", str(act + idle), " " * COL_BAR,
+                  f"{c['grn']}{act} active{c['r']}  {c['dim']}{idle} idle{c['r']}", vc=c["b"])]
     live = [q for stt, q in s["queries"] if stt == "active" and "pg_stat_activity" not in q]
     if not live and act <= 1:
-        arows.append(f"{c['dim']}no client query running — if a core is pinned, it is orphaned "
-                     f"server-side work{c['r']}")
-    for stt, q in s["queries"][:6]:
+        arows.append(f"{c['dim']}{' ' * COL_LABEL}nothing running — a pinned core now means "
+                     f"orphaned server-side work{c['r']}")
+    for stt, q in s["queries"][:5]:
         if "pg_stat_activity" in q:
             continue
-        mark = f"{c['grn']}▸{c['r']}" if stt == "active" else f"{c['dim']}·{c['r']}"
-        arows.append(f"{mark} {c['dim']}{stt[:6]:6}{c['r']} {q[:88]}")
+        run = stt == "active"
+        arows.append(f"{(c['grn'] + '▸') if run else (c['dim'] + '·')}{c['r']} "
+                     f"{'' if run else c['dim']}{q[:92]}{c['r']}")
     box("activity", arows, "grn")
 
-    # ── threads: where the parallelism actually is ──────────────────────────────────────────────
+    # ── threads ─────────────────────────────────────────────────────────────────────────────────
     if thr:
         top = thr[0][0] or 1
-        trows = [f"{c['dim']}{len(thr)} thread(s) over 1% · R=running S=sleeping{c['r']}"]
-        for pct, comm, st in thr:
-            sc = c["grn"] if st == "R" else c["dim"]
-            trows.append(f"{sc}{st}{c['r']} {c['b']}{pct:6.1f}%{c['r']} "
-                         f"{bar(pct / top, 16, c['grn'] if st == 'R' else c['blu'])} "
-                         f"{c['dim']}{comm}{c['r']}")
+        trows = []
+        for pct, comm, stt in thr:
+            run = stt == "R"
+            trows.append(line(c, comm, f"{pct:.1f}%",
+                              bar(pct / top, COL_BAR, (c["grn"] if run else c["blu"]) if col else ""),
+                              f"{c['grn']}running{c['r']}" if run else f"{c['dim']}sleeping{c['r']}",
+                              vc=c["b"] if run else None))
         box("threads", trows, "grn")
 
-    # ── where the cycles are ────────────────────────────────────────────────────────────────────
+    # ── cycles ──────────────────────────────────────────────────────────────────────────────────
     newest, tops = perf
     if tops:
-        # perf marks every sample [k] or [.]. Kernel SYMBOLS need kptr_restrict=0, but the split
-        # itself is always available and answers the question that matters: engine, or syscalls.
         kern = sum(v for sym, v in tops if sym.startswith("[k]"))
         user = sum(v for sym, v in tops if not sym.startswith("[k]"))
         tot = (kern + user) or 1
-        prows = [f"{c['dim']}shape{c['r']}    "
-                 f"{c['cyn']}user {user / tot * 100:4.1f}%{c['r']}  "
-                 f"{c['mag']}kernel {kern / tot * 100:4.1f}%{c['r']}  "
-                 f"{c['dim']}{newest}{c['r']}"]
+        prows = [line(c, "shape", f"{user / tot * 100:.0f}% usr", " " * COL_BAR,
+                      f"{c['mag']}{kern / tot * 100:.0f}% kernel{c['r']}  {c['dim']}{newest}{c['r']}",
+                      vc=c["cyn"])]
         top1 = tops[0][1] or 1
         for sym, pct in tops:
             k = sym.startswith("[k]")
             name = re.sub(r"^\[[.k]\]\s*", "", sym)
-            prows.append(f"{(c['mag'] if k else c['cyn'])}{pct:5.1f}%{c['r']} "
-                         f"{bar(pct / top1, 12, c['mag'] if k else c['cyn'])} "
-                         f"{c['dim'] if k else ''}{name[:60]}{c['r']}")
+            prows.append(line(c, name[:COL_LABEL], f"{pct:.1f}%",
+                              bar(pct / top1, COL_BAR, (c["mag"] if k else c["cyn"]) if col else ""),
+                              f"{c['dim']}{name[COL_LABEL:][:44]}{c['r']}",
+                              lc=c["mag"] if k else None))
         box("cycles", prows, "mag")
     elif newest is None:
-        box("cycles", [f"{c['dim']}no captures yet — run: sudo ./perf-snap.sh --name serened"
-                       f"{c['r']}"], "dim")
+        box("cycles", [f"{c['dim']}no captures — sudo ./perf-snap.sh --name serened{c['r']}"], "dim")
 
-    # ── config that has burned us ───────────────────────────────────────────────────────────────
-    tmpdir, threads, ckpt = (s["settings"] + ["?", "?", "?"])[:3]
+    # ── config ──────────────────────────────────────────────────────────────────────────────────
+    tmpdir, threads_n, ckpt = (s["settings"] + ["?", "?", "?"])[:3]
     bad = not str(tmpdir).startswith("/")
     box("config", [
-        f"{c['dim']}temp_directory{c['r']}       "
-        + (f"{c['red']}{tmpdir}  ← RELATIVE: every spill fails on a stock image{c['r']}"
-           if bad else f"{c['grn']}{tmpdir}{c['r']}"),
-        f"{c['dim']}threads{c['r']} {threads}    {c['dim']}checkpoint_threshold{c['r']} {ckpt}"
-        f"    {c['dim']}press{c['r']} c {c['dim']}for the full effective config{c['r']}",
+        line(c, "temp_directory", "", " " * COL_BAR,
+             (f"{c['red']}{tmpdir}  ← RELATIVE: every spill fails{c['r']}" if bad
+              else f"{c['grn']}{tmpdir}{c['r']}")),
+        line(c, "threads", threads_n, " " * COL_BAR,
+             f"{c['dim']}checkpoint_threshold{c['r']} {ckpt}   "
+             f"{c['dim']}c config · s stacks · q quit{c['r']}"),
     ], "yel" if bad else "dim")
     return L
 
