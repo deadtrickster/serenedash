@@ -172,10 +172,12 @@ fi
 if [ -z "$TARGET_PID" ] && [ -n "$TARGET_NAME" ]; then
 	TARGET_PID="$(pgrep -x "$TARGET_NAME" | head -1)"
 fi
-[ -n "$TARGET_PID" ] && [ -d "/proc/$TARGET_PID" ] || {
-	echo "no such process (use --pid or --name)" >&2
+# An if, not `A && B || C`: with the latter, C runs whenever A && B is false, which is what is
+# wanted here but reads as if-then-else and is not. shellcheck flags it (SC2015) for that reason.
+if ! { [ -n "$TARGET_PID" ] && [ -d "/proc/$TARGET_PID" ]; }; then
+	echo "no such process (use --pid, --name or --container)" >&2
 	exit 1
-}
+fi
 
 COMM="$(tr -d '\n' <"/proc/$TARGET_PID/comm" 2>/dev/null)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
