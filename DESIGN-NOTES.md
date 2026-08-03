@@ -49,3 +49,20 @@ line(label, value, glyph, tail, lc, vc, va)
 Every row goes through one `line()` so the glyph column is a single ruler down the frame and the
 number after it lands on the same column in every panel. Labels truncate with `…`, not by clipping.
 serenedash currently builds rows ad hoc and should adopt this before it grows more panels.
+
+## Mouse support — TODO
+
+The config view is cursor-driven (`j`/`k`, Enter for the untruncated description). Real clicking
+needs SGR mouse tracking:
+
+* enable with `\033[?1000h\033[?1006h` on entry, disable on exit — and it MUST be disabled in the
+  `finally` block alongside the cursor and termios restore, or the terminal keeps emitting escape
+  sequences into the user's shell after the dashboard quits.
+* parse `\033[<b;x;yM` / `m` from stdin in `wait_key`, which already selects on stdin so the plumbing
+  is there.
+* map row → setting using the same `body[scroll:scroll+view]` slice the renderer uses, so hit
+  testing and drawing cannot disagree. Deriving the mapping separately is how a click lands on the
+  wrong row after a resize.
+* wheel events are buttons 64/65; treat them as scroll, not selection.
+
+Worth doing for the config list and for the datasets rows. Not worth doing for the bars.

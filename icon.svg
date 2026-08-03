@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- serenedash: three stacked engine bars (vector / text / columnar) over a rising WAL line.
+     Reads at 16px as three bars; the ratio line is what the dashboard is actually for. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="12" fill="#12161c"/>
+  <rect x="10" y="16" width="30" height="7" rx="2" fill="#c678dd"/>
+  <rect x="10" y="27" width="21" height="7" rx="2" fill="#e5c07b"/>
+  <rect x="10" y="38" width="38" height="7" rx="2" fill="#56b6c2"/>
+  <path d="M10 54 L22 50 L34 51 L46 43 L54 34" fill="none" stroke="#e06c75"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

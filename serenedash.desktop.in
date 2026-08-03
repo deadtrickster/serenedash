@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=serenedash
+GenericName=SereneDB dashboard
+Comment=Live view of a SereneDB server: WAL ratio, memory, sessions, threads, engine profile
+Exec=@TERMINAL@ -e @BIN@
+Icon=@ICON@
+Terminal=false
+Categories=Development;Monitor;System;
+Keywords=serenedb;duckdb;database;monitoring;profiling;

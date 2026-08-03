@@ -50,6 +50,7 @@ import signal
 import subprocess
 import sys
 import termios
+import textwrap
 import time
 import tty
 
@@ -103,6 +104,39 @@ HAZARDS = {
                                  "which cuts both spill volume and time", None),
 }
 
+
+
+
+# ── which engine a hot symbol belongs to ────────────────────────────────────────────────────────
+#
+# The useful question about a profile here is not user-vs-kernel, it is WHICH ENGINE is burning the
+# cycles: SereneDB is DuckDB columnar storage + IResearch text index + FAISS/BLAS vector search
+# behind one pg-wire front end, and they fail in completely different ways.
+#
+# Measured examples that motivated each bucket:
+#   vector   sgemm_kernel at 16% — IVF k-means retraining its centroids, single-threaded, while
+#            23 cores waited. A matmul dominating means clustering, not search.
+#   text     irs::FieldData::add_term, DelimitedTokenizer::next — inverted index insertion.
+#   columnar duckdb::RLEState<float>::UpdateFlatValid — column encode.
+#   wire     sdb::message::Buffer::ReadableSize at 96% of a fourteen-hour load — the COPY feeder
+#            walking its whole chunk list per message to test a five-byte threshold.
+KERNELS = (
+    ("vector", ("gemm", "sgemm", "faiss", "IndexIVF", "Quantizer", "distance", "l2_", "knn",
+                "cblas", "openblas", "simsimd", "hnsw")),
+    ("text", ("irs::", "BM25", "Posting", "FieldData", "Tokenizer", "analysis::", "term_",
+              "iresearch")),
+    ("columnar", ("duckdb::", "RLE", "ColumnData", "RowGroup", "Vector::", "Compress")),
+    ("wire", ("sdb::message", "pg_wire", "Buffer::", "CopyEod")),
+    ("alloc", ("je_", "malloc", "free", "arena", "tcache")),
+)
+
+
+def kernel_of(sym):
+    low = sym.lower()
+    for name, pats in KERNELS:
+        if any(pt.lower() in low for pt in pats):
+            return name
+    return "kernel" if sym.startswith("[k]") else "other"
 
 
 # ── one column grid for every panel ─────────────────────────────────────────────────────────────
@@ -465,20 +499,25 @@ def frame(s, prev, sz, hist, perf, thr, col, width):
     # ── cycles ──────────────────────────────────────────────────────────────────────────────────
     newest, tops = perf
     if tops:
-        kern = sum(v for sym, v in tops if sym.startswith("[k]"))
-        user = sum(v for sym, v in tops if not sym.startswith("[k]"))
-        tot = (kern + user) or 1
-        prows = [line(c, "shape", f"{user / tot * 100:.0f}% usr", " " * COL_BAR,
-                      f"{c['mag']}{kern / tot * 100:.0f}% kernel{c['r']}  {c['dim']}{newest}{c['r']}",
-                      vc=c["cyn"])]
-        top1 = tops[0][1] or 1
+        # Group by engine first. A flat top-6 tells you a symbol is hot; the grouping tells you
+        # which subsystem is busy, which is the thing you act on.
+        fam = {}
         for sym, pct in tops:
-            k = sym.startswith("[k]")
-            name = re.sub(r"^\[[.k]\]\s*", "", sym)
-            prows.append(line(c, name[:COL_LABEL], f"{pct:.1f}%",
-                              bar(pct / top1, COL_BAR, (c["mag"] if k else c["cyn"]) if col else ""),
-                              f"{c['dim']}{name[COL_LABEL:][:44]}{c['r']}",
-                              lc=c["mag"] if k else None))
+            fam.setdefault(kernel_of(sym), []).append((sym, pct))
+        order = sorted(fam.items(), key=lambda kv: -sum(p for _, p in kv[1]))
+        tot = sum(p for _, ps in fam.items() for _, p in ps) or 1
+        fcol = {"vector": c["mag"], "text": c["yel"], "columnar": c["cyn"],
+                "wire": c["red"], "alloc": c["dim"], "kernel": c["blu"]}
+        prows = [line(c, "engines", f"{len(fam)}", " " * COL_BAR,
+                      "  ".join(f"{fcol.get(k, '')}{k} {sum(p for _, p in v) / tot * 100:.0f}%{c['r']}"
+                                for k, v in order) + f"   {c['dim']}{newest}{c['r']}", vc=c["b"])]
+        top1 = tops[0][1] or 1
+        for k, syms in order:
+            for sym, pct in syms[:3]:
+                name = re.sub(r"^\[[.k]\]\s*", "", sym)
+                prows.append(line(c, k, f"{pct:.1f}%",
+                                  bar(pct / top1, COL_BAR, fcol.get(k, "") if col else ""),
+                                  f"{c['dim']}{name[:52]}{c['r']}", lc=fcol.get(k)))
         box("cycles", prows, "mag")
     elif newest is None:
         box("cycles", [f"{c['dim']}no captures — sudo ./perf-snap.sh --name serened{c['r']}"], "dim")
@@ -497,19 +536,44 @@ def frame(s, prev, sz, hist, perf, thr, col, width):
     return L
 
 
-def config_frame(rows, s, col, width, scroll):
-    """The `c` view: every effective setting, with the server's own description.
+def config_frame(rows, s, col, width, scroll, sel, detail):
+    """The `c` view: every effective setting, selectable, with the full description on Enter.
 
-    Hazards first and annotated, because 297 settings sorted alphabetically is a list nobody reads
-    to the end. The annotations are consequences we have MEASURED here, not a restatement of the
-    description — the server already ships that, and repeating it would bury the part that matters.
+    Descriptions are truncated in the list because 297 rows only fit if each is one line — but a
+    truncated description is exactly the thing you needed when you came looking. So the list is a
+    cursor, and Enter opens the untruncated text for the highlighted row.
+
+    Hazards are pulled to the top and annotated with consequences we MEASURED here; the server
+    already ships the description and repeating it would bury the part that matters.
     """
     c = C if col else NOCOLOR
     W = max(70, min(width, 140))
-    out = [f"{c['b']}{c['cyn']}effective configuration{c['r']}  "
-           f"{c['dim']}{len(rows)} settings · q quit · c back · ↑↓/jk scroll{c['r']}", ""]
-
     by = {r[0]: r for r in rows if r}
+
+    if detail and detail in by:
+        r = by[detail]
+        name, val, desc = r[0], r[1] if len(r) > 1 else "", r[2] if len(r) > 2 else ""
+        out = [f"{c['b']}{c['cyn']}{name}{c['r']}", ""]
+        out.append(f"  {c['dim']}value{c['r']}   {c['b']}{val}{c['r']}")
+        if len(r) > 3:
+            out.append(f"  {c['dim']}type{c['r']}    {r[3]}")
+        if len(r) > 4:
+            out.append(f"  {c['dim']}scope{c['r']}   {r[4]}")
+        out.append("")
+        out += [f"  {ln}" for ln in textwrap.wrap(desc, W - 4)] if desc else []
+        if name in HAZARDS:
+            why, check = HAZARDS[name]
+            out += ["", f"  {c['yel']}why it matters{c['r']}"]
+            out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(why, W - 4)]
+            warn = check(val, s) if check else None
+            if warn:
+                out += ["", f"  {c['red']}on this server{c['r']}"]
+                out += [f"  {c['red']}{ln}{c['r']}" for ln in textwrap.wrap(warn, W - 4)]
+        out += ["", f"{c['dim']}  enter/esc back · q quit{c['r']}"]
+        return out, scroll, sel
+
+    out = [f"{c['b']}{c['cyn']}effective configuration{c['r']}  "
+           f"{c['dim']}{len(rows)} settings · jk move · enter details · c back · q quit{c['r']}", ""]
     out.append(f"{c['b']}{c['yel']}worth an opinion{c['r']}")
     for name, (why, check) in HAZARDS.items():
         r = by.get(name)
@@ -517,28 +581,28 @@ def config_frame(rows, s, col, width, scroll):
             continue
         val = r[1] if len(r) > 1 else "?"
         warn = check(val, s) if check else None
-        vcol = c["red"] if warn else c["grn"]
-        out.append(f"  {c['b']}{name:24}{c['r']} {vcol}{val[:34]:34}{c['r']} {c['dim']}{why}{c['r']}")
-        if warn:
-            for i in range(0, len(warn), W - 8):
-                out.append(f"      {c['red']}{warn[i:i + W - 8]}{c['r']}")
-    out.append("")
-    out.append(f"{c['b']}{c['cyn']}all settings{c['r']}")
+        out.append(f"  {c['b']}{name:24}{c['r']} {(c['red'] if warn else c['grn'])}{val[:30]:30}{c['r']} "
+                   f"{c['dim']}{why[:W - 62]}{c['r']}")
+    out += ["", f"{c['b']}{c['cyn']}all settings{c['r']}"]
 
-    body = []
-    for r in sorted(rows, key=lambda x: x[0].lower()):
-        if len(r) < 3:
-            continue
-        name, val, desc = r[0], r[1], r[2]
-        hot = name in HAZARDS
-        body.append(f"  {(c['b'] if hot else c['dim'])}{name[:28]:28}{c['r']} "
-                    f"{(c['yel'] if hot else '')}{val[:26]:26}{c['r']} "
-                    f"{c['dim']}{desc[:W - 62]}{c['r']}")
-    view = max(8, shutil.get_terminal_size((100, 40)).lines - len(out) - 2)
+    body = sorted([r for r in rows if len(r) >= 3], key=lambda x: x[0].lower())
+    sel = max(0, min(sel, len(body) - 1)) if body else 0
+    view = max(6, shutil.get_terminal_size((100, 40)).lines - len(out) - 3)
     scroll = max(0, min(scroll, max(0, len(body) - view)))
-    out += body[scroll:scroll + view]
-    out.append(f"{c['dim']}  {scroll + 1}-{min(scroll + view, len(body))} of {len(body)}{c['r']}")
-    return out, scroll
+    if sel < scroll:
+        scroll = sel
+    elif sel >= scroll + view:
+        scroll = sel - view + 1
+    for i, r in enumerate(body[scroll:scroll + view], start=scroll):
+        cur = i == sel
+        hot = r[0] in HAZARDS
+        mark = f"{c['cyn']}›{c['r']}" if cur else " "
+        lab = (c["b"] if (cur or hot) else c["dim"])
+        out.append(f"{mark} {lab}{r[0][:28]:28}{c['r']} "
+                   f"{(c['yel'] if hot else '')}{r[1][:24]:24}{c['r']} "
+                   f"{c['dim']}{r[2][:W - 60]}{c['r']}")
+    out.append(f"{c['dim']}  {sel + 1}/{len(body)}{c['r']}")
+    return out, scroll, sel
 
 
 # ── the producer/consumer binding ───────────────────────────────────────────────────────────────
@@ -628,8 +692,9 @@ def main():
     prev, sz, tick, shown = None, {}, 0, []
     hist = {"mem": []}
     perf = (None, [])
+    crows = []
     thr, tprev, tlast = [], {}, time.time()
-    view, scroll = "main", 0
+    view, scroll, sel, detail = "main", 0, 0, None
     hpid = host_pid(a.container)
     signal.signal(signal.SIGUSR1, _on_usr1)
     pidfile = write_pidfile(a.perf_dir)
@@ -658,9 +723,10 @@ def main():
                              + ls[scroll:scroll + max(8, shutil.get_terminal_size((100, 40)).lines - 4)])
                 elif view == "config":
                     cfg = psql(a.container, a.port, a.password,
-                               ["select name, value, coalesce(description,'') "
-                                "from duckdb_settings()"])
-                    lines, scroll = config_frame(cfg[0] if cfg else [], s, col, w, scroll)
+                               ["select name, value, coalesce(description,''), "
+                                "input_type, scope from duckdb_settings()"])
+                    crows = cfg[0] if cfg else []
+                    lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail)
                 else:
                     lines = frame(s, prev, sz, hist, perf, thr, col, w)
                 prev = s
@@ -677,7 +743,10 @@ def main():
             sys.stdout.write(f"\033[{len(lines) + 1};1H")
             sys.stdout.flush()
             k = wait_key(a.interval)
-            if k in ("q", "\x1b"):
+            if k == "\x1b" and (detail or view != "main"):
+                detail, view, shown = None, "main", []
+                continue
+            if k == "q":
                 return 0
             if k == "s":
                 view = "main" if view == "stacks" else "stacks"
@@ -686,9 +755,23 @@ def main():
                 view = "main" if view == "config" else "config"
                 scroll, shown = 0, []
             elif k in ("j", "B"):
-                scroll += 5
+                if view == "config" and not detail:
+                    sel += 1
+                else:
+                    scroll += 5
             elif k in ("k", "A"):
-                scroll = max(0, scroll - 5)
+                if view == "config" and not detail:
+                    sel = max(0, sel - 1)
+                else:
+                    scroll = max(0, scroll - 5)
+            elif k in ("\r", "\n", " ") and view == "config":
+                # Enter opens the highlighted setting; enter/esc again closes it.
+                if detail:
+                    detail = None
+                else:
+                    body = sorted([r for r in crows if len(r) >= 3], key=lambda x: x[0].lower())
+                    detail = body[sel][0] if body and sel < len(body) else None
+                shown = []
     except KeyboardInterrupt:
         return 0
     finally:
