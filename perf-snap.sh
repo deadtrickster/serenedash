@@ -72,6 +72,7 @@ set -uo pipefail
 
 TARGET_PID=""
 TARGET_NAME=""
+CONTAINER=""
 DISK_DIR=""
 WINDOW="${WINDOW:-30}" # seconds of recording per capture
 POLL="${POLL:-5}"      # seconds between /proc samples
@@ -87,6 +88,13 @@ while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--pid)
 		TARGET_PID="${2:-}"
+		shift 2
+		;;
+	--container)
+		# Resolve the pid from a container rather than being handed one. A pid is only valid until
+		# the process restarts, and the thing being profiled here is a database that may restart
+		# under a watcher that outlives it; the container name does not change.
+		CONTAINER="${2:-}"
 		shift 2
 		;;
 	--name)
@@ -157,6 +165,10 @@ fi
 	exit 1
 }
 
+if [ -z "$TARGET_PID" ] && [ -n "${CONTAINER:-}" ]; then
+	TARGET_PID="$(docker inspect -f '{{.State.Pid}}' "$CONTAINER" 2>/dev/null)"
+	case "$TARGET_PID" in '' | 0 | *[!0-9]*) TARGET_PID="" ;; esac
+fi
 if [ -z "$TARGET_PID" ] && [ -n "$TARGET_NAME" ]; then
 	TARGET_PID="$(pgrep -x "$TARGET_NAME" | head -1)"
 fi
