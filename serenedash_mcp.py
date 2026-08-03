@@ -51,9 +51,14 @@ server = MCPServer(
 )
 
 
-def _sample():
-    """One psql round trip, or an error dict the tools return verbatim."""
-    s = dash.sample(CONTAINER, PORT, PASSWORD)
+def _sample(query_head: int = 400):
+    """One psql round trip, or an error dict the tools return verbatim.
+
+    `query_head` is pushed down into the SQL rather than applied on arrival. Trimming here would
+    still move the whole statement across — 1.84 MB per call on this deployment — to throw away
+    99.9% of it; `left()` in the query means it is never sent.
+    """
+    s = dash.sample(CONTAINER, PORT, PASSWORD, query_head=query_head)
     if s is None:
         return None, {"error": f"cannot reach {CONTAINER}:{PORT}",
                       "hint": "is the container running, and is PGPASSWORD right?"}
@@ -192,14 +197,29 @@ def _memory(s, host):
     }
 
 
-def _activity(s):
-    rows = [{"state": st, "query": q or None}
-            for st, q in s["queries"] if "pg_stat_activity" not in q]
+def _activity(s, max_query_chars=400):
+    """Sessions, with statement text BOUNDED.
+
+    Statements are unbounded server-supplied text and the caller is a context window. A single
+    generated INSERT on this deployment is ~185 KB, so twelve sessions returned 1.66 MB in one
+    call — enough to blow the tool-result limit on its own, with every other panel in the response
+    adding up to under 14 KB. The head of a statement identifies it; the body is bulk. The full
+    length is reported so a truncated one is never mistaken for a short one.
+    """
+    rows = []
+    for st, q, full_len in s["queries"]:
+        if "pg_stat_activity" in q:
+            continue
+        row = {"state": st, "query": (q[:max_query_chars] or None), "query_chars": full_len}
+        if full_len > len(row["query"] or ""):
+            row["query_truncated"] = True
+        rows.append(row)
     active = [r for r in rows if r["state"] == "active"]
     return {
         "sessions_total": sum(s["states"].values()),
         "by_state": s["states"],
-        "note": "excludes this connection, which is active by construction",
+        "note": "excludes this connection, which is active by construction. Statement text is cut "
+                f"at {max_query_chars} chars; query_chars is always the full length.",
         "nothing_running": not active,
         "nothing_running_means": "a pinned core with no active session is work with no session "
                                  "behind it - an orphaned server-side task",
@@ -287,16 +307,21 @@ def memory() -> dict:
 
 
 @server.tool()
-def activity() -> dict:
+def activity(max_query_chars: int = 2000) -> dict:
     """Sessions and their current statements, excluding this connection.
 
     `nothing_running: true` alongside busy threads is a finding rather than an absence: it means
     work with no session behind it.
+
+    Args:
+        max_query_chars: statement text is cut at this length. `query_chars` on each row is always
+            the full length, so a truncated statement is never mistaken for a short one. Raise it
+            deliberately — generated statements here run to ~185 KB each.
     """
-    s, err = _sample()
+    s, err = _sample(query_head=max_query_chars)
     if err:
         return err
-    return _activity(s)
+    return _activity(s, max_query_chars)
 
 
 @server.tool()

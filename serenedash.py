@@ -215,7 +215,15 @@ def human(n):
     return f"{n:.1f}T"
 
 
-def sample(c, p, pw):
+def sample(c, p, pw, query_head=200):
+    """One docker exec per tick. `query_head` is how much statement text to fetch.
+
+    Fetch what will be displayed, not what exists. The main panel gives each session one row, so it
+    can never show more than the terminal's width — while the statements themselves run to ~185 KB
+    on this deployment, which is 1.84 MB moved through a docker exec every five seconds for a panel
+    that then clips each row to ~90 columns. Callers that will show more (the `a` view, an MCP
+    request asking for it) pass a larger value or re-fetch in full; the tick pays for the head only.
+    """
     b = psql(c, p, pw, [
         "select database_name, database_size, wal_size, memory_usage, memory_limit, "
         "  total_blocks, used_blocks, free_blocks, block_size "
@@ -230,7 +238,11 @@ def sample(c, p, pw):
         # No `query <> ''` filter: with it the header counted every session and the list showed only
         # the ones carrying statement text, so `6 sessions` sat above four rows with nothing saying
         # where the other two went. A session with no statement is a row that says so.
-        "select coalesce(state,'?'), replace(replace(coalesce(query,''),chr(10),' '),chr(13),' ') "
+        #
+        # Truncated in SQL, not on arrival — see the docstring. length() comes back alongside the
+        # head so a truncated statement is never mistaken for a short one.
+        f"select coalesce(state,'?'), replace(replace(left(coalesce(query,''),{int(query_head)}),"
+        "chr(10),' '),chr(13),' '), length(coalesce(query,'')) "
         "from pg_stat_activity where pid <> pg_backend_pid() order by state",
         # Every setting the HAZARDS table has an opinion about, in one go. The panel used to hard-code
         # three of them in the query and show two, so a table built from measured incidents was
@@ -247,7 +259,9 @@ def sample(c, p, pw):
         "blocks": (int(r[5] or 0), int(r[6] or 0), int(r[7] or 0), int(r[8] or 0)),
         "memtags": [(x[0], int(x[1])) for x in b[1] if len(x) == 2 and x[1].isdigit()],
         "states": {x[0]: int(x[1]) for x in b[2] if len(x) == 2 and x[1].isdigit()},
-        "queries": [(x[0], x[1]) for x in b[3] if len(x) == 2],
+        # (state, statement head, full statement length). The length is carried so a truncated
+        # statement is never mistaken for a short one.
+        "queries": [(x[0], x[1], int(x[2] or 0)) for x in b[3] if len(x) == 3],
         "settings": {x[0]: x[1] for x in b[4] if len(x) == 2},
         "t": time.time(),
     }
@@ -854,25 +868,45 @@ def storage_frame(s, sz, host, col, width, scroll):
     return out[scroll:]
 
 
-def activity_frame(s, col, width, scroll):
-    """The `a` view: every session and its whole statement, not the first 90 characters."""
+def activity_frame(s, col, width, scroll, full=None):
+    """The `a` view: every session and its whole statement, not the first 90 characters.
+
+    `full` is a separately-fetched, untruncated copy of the statements — this is the one screen that
+    wants them, so it is the one screen that pays for them. The per-tick sample carries only what
+    the main panel can display (see `sample`), which on this deployment is the difference between
+    40 KB and 1.84 MB every five seconds.
+    """
     c = C if col else NOCOLOR
     W = max(70, width)
     st = s["states"]
-    rows = [(stt, q) for stt, q in s["queries"] if "pg_stat_activity" not in q]
+    rows = [(stt, q, n) for stt, q, n in s["queries"] if "pg_stat_activity" not in q]
+    if full:
+        rows = [(stt, q, n) for stt, q, n in full if "pg_stat_activity" not in q]
     out = [f"{c['b']}activity{c['r']}  {c['dim']}"
            + "  ".join(f"{k} {v}" for k, v in sorted(st.items())) + f"{c['r']}", ""]
     if not rows:
         out.append(f"{c['dim']}no sessions{c['r']}")
-    for stt, q in rows:
+    for stt, q, n in rows:
         run = stt == "active"
-        out.append(f"{(c['grn'] + '▸') if run else (c['dim'] + '·')} {stt}{c['r']}")
+        size = f"  {c['dim']}{human(n)}{c['r']}" if n > 2000 else ""
+        out.append(f"{(c['grn'] + '▸') if run else (c['dim'] + '·')} {stt}{c['r']}{size}")
         # Wrapped, not truncated: the interesting part of a statement is rarely in its first line,
         # and the main panel already shows the head of it.
-        for chunk in (textwrap.wrap(q, max(30, W - 4)) or ["(no statement)"]):
+        shown = q if len(q) >= n else q + f"  … {human(n - len(q))} more not fetched"
+        for chunk in (textwrap.wrap(shown, max(30, W - 4)) or ["(no statement)"]):
             out.append(f"    {'' if run else c['dim']}{chunk}{c['r']}")
         out.append("")
     return out[scroll:]
+
+
+def full_queries(container, port, password):
+    """Untruncated statement text, for the one view that shows it. See `sample`."""
+    b = psql(container, port, password,
+             ["select coalesce(state,'?'), "
+              "replace(replace(coalesce(query,''),chr(10),' '),chr(13),' '), "
+              "length(coalesce(query,'')) from pg_stat_activity "
+              "where pid <> pg_backend_pid() order by state"])
+    return [(x[0], x[1], int(x[2] or 0)) for x in (b[0] if b else []) if len(x) == 3]
 
 
 def threads_frame(thr, tcpu, by_tid, host, col, width, scroll):
@@ -1209,7 +1243,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
     act, idle = st.get("active", 0), st.get("idle", 0)
     ahead = [line(c, "sessions", str(act + idle), " " * COL_BAR,
                   f"{c['grn']}{act} active{c['r']}  {c['dim']}{idle} idle{c['r']}", vc=c["b"])]
-    live = [q for stt, q in s["queries"] if stt == "active" and "pg_stat_activity" not in q]
+    live = [q for stt, q, _ in s["queries"] if stt == "active" and "pg_stat_activity" not in q]
     if not live and act == 0:
         ahead.append(f"{c['dim']}{' ' * COL_LABEL}nothing running — a pinned core now means "
                      f"orphaned server-side work{c['r']}")
@@ -1221,7 +1255,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
     abody = [f"{(c['grn'] + '▸') if stt == 'active' else (c['dim'] + '·')}{c['r']} "
              f"{'' if stt == 'active' else c['dim']}"
              f"{clip(q, WIDE) if q else f'({stt}, no statement)'}{c['r']}"
-             for stt, q in ordered]
+             for stt, q, _ in ordered]
 
     # ── threads ─────────────────────────────────────────────────────────────────────────────────
     if thr:
@@ -1788,7 +1822,10 @@ def main():
             # for all 297 settings — which is why holding `j` there felt like the list was stuck
             # rather than slow. Only a timeout or a SIGUSR1 wake refreshes the data.
             if fresh:
-                s = sample(a.container, a.port, a.password)
+                # Fetch as much statement text as the widest row could show, and no more. The
+                # terminal is read first precisely so the query can be sized to it.
+                s = sample(a.container, a.port, a.password,
+                           query_head=max(200, shutil.get_terminal_size((100, 40)).columns))
             if s is None:
                 lines = [f" cannot reach {a.container}:{a.port}"]
             else:
@@ -1838,7 +1875,11 @@ def main():
                 elif view in DETAIL:
                     body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll),
                             "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
-                            "activity": lambda: activity_frame(s, col, w, scroll),
+                            # The one view that shows whole statements is the one that pays to
+                            # fetch them, and only while it is open.
+                            "activity": lambda: activity_frame(
+                                s, col, w, scroll,
+                                full=full_queries(a.container, a.port, a.password)),
                             "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                              scroll),
                             "profile": lambda: profile_frame(perf, col, w, scroll),

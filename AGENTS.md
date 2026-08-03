@@ -31,6 +31,21 @@ to their base. This was wrong in four places independently:
 - the engines line divided by the six symbols that fit, printing `columnar 50%` above rows of 2%
 - memory sparklines self-scaled, so a flat 260 MB pool drew the same full-height trace as a 34 GB one
 
+## Fetch what will be displayed
+
+Bound server-supplied text at the source, and size the bound to the consumer.
+
+The activity query fetched whole statements. On this deployment a generated `INSERT` is ~185 KB, so
+twelve sessions moved **1.84 MB through a docker exec every five seconds** — for a panel that gives
+each session one row and clips it to about 90 columns. The same unbounded text went out over MCP as
+a single 1.66 MB tool result, of which `activity` was 1.66 MB and every other panel together was
+under 14 KB.
+
+`left()` in the SQL, sized to what the caller will render, cut both to 40 KB and 15 KB. Trimming on
+arrival would have fixed neither — the bytes still cross the wire to be thrown away. Carry
+`length()` alongside the head so a truncated value is never mistaken for a short one, and let the
+one view that shows whole statements re-fetch them, only while it is open.
+
 ## Layout
 
 - **Constant height.** A panel's height comes from a budget, not from how many rows it happens to
