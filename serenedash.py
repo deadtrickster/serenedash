@@ -536,7 +536,52 @@ def frame(s, prev, sz, hist, perf, thr, col, width):
     return L
 
 
-def config_frame(rows, s, col, width, scroll, sel, detail):
+
+
+def apply_setting(container, port, password, name, value):
+    """SET GLOBAL one setting. Returns (ok, message).
+
+    Quoting: values go through a single-quoted literal with '' escaping, and the NAME is validated
+    against an identifier pattern rather than quoted — it comes from the server's own settings list,
+    but a dashboard that can be talked into running arbitrary SQL by a setting name is a dashboard
+    with an injection bug, and the check costs nothing.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""):
+        return False, f"refusing: {name!r} is not a plain identifier"
+    lit = str(value).replace("'", "''")
+    out = psql(container, port, password, [f"SET GLOBAL {name} = '{lit}'"])
+    if out is None:
+        return False, "the server rejected it (or is unreachable) — value unchanged"
+    return True, f"SET GLOBAL {name} = '{value}' — applied, NOT persisted"
+
+
+def persistence(scope):
+    """(marker, one-line, explanation) for whether a setting can be changed now, and whether it lasts.
+
+    This exists because "I changed it and it looked like it worked" cost real time twice in one day:
+    `SET GLOBAL temp_directory` took effect and `current_setting` confirmed it, and it would have
+    reverted on the next restart because the flagfile still carried the old value. The same shape
+    caught MySQL's binlog expiry an hour earlier — `SET PERSIST` wrote mysqld-auto.cnf, and the
+    command line overrode it.
+
+    The rule, in both cases: a runtime change is real until the process restarts, and the file wins
+    at boot. So a runtime SET is a fix for now, never a fix.
+    """
+    sc = (scope or "").upper()
+    if sc == "GLOBAL":
+        return ("~", f"{'runtime'}",
+                "Settable now with SET GLOBAL, and it takes effect immediately. It does NOT "
+                "survive a restart: the flagfile is re-read at boot and wins. To make it stick, put "
+                "it in serened.conf (mounted over /etc/serenedb/serened.conf) as well — changing "
+                "only the runtime value means the next recreate silently reverts it.")
+    if sc == "LOCAL":
+        return ("·", "session",
+                "Per-session. SET affects this connection only; other sessions and anything the "
+                "server does on its own are unchanged.")
+    return (" ", sc.lower() or "?", "Scope not reported by the server.")
+
+
+def config_frame(rows, s, col, width, scroll, sel, detail, edit=None, msg=None):
     """The `c` view: every effective setting, selectable, with the full description on Enter.
 
     Descriptions are truncated in the list because 297 rows only fit if each is one line — but a
@@ -558,7 +603,11 @@ def config_frame(rows, s, col, width, scroll, sel, detail):
         if len(r) > 3:
             out.append(f"  {c['dim']}type{c['r']}    {r[3]}")
         if len(r) > 4:
-            out.append(f"  {c['dim']}scope{c['r']}   {r[4]}")
+            mark, short, expl = persistence(r[4])
+            pc = c["yel"] if short == "runtime" else c["dim"]
+            out.append(f"  {c['dim']}scope{c['r']}   {r[4]}  {pc}{mark} {short}{c['r']}")
+            out.append("")
+            out += [f"  {pc}{ln}{c['r']}" for ln in textwrap.wrap(expl, W - 4)]
         out.append("")
         out += [f"  {ln}" for ln in textwrap.wrap(desc, W - 4)] if desc else []
         if name in HAZARDS:
@@ -569,11 +618,22 @@ def config_frame(rows, s, col, width, scroll, sel, detail):
             if warn:
                 out += ["", f"  {c['red']}on this server{c['r']}"]
                 out += [f"  {c['red']}{ln}{c['r']}" for ln in textwrap.wrap(warn, W - 4)]
-        out += ["", f"{c['dim']}  enter/esc back · q quit{c['r']}"]
+        editable = len(r) > 4 and (r[4] or "").upper() == "GLOBAL"
+        if edit is not None:
+            out += ["", f"  {c['yel']}new value{c['r']} {c['b']}{edit}{c['r']}█",
+                    f"  {c['dim']}enter apply · esc cancel{c['r']}",
+                    f"  {c['dim']}applies immediately and reverts on restart — put it in "
+                    f"serened.conf to keep it{c['r']}"]
+        elif editable:
+            out += ["", f"{c['dim']}  e edit · enter/esc back · q quit{c['r']}"]
+        else:
+            out += ["", f"{c['dim']}  not runtime-settable · enter/esc back · q quit{c['r']}"]
+        if msg:
+            out += ["", f"  {c['grn'] if msg[0] else c['red']}{msg[1]}{c['r']}"]
         return out, scroll, sel
 
     out = [f"{c['b']}{c['cyn']}effective configuration{c['r']}  "
-           f"{c['dim']}{len(rows)} settings · jk move · enter details · c back · q quit{c['r']}", ""]
+           f"{c['dim']}{len(rows)} settings · {c['yel']}~{c['dim']} runtime-settable (reverts on restart) · jk move · enter details · c back · q{c['r']}", ""]
     out.append(f"{c['b']}{c['yel']}worth an opinion{c['r']}")
     for name, (why, check) in HAZARDS.items():
         r = by.get(name)
@@ -598,9 +658,11 @@ def config_frame(rows, s, col, width, scroll, sel, detail):
         hot = r[0] in HAZARDS
         mark = f"{c['cyn']}›{c['r']}" if cur else " "
         lab = (c["b"] if (cur or hot) else c["dim"])
+        pm, _, _ = persistence(r[4] if len(r) > 4 else "")
         out.append(f"{mark} {lab}{r[0][:28]:28}{c['r']} "
-                   f"{(c['yel'] if hot else '')}{r[1][:24]:24}{c['r']} "
-                   f"{c['dim']}{r[2][:W - 60]}{c['r']}")
+                   f"{c['yel']}{pm}{c['r']} "
+                   f"{(c['yel'] if hot else '')}{r[1][:22]:22}{c['r']} "
+                   f"{c['dim']}{r[2][:W - 62]}{c['r']}")
     out.append(f"{c['dim']}  {sel + 1}/{len(body)}{c['r']}")
     return out, scroll, sel
 
@@ -664,7 +726,21 @@ def wait_key(timeout):
                     pass
                 return "wake"
             if r:
-                return sys.stdin.read(1).lower()
+                ch = sys.stdin.read(1)
+                if ch != "\x1b":
+                    return ch.lower()
+                # ESC is ambiguous: it is either the Esc key, or the first byte of an arrow/function
+                # sequence (\x1b[A etc). Peek with a zero timeout — if more bytes are already
+                # waiting it was a sequence, if not the user pressed Esc. Without this, every arrow
+                # press read as Esc and exited the view, which is exactly what it did.
+                if not select.select([sys.stdin], [], [], 0.02)[0]:
+                    return "\x1b"
+                seq = sys.stdin.read(1)
+                if seq != "[":
+                    return "\x1b"
+                code = sys.stdin.read(1)
+                return {"A": "up", "B": "down", "C": "right", "D": "left",
+                        "5": "pgup", "6": "pgdn"}.get(code, "")
     finally:
         if old is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
@@ -695,6 +771,7 @@ def main():
     crows = []
     thr, tprev, tlast = [], {}, time.time()
     view, scroll, sel, detail = "main", 0, 0, None
+    edit, msg = None, None
     hpid = host_pid(a.container)
     signal.signal(signal.SIGUSR1, _on_usr1)
     pidfile = write_pidfile(a.perf_dir)
@@ -726,7 +803,7 @@ def main():
                                ["select name, value, coalesce(description,''), "
                                 "input_type, scope from duckdb_settings()"])
                     crows = cfg[0] if cfg else []
-                    lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail)
+                    lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
                 else:
                     lines = frame(s, prev, sz, hist, perf, thr, col, w)
                 prev = s
@@ -743,6 +820,27 @@ def main():
             sys.stdout.write(f"\033[{len(lines) + 1};1H")
             sys.stdout.flush()
             k = wait_key(a.interval)
+            if edit is not None:
+                # A tiny line editor. Enter applies, Esc cancels, backspace deletes; anything
+                # printable appends. Deliberately no history or cursor movement — this is for
+                # changing one value, not for living in.
+                if k in ("\r", "\n"):
+                    msg = apply_setting(a.container, a.port, a.password, detail, edit)
+                    edit = None
+                elif k == "\x1b":
+                    edit, msg = None, None
+                elif k in ("\x7f", "\b"):
+                    edit = edit[:-1]
+                elif k and len(k) == 1 and k.isprintable():
+                    edit += k
+                shown = []
+                continue
+            if k == "e" and view == "config" and detail:
+                row = next((r for r in crows if r and r[0] == detail), None)
+                if row and len(row) > 4 and (row[4] or "").upper() == "GLOBAL":
+                    edit, msg = (row[1] if len(row) > 1 else ""), None
+                    shown = []
+                continue
             if k == "\x1b" and (detail or view != "main"):
                 detail, view, shown = None, "main", []
                 continue
@@ -754,12 +852,12 @@ def main():
             elif k == "c":
                 view = "main" if view == "config" else "config"
                 scroll, shown = 0, []
-            elif k in ("j", "B"):
+            elif k in ("j", "down"):
                 if view == "config" and not detail:
                     sel += 1
                 else:
                     scroll += 5
-            elif k in ("k", "A"):
+            elif k in ("k", "up"):
                 if view == "config" and not detail:
                     sel = max(0, sel - 1)
                 else:
