@@ -1,0 +1,5 @@
+# Only serenedash_mcp.py needs this. serenedash.py itself is stdlib-only and always will be —
+# the point of a single dependency-free file is that it drops onto any box with a python3.
+#
+#     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+mcp>=2.0.0

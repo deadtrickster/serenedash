@@ -31,6 +31,31 @@ Every bar and its history share one denominator, and each panel says what that d
 thread bar is a share of one core; storage shares add to 100 against the on-disk total; a memory
 sparkline is its own bar over time.
 
+## MCP
+
+`serenedash_mcp.py` exposes the same collectors as MCP tools, so an agent can read the server's
+state instead of being shown a screenshot of it. `serenedash.py` stays stdlib-only; only the MCP
+server needs the dependency:
+
+    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    .venv/bin/python serenedash_mcp.py              # read-only
+    .venv/bin/python serenedash_mcp.py --allow-write   # also exposes set_setting
+
+For Claude Code, from the directory you start it in:
+
+    claude mcp add serenedash --scope project -- \
+      /path/to/.venv/bin/python /path/to/serenedash_mcp.py
+
+Tools: `status` `storage` `memory` `activity` `threads` `profile` `callgraph` `host` `config`, plus
+`set_setting` under `--allow-write`. `status` is one round trip and leads with `findings` — each
+one a condition that was measured, with the numbers behind it and how to check it, rather than a
+verdict to be taken on trust. Same environment variables as the dashboard
+(`SERENEDB_CONTAINER`, `PGPASSWORD`, `SERENEDASH_PERF_DIR`, …).
+
+Rates arrive next to their base — `{"cpu_percent_of_one_core": 94.9, "cores": 24}`, storage shares
+with the total they divide. Every display bug this dashboard has had was a unit error rather than a
+collection error, and a bare number in JSON is exactly as easy to misread as a bare number on screen.
+
 ## perf
 
 The dashboard cannot record: `perf_event_paranoid` blocks attaching to a container process without
