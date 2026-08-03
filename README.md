@@ -2,7 +2,7 @@
 
 Live terminal dashboard for a SereneDB server. Single file, stdlib only, no dependencies.
 
-![serenedash](serenedash.gif)
+![serenedash](serenedash.png)
 
     ./serenedash.py                 refresh every 5s
     ./serenedash.py --once          one frame (scripts, logs)
