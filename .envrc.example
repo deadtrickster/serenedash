@@ -1,0 +1,23 @@
+# direnv: per-checkout settings for serenedash.
+#
+#   cp .envrc.example .envrc && direnv allow
+#
+# The environment beats the config file, so this points the dashboard — and the MCP server, which
+# shares the loader — at the server this checkout belongs to for as long as you are standing in it.
+# Leaving the directory puts your global config back. That is the whole reason the precedence runs
+# this way round.
+
+export SERENEDB_CONTAINER=serenedb
+export SERENEDB_PORT=7890
+export SERENEDB_DATA=/var/lib/serenedb
+
+# Don't put a password in a file that lives in a checkout. Fetch it:
+# export PGPASSWORD="$(pass show serenedb)"
+# or let serenedash run the command itself, so it is not in this process's environment either:
+# export SERENEDASH_PASSWORD_COMMAND="pass show serenedb"
+
+# export SERENEDASH_PERF_DIR="$PWD/.perf"
+# export SERENEDASH_INTERVAL=2
+
+# Colon-separated, like PATH. Build trees holding a binary that matches your captures' build-id.
+# export SERENEDASH_SYMBOL_PATHS="$PWD/build/bin:/opt/serenedb/bin"

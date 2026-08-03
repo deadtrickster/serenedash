@@ -1,0 +1,32 @@
+# serenedash configuration.
+#
+# Copy to one of these, in increasing precedence:
+#   ~/.config/serenedash/config.toml   (or $XDG_CONFIG_HOME/serenedash/config.toml)
+#   $SERENEDASH_CONFIG                 (or --config PATH)
+#   ./serenedash.toml                  (per checkout, resolved from the working directory)
+#
+# Overall precedence: flag > environment > config file > built-in default.
+# The environment wins over files so a .envrc can point the dashboard at whichever server the
+# directory you are standing in belongs to. `serenedash.py --print-config` shows what won.
+
+# The container running serened, and the port it speaks pg-wire on.
+container = "serenedb"
+port = "7890"
+
+# The store's data directory *inside* the container. du runs there for the storage panel.
+data = "/var/lib/serenedb"
+
+# Prefer this over a plaintext `password` — the command runs once at startup and its stdout is the
+# password, so the secret stays wherever you already keep secrets.
+# password_command = "pass show serenedb"
+# password = "..."
+
+# Where perf-snap.sh writes captures.
+# perf_dir = "~/.cache/serenedash/perf"
+
+# Build trees to search for a binary whose GNU build-id matches a capture's. This is what lets an
+# unprivileged reader see symbol names: perf resolves a container binary only for a reader that can
+# reach it through /proc/<pid>/root, which is root — but a build with the same build-id sitting in a
+# local tree resolves the same capture. It does not have to be the same machine the server runs on,
+# only the same build.
+# symbol_paths = ["/path/to/build/bin", "/opt/serenedb/bin"]

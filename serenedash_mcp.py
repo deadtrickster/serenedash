@@ -36,11 +36,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serenedash as dash                                       # noqa: E402
 from mcp.server import MCPServer                                # noqa: E402
 
-CONTAINER = os.environ.get("SERENEDB_CONTAINER", "oracle-serenedb")
-PORT = os.environ.get("SERENEDB_PORT", "7890")
-PASSWORD = os.environ.get("PGPASSWORD", "oracle-sdb")
-DATA = os.environ.get("SERENEDB_DATA", "/var/lib/serenedb")
-PERF = os.environ.get("SERENEDASH_PERF_DIR", os.path.expanduser("~/.cache/serenedash/perf"))
+# The same four layers the dashboard resolves, from the same loader — flag, environment, config
+# file, default. An MCP server is launched by a client with an environment it did not choose, so a
+# config file is often the only layer it has; reading env vars directly (as this did) meant the
+# global config was invisible to exactly the caller most likely to depend on it.
+_CFG, _PROV = dash.load_config()
+CONTAINER, PORT, PASSWORD = _CFG["container"], _CFG["port"], _CFG["password"]
+DATA, PERF = _CFG["data"], _CFG["perf_dir"]
 
 server = MCPServer(
     name="serenedash",

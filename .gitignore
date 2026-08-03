@@ -34,3 +34,7 @@ serenedash.desktop
 
 # The MCP server's venv - see requirements.txt
 .venv/
+
+# A real .envrc is yours, not the repo's - see .envrc.example
+.envrc
+serenedash.toml
