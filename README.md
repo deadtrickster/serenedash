@@ -34,8 +34,17 @@ sparkline is its own bar over time.
 ## MCP
 
 `serenedash_mcp.py` exposes the same collectors as MCP tools, so an agent can read the server's
-state instead of being shown a screenshot of it. `serenedash.py` stays stdlib-only; only the MCP
-server needs the dependency:
+state instead of being shown a screenshot of it.
+
+![asking an agent how the server is doing](serenedash-mcp.png)
+
+That is one `status()` call. The tools return numbers next to the denominators they were measured
+against and findings that carry the evidence for themselves, so the answer can be checked rather
+than believed — "72.6 GiB of orphaned temp files" arrives with the file count, the reason DuckDB
+leaks them, the live-spill figure it is *not* to be confused with, and the command to confirm
+nothing holds them open.
+
+`serenedash.py` stays stdlib-only; only the MCP server needs the dependency:
 
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     .venv/bin/python serenedash_mcp.py              # read-only
