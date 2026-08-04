@@ -176,7 +176,10 @@ def sample(cfg, query_head=200):
         "select database_name, database_size, wal_size, memory_usage, memory_limit, "
         "  total_blocks, used_blocks, free_blocks, block_size "
         "from pragma_database_size() where database_name not in ('memory','postgres')",
-        "select tag, memory_usage_bytes from duckdb_memory() order by memory_usage_bytes desc",
+        # temporary_storage_bytes alongside the usage: which POOL is spilling, not just that
+        # something is. The panel showed usage only and threw the spill column away.
+        "select tag, memory_usage_bytes, temporary_storage_bytes from duckdb_memory() "
+        "order by memory_usage_bytes desc",
         # Excluding this very session. It is `active` by construction — it is the one running this
         # query — so counting it made the panel report "1 active" in green directly above "nothing
         # running", which is the same contradiction read two ways. The query list already dropped it;
@@ -205,7 +208,11 @@ def sample(cfg, query_head=200):
         "db": r[0], "size": to_bytes(r[1]), "wal": to_bytes(r[2]),
         "mem": to_bytes(r[3]), "memlimit": to_bytes(r[4]),
         "blocks": (int(r[5] or 0), int(r[6] or 0), int(r[7] or 0), int(r[8] or 0)),
-        "memtags": [(x[0], int(x[1])) for x in b[1] if len(x) == 2 and x[1].isdigit()],
+        "memtags": [(x[0], int(x[1])) for x in b[1] if len(x) >= 2 and x[1].isdigit()],
+        # {tag: bytes spilled}. Only the tags that actually spilled, so an empty dict is the
+        # normal case and a non-empty one is the finding.
+        "memspill": {x[0]: int(x[2]) for x in b[1]
+                     if len(x) >= 3 and x[2].isdigit() and int(x[2]) > 0},
         "states": {x[0]: int(x[1]) for x in b[2] if len(x) == 2 and x[1].isdigit()},
         # (state, statement head, full statement length). The length is carried so a truncated
         # statement is never mistaken for a short one.
@@ -213,6 +220,71 @@ def sample(cfg, query_head=200):
         "settings": {x[0]: x[1] for x in b[4] if len(x) == 2},
         "t": time.time(),
     }
+
+
+def search(cfg):
+    """`sdb_metrics`, split into server-wide counters and per-index rows. None if unavailable.
+
+    This is the engine SereneDB actually is, and no panel had a number from it. The table is one
+    long (metric, value, description, relation_id) list: rows with an empty relation_id are
+    server-wide, the rest repeat per index. Reshaped here so a renderer does not have to know that.
+
+    Kept separate from `sample` because it is one more round trip for a panel that not every
+    deployment has an index for, and because `sample` is on the 5s tick path.
+    """
+    # relation_id is INT64, not text - coalescing it to '' is a cast error, not an empty string.
+    b = query(cfg, ["select metric, value, coalesce(relation_id::VARCHAR, '') from sdb_metrics"])
+    if b is None:
+        return None
+    server, per = {}, {}
+    for row in b[0] or []:
+        if len(row) != 3:
+            continue
+        name, val, rel = row
+        try:
+            val = int(val)
+        except ValueError:
+            pass
+        (server if not rel else per.setdefault(rel, {}))[name] = val
+    return {"server": server, "indexes": per}
+
+
+def progress(cfg):
+    """`sdb_progress` for backends that are running something. [] when nothing is.
+
+    `pg_stat_activity` says a statement is running. This says how far in and which phase, which is
+    the difference between waiting for it and killing it.
+    """
+    b = query(cfg, ["select pid, coalesce(state,''), coalesce(command,''), coalesce(phase,''), "
+                    "coalesce(percent,0), coalesce(rows_processed,0), coalesce(rows_total,0), "
+                    "coalesce(bytes_processed,0), coalesce(bytes_total,0) "
+                    "from sdb_progress where state = 'active'"])
+    if b is None:
+        return []
+    out = []
+    for r in b[0] or []:
+        if len(r) != 9:
+            continue
+        nums = [float(x or 0) for x in r[4:]]
+        out.append({"pid": r[0], "state": r[1], "command": r[2], "phase": r[3],
+                    "percent": nums[0], "rows_done": nums[1], "rows_total": nums[2],
+                    "bytes_done": nums[3], "bytes_total": nums[4]})
+    return out
+
+
+def temp_files_held(cfg):
+    """(file count, bytes) the SERVER currently holds open in temp_directory. None if unavailable.
+
+    The orphaned/live spill split is otherwise inferred from file mtimes against the process start
+    time, which is sound but circumstantial. This is the server's own answer, and on this deployment
+    it returns nothing at all while 72.6 GiB of duckdb_temp_storage_*.tmp sit on disk - which is the
+    orphan claim proving itself from the inside.
+    """
+    b = query(cfg, ["select count(*), coalesce(sum(size), 0) from duckdb_temporary_files()"])
+    if b is None or not b[0]:
+        return None
+    r = b[0][0]
+    return (int(r[0] or 0), int(r[1] or 0)) if len(r) == 2 else None
 
 
 def full_queries(cfg):
