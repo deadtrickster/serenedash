@@ -179,12 +179,15 @@ def storage() -> dict:
     `spill_live_bytes` and `spill_orphaned_bytes` are reported separately rather than summed. A
     temp file older than the process cannot belong to a query running in it, and counting the two
     together is what makes a server look like it is spilling heavily when it is only holding the
-    wreckage of one that was killed.
+    wreckage of one that was killed. `server_temp_files_held` is the same question asked of the
+    server instead of the filesystem - 0 files open against a full temp directory is the orphan
+    claim proving itself from the inside, which is what to quote before recommending a deletion.
     """
     s, err = _sample()
     if err:
         return err
-    return snap.storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER))
+    return snap.storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER),
+                        db.temp_files_held(CFG))
 
 
 @server.tool()
@@ -194,7 +197,9 @@ def memory() -> dict:
 
     The pools are what the store believes it holds; resident is what is actually in RAM. Read them
     against each other — the gap is usually swap, and a store can sit comfortably under
-    memory_limit while most of it is paged out.
+    memory_limit while most of it is paged out. `spilled_bytes_by_pool` is which pool went to disk:
+    the storage panel can only say the temp directory has bytes in it, and that is as often the
+    wreckage of a killed run as it is a live operator.
     """
     s, err = _sample()
     if err:
@@ -205,10 +210,15 @@ def memory() -> dict:
 @server.tool()
 @stamped
 def activity(max_query_chars: int = 2000) -> dict:
-    """Sessions and their current statements, excluding this connection.
+    """Sessions and their current statements, excluding this connection, with per-query progress.
 
     `nothing_running: true` alongside busy threads is a finding rather than an absence: it means
     work with no session behind it.
+
+    `progress` is `sdb_progress` beside the same sessions. `pg_stat_activity` says a statement is
+    running; this says how far in and which phase, which is the difference between telling someone
+    to wait and telling them to kill it. Unlike the session list it cannot exclude the connection
+    that asked, so one row is always this collector.
 
     Args:
         max_query_chars: statement text is cut at this length. `query_chars` on each row is always
@@ -218,7 +228,32 @@ def activity(max_query_chars: int = 2000) -> dict:
     s, err = _sample(query_head=max_query_chars)
     if err:
         return err
-    return snap.activity(s, max_query_chars)
+    return snap.activity(s, max_query_chars, db.progress(CFG))
+
+
+@server.tool()
+@stamped
+def search() -> dict:
+    """The inverted indexes: documents, segments, size, and whether maintenance is keeping up.
+
+    SereneDB is a search engine and every other tool here measures the process or the store around
+    it. This is the engine's own accounting, from `sdb_metrics`: per index, `num_live_docs` against
+    `num_docs` (the difference is deleted-but-not-reclaimed), `num_buffered_docs` (written, not yet
+    published - why a just-inserted row does not come back), `num_segments`, `index_size_bytes`, the
+    `num_failed_*` counters and the three `avg_*_time_ms`. Server-wide: the refresh, compaction and
+    cleanup active/pending pairs.
+
+    What is misread without it: a periodic CPU spike on a write-heavy server has two candidate
+    causes - a refresh coupled to the autocheckpoint, which is single-threaded with a synchronous
+    segment flush, and compaction. They look identical in `threads` and `profile`. `refresh_active`,
+    `refresh_pending`, `compaction_active` and `avg_consolidation_time_ms` tell them apart, and
+    without them the honest answer is "one of these two". A search index larger than the table it
+    indexes reads as a defect until `index_size_bytes` is set beside the feature flags that
+    explain it.
+
+    Unavailable is reported as unavailable: no index and no connection are not an empty result.
+    """
+    return snap.search(db.search(CFG))
 
 
 @server.tool()
