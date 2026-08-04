@@ -1,18 +1,23 @@
 """serenedash.tui"""
 import argparse
+import json
 import os
 import select
 import shutil
 import signal
 import sys
 import termios
+import textwrap
 import time
 import tty
 
 from .config import config_files, load_config
 from .fmt import C, HIST, NOCOLOR
+from .anomaly import index as anom_index
 from .hover import describe, panel_at, place, tip_box
-from .db import apply_setting, full_queries, query, sample
+from . import history
+from . import snapshot as snap
+from .db import apply_setting, full_queries, query, sample, sql_status
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
@@ -55,6 +60,11 @@ def _on_usr1(_sig, _frm):
 # Most terminals also let Shift bypass tracking and select as usual.
 MOUSE_ON = "\033[?1003h\033[?1006h"
 MOUSE_OFF = "\033[?1003l\033[?1006l"
+
+
+# The views whose numbers all come from SQL. Everything else on the screen is /proc, du or a perf
+# capture, and none of that stops working because a password is wrong.
+NEEDS_SQL = ("storage", "memory", "activity")
 
 
 def write_pidfile(perf_dir):
@@ -197,6 +207,13 @@ def main():
         for p in config_files():
             print(f"    {'✓' if os.path.exists(p) else '·'} {p}")
         return 0
+    if a.once and a.format == "json":
+        # The same builder the MCP server uses, so the two can never disagree about what a
+        # snapshot contains. Reads the recorded history too, which is what lets a one-shot run in
+        # a cron job report drift rather than only this instant.
+        print(json.dumps(snap.collect(cfg, hist=history.load(cfg["perf_dir"])),
+                         indent=2, sort_keys=True))
+        return 0
     a.container, a.port, a.password = cfg["container"], cfg["port"], cfg["password"]
     a.data, a.perf_dir, a.interval = cfg["data"], cfg["perf_dir"], cfg["interval"]
     col = not a.no_color and sys.stdout.isatty()
@@ -208,6 +225,7 @@ def main():
     thr, tcpu, tprev, tlast = [], 0.0, {}, time.time()
     hinfo, wh = {}, (0, 0)
     drows, dfix, dmsg, fullq = None, None, None, None
+    why, recording = None, True
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -251,97 +269,126 @@ def main():
                 # Fetch as much statement text as the widest row could show, and no more. The
                 # terminal is read first precisely so the query can be sized to it.
                 s = sample(cfg, query_head=max(200, shutil.get_terminal_size((100, 40)).columns))
-            if s is None:
-                lines = [f" cannot reach {a.container}:{a.port}"]
+            if fresh:
+                # Only on the data tick: sql_status opens its own connection to find out WHY, and
+                # doing that per keypress would put a failing connect in front of every redraw.
+                why = sql_status(cfg) if s is None else None
+                # du does not need the server. It used to sit behind the same branch as the SQL
+                # panels, so losing the connection also lost the storage sizes, which are read off
+                # the filesystem this process can see perfectly well.
+                if tick % SLOW_EVERY == 0:
+                    sz = slow(cfg, a.data, sz)
+            if fresh and s is not None:
+                hist["mem"] = (hist["mem"] + [s["mem"]])[-HIST:]
+                # Per tag as well as in total. The total tells you memory moved; only the per-tag
+                # traces say WHICH pool moved, and that is the difference between a query holding a
+                # hash table and a table cache that has been growing all afternoon. Tags absent from
+                # this sample record a zero rather than freezing, so a pool that drains reads as
+                # dropping to the floor instead of holding its last value forever.
+                now_tags = dict(s["memtags"])
+                for key in set(now_tags) | {k[2:] for k in hist if k.startswith("t:")}:
+                    hist["t:" + key] = (hist.get("t:" + key, [])
+                                        + [now_tags.get(key, 0)])[-HIST:]
+            if fresh:
+                perf = perf_window(a.perf_dir)
+                hpid = hpid or host_pid(cfg)
+                if hpid:
+                    thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast)
+                hinfo = hostinfo(hpid, cfg["container"])
+                for key, val in (("cpu", tcpu), ("rss", hinfo.get("rss") or 0),
+                                 ("swap", hinfo.get("swap") or 0)):
+                    hist[key] = (hist.get(key, []) + [val])[-HIST:]
+                # On disk as well as in memory. The in-memory window is a bit over two hours and
+                # dies with the process, which makes it a poor baseline for the anomaly rules and
+                # no use at all to the MCP server, which is a different process entirely.
+                if recording:
+                    recording = history.append(a.perf_dir, time.time(),
+                                               {k: v[-1] for k, v in hist.items() if v})
+            tsz = shutil.get_terminal_size((100, 40))
+            w, h = tsz.columns, tsz.lines
+            # A resize invalidates every line on screen, but the redraw below only rewrites the
+            # ones whose TEXT changed — so after growing the terminal the old frame sat there in
+            # pieces until each line happened to differ. Clear once and repaint in full.
+            if (w, h) != wh:
+                wh, shown = (w, h), []
+                if not a.once:
+                    sys.stdout.write("\033[2J")
+            cc = C if col else NOCOLOR
+            if view == "graph":
+                nm, ls = callstacks(a.perf_dir)
+                keybar = status(cc, w, f"{cc['b']}g{cc['r']} {cc['dim']}back{cc['r']}  "
+                                       f"{cc['dim']}·{cc['r']}  {cc['b']}j/k{cc['r']} "
+                                       f"{cc['dim']}scroll{cc['r']}")
+                lines = [f"{cc['b']}call graph{cc['r']}  {cc['dim']}{nm or 'no captures'}"
+                         f"{cc['r']}", ""] + ls[scroll:scroll + max(1, h - 2 - len(keybar))]
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            # Every panel has a view behind it, keyed by its own name. They share one shape:
+            # build the whole thing, slice to the window, and end with the status bar carrying
+            # the key that goes back — so no view is a place you can get stuck.
+            elif view == "doctor":
+                if drows is None or fresh:
+                    drows, dfix = doctor(cfg, a.perf_dir)
+                keybar = status(cc, w, f"{cc['b']}d{cc['r']} {cc['dim']}back{cc['r']}"
+                                + (f"  {cc['dim']}·{cc['r']}  {cc['b']}r{cc['r']} "
+                                   f"{cc['dim']}register symbols{cc['r']}" if dfix else ""))
+                body = doctor_frame(drows, dfix, col, w, scroll, dmsg)
+                lines = body[:max(1, h - len(keybar))]
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view in DETAIL and s is None and view in NEEDS_SQL:
+                # Reachable: its key still works, and a view that refuses to open reads as a broken
+                # key rather than as a missing connection. It says which of the two it is.
+                body = [f"{cc['b']}{view}{cc['r']}  {cc['yel']}{(why or ('unavailable', ''))[0]}"
+                        f"{cc['r']}", ""]
+                body += [f"  {cc['dim']}{ln}{cc['r']}"
+                         for ln in textwrap.wrap((why or ("", ""))[1], max(30, w - 4))]
+                body += ["", f"  {cc['dim']}threads, profile and host do not need a connection and "
+                             f"are still live.{cc['r']}"]
+                keybar = status(cc, w, f"{cc['b']}{DETAIL[view]}{cc['r']} {cc['dim']}back{cc['r']}")
+                lines = body[:max(1, h - len(keybar))]
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view in DETAIL:
+                # The one view that shows whole statements is the one that pays to fetch them,
+                # and only while it is open — but on the data tick, not on every redraw. Inline
+                # in the lambda below it ran per keypress, and with the pointer reporting every
+                # cell it crosses that became a round trip for 185 KB statements per mouse move.
+                if view != "activity":
+                    fullq = None
+                elif fresh or fullq is None:
+                    fullq = full_queries(cfg)
+                body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll),
+                        "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
+                        "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
+                        "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
+                                                         scroll),
+                        "profile": lambda: profile_frame(perf, col, w, scroll),
+                        "host": lambda: host_frame(hinfo, s, col, w, scroll),
+                        "legend": lambda: legend_frame(col, w, scroll)}[view]()
+                keybar = status(cc, w, f"{cc['b']}{DETAIL[view]}{cc['r']} "
+                                       f"{cc['dim']}back{cc['r']}  {cc['dim']}·{cc['r']}  "
+                                       f"{cc['b']}j/k{cc['r']} {cc['dim']}scroll{cc['r']}")
+                # Pinned to the last rows of the terminal, not left floating under whatever the
+                # view happened to be tall. The keys belong in the same place on every screen.
+                lines = body[:max(1, h - len(keybar))]
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view == "config" and s is None:
+                keybar = status(cc, w, f"{cc['b']}c{cc['r']} {cc['dim']}back{cc['r']}")
+                lines = ([f"{cc['b']}config{cc['r']}  {cc['yel']}"
+                          f"{(why or ('unavailable', ''))[0]}{cc['r']}", "",
+                          f"  {cc['dim']}the settings are the server's own; there is no reading "
+                          f"them without a connection{cc['r']}"])
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view == "config":
+                # 297 settings is a big result and they change only when someone changes them,
+                # so it is fetched on the data tick and reused for every keypress in between.
+                if fresh or not crows:
+                    rows_ = query(cfg,
+                               ["select name, value, coalesce(description,''), "
+                                "input_type, scope from duckdb_settings()"])
+                    crows = rows_[0] if rows_ else []
+                lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
             else:
-                if fresh:
-                    if tick % SLOW_EVERY == 0:
-                        sz = slow(cfg, a.data, sz)
-                    hist["mem"] = (hist["mem"] + [s["mem"]])[-HIST:]
-                    # Per tag as well as in total. The total tells you memory moved; only the
-                    # per-tag traces say WHICH pool moved, and that is the difference between a
-                    # query holding a hash table and a table cache that has been growing all
-                    # afternoon. Tags absent from this sample record a zero rather than freezing,
-                    # so a pool that drains reads as dropping to the floor instead of holding its
-                    # last value forever.
-                    for key, val in (("cpu", tcpu), ("rss", hinfo.get("rss") or 0),
-                                     ("swap", hinfo.get("swap") or 0)):
-                        hist[key] = (hist.get(key, []) + [val])[-HIST:]
-                    now_tags = dict(s["memtags"])
-                    for key in set(now_tags) | {k[2:] for k in hist if k.startswith("t:")}:
-                        hist["t:" + key] = (hist.get("t:" + key, [])
-                                            + [now_tags.get(key, 0)])[-HIST:]
-                    perf = perf_window(a.perf_dir)
-                    hpid = hpid or host_pid(cfg)
-                    if hpid:
-                        thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast)
-                    hinfo = hostinfo(hpid, cfg["container"])
-                tsz = shutil.get_terminal_size((100, 40))
-                w, h = tsz.columns, tsz.lines
-                # A resize invalidates every line on screen, but the redraw below only rewrites the
-                # ones whose TEXT changed — so after growing the terminal the old frame sat there in
-                # pieces until each line happened to differ. Clear once and repaint in full.
-                if (w, h) != wh:
-                    wh, shown = (w, h), []
-                    if not a.once:
-                        sys.stdout.write("\033[2J")
-                cc = C if col else NOCOLOR
-                if view == "graph":
-                    nm, ls = callstacks(a.perf_dir)
-                    keybar = status(cc, w, f"{cc['b']}g{cc['r']} {cc['dim']}back{cc['r']}  "
-                                           f"{cc['dim']}·{cc['r']}  {cc['b']}j/k{cc['r']} "
-                                           f"{cc['dim']}scroll{cc['r']}")
-                    lines = [f"{cc['b']}call graph{cc['r']}  {cc['dim']}{nm or 'no captures'}"
-                             f"{cc['r']}", ""] + ls[scroll:scroll + max(1, h - 2 - len(keybar))]
-                    lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
-                # Every panel has a view behind it, keyed by its own name. They share one shape:
-                # build the whole thing, slice to the window, and end with the status bar carrying
-                # the key that goes back — so no view is a place you can get stuck.
-                elif view == "doctor":
-                    if drows is None or fresh:
-                        drows, dfix = doctor(cfg, a.perf_dir)
-                    keybar = status(cc, w, f"{cc['b']}d{cc['r']} {cc['dim']}back{cc['r']}"
-                                    + (f"  {cc['dim']}·{cc['r']}  {cc['b']}r{cc['r']} "
-                                       f"{cc['dim']}register symbols{cc['r']}" if dfix else ""))
-                    body = doctor_frame(drows, dfix, col, w, scroll, dmsg)
-                    lines = body[:max(1, h - len(keybar))]
-                    lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
-                elif view in DETAIL:
-                    # The one view that shows whole statements is the one that pays to fetch them,
-                    # and only while it is open — but on the data tick, not on every redraw. Inline
-                    # in the lambda below it ran per keypress, and with the pointer reporting every
-                    # cell it crosses that became a round trip for 185 KB statements per mouse move.
-                    if view != "activity":
-                        fullq = None
-                    elif fresh or fullq is None:
-                        fullq = full_queries(cfg)
-                    body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll),
-                            "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
-                            "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
-                            "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
-                                                             scroll),
-                            "profile": lambda: profile_frame(perf, col, w, scroll),
-                            "host": lambda: host_frame(hinfo, s, col, w, scroll),
-                            "legend": lambda: legend_frame(col, w, scroll)}[view]()
-                    keybar = status(cc, w, f"{cc['b']}{DETAIL[view]}{cc['r']} "
-                                           f"{cc['dim']}back{cc['r']}  {cc['dim']}·{cc['r']}  "
-                                           f"{cc['b']}j/k{cc['r']} {cc['dim']}scroll{cc['r']}")
-                    # Pinned to the last rows of the terminal, not left floating under whatever the
-                    # view happened to be tall. The keys belong in the same place on every screen.
-                    lines = body[:max(1, h - len(keybar))]
-                    lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
-                elif view == "config":
-                    # 297 settings is a big result and they change only when someone changes them,
-                    # so it is fetched on the data tick and reused for every keypress in between.
-                    if fresh or not crows:
-                        rows_ = query(cfg,
-                                   ["select name, value, coalesce(description,''), "
-                                    "input_type, scope from duckdb_settings()"])
-                        crows = rows_[0] if rows_ else []
-                    lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
-                else:
-                    lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h)
-                prev = s
+                lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why)
+            prev = s
             tick += 1
             if a.once:
                 print("\n".join(lines))
@@ -359,7 +406,7 @@ def main():
             # recomputed when the screen changes under a pointer that has not moved — otherwise it
             # keeps answering for the row that used to be there after a scroll, a view change, or a
             # thread dropping off the list.
-            tip = describe(lines, mpos[1], mpos[0], view) if tipon else None
+            tip = describe(lines, mpos[1], mpos[0], view, anom_index(hist)) if tipon else None
             if tip:
                 # Drawn over the finished frame rather than into it. The frame's height is a budget
                 # every panel is fitted to, and a box that pushed rows down to make room for itself
@@ -420,7 +467,7 @@ def main():
                     continue
                 if kind == "release":
                     continue
-                new = describe(lines, my, mx, view)
+                new = describe(lines, my, mx, view, anom_index(hist))
                 # Redraw only when the answer or the row changes. Moving along a row leaves the box
                 # exactly where it is: any-event tracking fires once per cell crossed, so following
                 # the pointer sideways costs a frame rebuild per column and gives a box that jitters

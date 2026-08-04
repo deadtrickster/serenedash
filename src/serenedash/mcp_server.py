@@ -30,14 +30,12 @@ Requires the `mcp` package (see requirements.txt). serenedash.py itself stays st
 import argparse
 import time
 
-import re
-
 from mcp.server import MCPServer
 
 from . import config as _config
-from . import db, perf, system
-from .fmt import human
-from .hazards import HAZARDS, kernel_of
+from . import anomaly, db, history, perf, system
+from . import snapshot as snap
+from .hazards import HAZARDS
 
 # The same four layers the dashboard resolves, from the same loader — flag, environment, config
 # file, default. An MCP server is launched by a client with an environment it did not choose, so a
@@ -85,201 +83,21 @@ def _threads(window: float = 1.0):
     return rows, total, pid
 
 
-def _temp_split(sz, host):
-    """Live spill vs files older than the process. The split, not the sum — see storage()."""
-    started = time.time() - host["uptime"] if host.get("uptime") else None
-    orph = [f for f in (sz.get("temp_files") or []) if started and f[0] < started]
-    orph_bytes = sum(f[1] for f in orph)
-    return orph, orph_bytes, max(0, (sz.get("temp") or 0) - orph_bytes)
-
-
 @server.tool()
 def status(thread_window: float = 1.0) -> dict:
     """Everything the dashboard shows, in one call, with the findings called out.
 
     Start here. `findings` is the part worth reading first: each entry is a condition that was
     measured rather than inferred, with the numbers behind it, so it can be checked rather than
-    trusted. An empty list means nothing tripped, not that nothing was looked at.
+    trusted. An empty list means nothing tripped, not that nothing was looked at. Findings whose
+    `what` starts with `anomaly:` come from the recorded history rather than from this instant —
+    they are judged against the series' own past, so they catch drift that no threshold can.
 
     Args:
         thread_window: seconds between the two /proc samples the CPU figures are derived from.
             Longer is steadier and slower; below ~0.5s quantisation starts to show.
     """
-    s, err = _sample()
-    if err:
-        return err
-    host = system.hostinfo(_pid(), CONTAINER)
-    sz = system.slow(CFG, DATA)
-    rows, tcpu, pid = _threads(thread_window)
-    newest, tops, by_tid = perf.perf_window(PERF)
-    orph, orph_bytes, live_spill = _temp_split(sz, host)
-
-    findings = []
-    if orph_bytes:
-        findings.append({
-            "what": "orphaned temp files",
-            "detail": f"{len(orph)} files, {human(orph_bytes)}, all older than the running "
-                      f"serened. DuckDB deletes temp files only in a destructor and never sweeps "
-                      f"at startup, so a killed server leaks them and no later run reclaims them.",
-            "bytes_reclaimable": orph_bytes,
-            "verify": "nothing holds them open: ls -l /proc/1/fd | grep -c tmp, inside the container",
-        })
-    if (host.get("swap") or 0) > 0:
-        findings.append({
-            "what": "process memory paged out",
-            "detail": f"{human(host['swap'])} of serened is in swap while duckdb_memory() "
-                      f"reports {human(s['mem'])} held. Every touch of that memory is a disk "
-                      f"read, and memory_limit does not count it.",
-            "swap_bytes": host.get("swap"), "rss_bytes": host.get("rss"),
-        })
-    ratio = s["wal"] / s["size"] if s["size"] else 0
-    if ratio > 1:
-        findings.append({
-            "what": "checkpoints not completing",
-            "detail": f"WAL is {ratio:.1f}x the database. Look for write errors, not for tuning.",
-            "wal_bytes": s["wal"], "database_bytes": s["size"],
-        })
-    lim, ram = s["memlimit"] or 0, host.get("ram_total") or 0
-    if ram and lim > ram * 0.75:
-        findings.append({
-            "what": "memory_limit oversubscribed",
-            "detail": f"memory_limit is {lim / ram * 100:.0f}% of the machine's {human(ram)} "
-                      f"of RAM, which anything else on the box has to fit around.",
-            "memory_limit_bytes": lim, "ram_total_bytes": ram,
-        })
-    for name in sorted(HAZARDS):
-        why, pred = HAZARDS[name]
-        warn = pred(str(s["settings"].get(name, "?")), s) if pred else None
-        if warn:
-            findings.append({"what": f"setting: {name}", "detail": warn,
-                             "value": s["settings"].get(name)})
-
-    return {
-        "findings": findings,
-        "storage": _storage(s, sz, host),
-        "memory": _memory(s, host),
-        "activity": _activity(s),
-        "threads": _threads_out(rows, tcpu, by_tid, host, thread_window),
-        "profile": _profile(newest, tops),
-        "host": _host(host, s),
-        "config": {n: s["settings"].get(n) for n in sorted(HAZARDS)},
-    }
-
-
-def _storage(s, sz, host):
-    tot = sz.get("total") or 1
-    orph, orph_bytes, live_spill = _temp_split(sz, host)
-    return {
-        "on_disk_bytes": tot,
-        "database_bytes": s["size"],
-        "note": "database is the store's own logical size; the directory sizes below are du and "
-                "sum to on_disk_bytes. The two are different measures and will not match.",
-        "wal_bytes": s["wal"],
-        "wal_over_database": round(s["wal"] / s["size"], 4) if s["size"] else None,
-        "directories": {
-            "columnar_bytes": sz.get("duck"), "search_index_bytes": sz.get("index"),
-            "temp_bytes": sz.get("temp"),
-        },
-        "spill_live_bytes": live_spill,
-        "spill_orphaned_bytes": orph_bytes,
-        "spill_orphaned_files": len(orph),
-        "blocks": dict(zip(("total", "used", "free", "size_bytes"), s["blocks"], strict=True)),
-    }
-
-
-def _memory(s, host):
-    rss, swap = host.get("rss") or 0, host.get("swap") or 0
-    return {
-        "duckdb_memory_bytes": s["mem"],
-        "memory_limit_bytes": s["memlimit"],
-        "used_fraction_of_limit": round(s["mem"] / s["memlimit"], 4) if s["memlimit"] else None,
-        "resident_bytes": rss,
-        "swapped_bytes": swap,
-        "peak_resident_bytes": host.get("peak"),
-        "note": "duckdb_memory() counts what the store believes it holds; resident is what is in "
-                "RAM now. A large gap is usually swap, which memory_limit does not account for.",
-        "pools": dict(s["memtags"]),
-    }
-
-
-def _activity(s, max_query_chars=400):
-    """Sessions, with statement text BOUNDED.
-
-    Statements are unbounded server-supplied text and the caller is a context window. A single
-    generated INSERT on this deployment is ~185 KB, so twelve sessions returned 1.66 MB in one
-    call — enough to blow the tool-result limit on its own, with every other panel in the response
-    adding up to under 14 KB. The head of a statement identifies it; the body is bulk. The full
-    length is reported so a truncated one is never mistaken for a short one.
-    """
-    rows = []
-    for st, q, full_len in s["queries"]:
-        if "pg_stat_activity" in q:
-            continue
-        row = {"state": st, "query": (q[:max_query_chars] or None), "query_chars": full_len}
-        if full_len > len(row["query"] or ""):
-            row["query_truncated"] = True
-        rows.append(row)
-    active = [r for r in rows if r["state"] == "active"]
-    return {
-        "sessions_total": sum(s["states"].values()),
-        "by_state": s["states"],
-        "note": "excludes this connection, which is active by construction. Statement text is cut "
-                f"at {max_query_chars} chars; query_chars is always the full length.",
-        "nothing_running": not active,
-        "nothing_running_means": "a pinned core with no active session is work with no session "
-                                 "behind it - an orphaned server-side task",
-        "sessions": rows,
-    }
-
-
-def _threads_out(rows, tcpu, by_tid, host, window):
-    cores = host.get("cores") or 1
-    return {
-        "process_cpu_percent": round(tcpu, 1),
-        "of_percent": cores * 100,
-        "cores": cores,
-        "note": f"percentages are shares of ONE core, summed over all threads. {cores * 100}% is "
-                f"the machine. Sampled over {window}s.",
-        "os_threads": host.get("threads"),
-        "threads": [
-            {"tid": tid, "name": name, "cpu_percent_of_one_core": round(pct, 1),
-             "state": st, "blocked_in_io": st == "D",
-             "symbol": (by_tid.get(tid) or [None])[0]}
-            for pct, name, st, tid in rows
-        ],
-    }
-
-
-def _profile(newest, tops):
-    fam = {}
-    for sym, pct in tops:
-        fam[kernel_of(sym)] = fam.get(kernel_of(sym), 0.0) + pct
-    tot = sum(fam.values()) or 1
-    return {
-        "capture": newest,
-        "note": "shares of sampled cycles over the newest captures. Engine shares are computed "
-                "over the whole profile, not over the symbols listed here.",
-        "engines": {k: round(v / tot * 100, 1) for k, v in
-                    sorted(fam.items(), key=lambda kv: -kv[1])},
-        "symbols": [{"symbol": re.sub(r"^\[[.k]\]\s*", "", sym),
-                     "kernel": sym.startswith("[k]"),
-                     "engine": kernel_of(sym), "percent": round(pct, 2)}
-                    for sym, pct in tops[:25]],
-    }
-
-
-def _host(host, s):
-    ram = host.get("ram_total") or 0
-    lim = s["memlimit"] or 0
-    return {
-        "container": host.get("container"), "pid": host.get("pid"),
-        "uptime_seconds": int(host.get("uptime") or 0),
-        "cores": host.get("cores"), "load": host.get("load"),
-        "ram_total_bytes": ram, "ram_available_bytes": host.get("ram_avail"),
-        "swap_total_bytes": host.get("swap_total"),
-        "swap_used_bytes": (host.get("swap_total") or 0) - (host.get("swap_free") or 0),
-        "memory_limit_fraction_of_ram": round(lim / ram, 4) if ram else None,
-    }
+    return snap.collect(CFG, thread_window=thread_window, hist=history.load(PERF))
 
 
 @server.tool()
@@ -294,7 +112,7 @@ def storage() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER))
+    return snap.storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER))
 
 
 @server.tool()
@@ -308,7 +126,7 @@ def memory() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _memory(s, system.hostinfo(_pid(), CONTAINER))
+    return snap.memory(s, system.hostinfo(_pid(), CONTAINER))
 
 
 @server.tool()
@@ -326,7 +144,7 @@ def activity(max_query_chars: int = 2000) -> dict:
     s, err = _sample(query_head=max_query_chars)
     if err:
         return err
-    return _activity(s, max_query_chars)
+    return snap.activity(s, max_query_chars)
 
 
 @server.tool()
@@ -344,7 +162,7 @@ def threads(window: float = 1.0) -> dict:
     if not pid:
         return {"error": f"cannot resolve the host pid for {CONTAINER}"}
     _, _, by_tid = perf.perf_window(PERF)
-    return _threads_out(rows, tcpu, by_tid, system.hostinfo(pid, CONTAINER), window)
+    return snap.threads(rows, tcpu, by_tid, system.hostinfo(pid, CONTAINER), window)
 
 
 @server.tool()
@@ -355,7 +173,7 @@ def profile() -> dict:
     blocks attaching to a container process without root), so this reads what perf-snap.sh wrote.
     """
     newest, tops, _ = perf.perf_window(PERF)
-    out = _profile(newest, tops)
+    out = snap.profile(newest, tops)
     if not tops:
         out["hint"] = "no captures. run: sudo ./perf-snap.sh --container " + CONTAINER
     return out
@@ -386,7 +204,7 @@ def host() -> dict:
     s, err = _sample()
     if err:
         return err
-    return _host(system.hostinfo(_pid(), CONTAINER), s)
+    return snap.hostinfo(system.hostinfo(_pid(), CONTAINER), s)
 
 
 @server.tool()
@@ -420,6 +238,65 @@ def config(name: str = "") -> dict:
         out[n] = {"value": val, "why_it_matters": why,
                   "verdict": (pred(val, s) if pred else None) or "nothing wrong on this server"}
     return out
+
+
+@server.tool()
+def query(sql: str, max_rows: int = 200, max_chars: int = 20000) -> dict:
+    """Run one read-only statement against the server and get the rows back.
+
+    The panels answer the questions they were built for. This is for the ones they were not: joining
+    duckdb_settings() against what a session is actually doing, counting something in a system view,
+    checking whether the thing a finding claims is really there. Without it the honest move on a
+    question the panels do not cover is to write the SQL out and ask someone else to run it, which
+    is a diagnosis that stops halfway.
+
+    Refused unless the statement's leading keyword is one that cannot write, and the connection is
+    opened read-only regardless, so the server would reject a write that got past the check. Results
+    are capped by rows and then by characters — this returns into a context window, and one wide
+    system view can be megabytes.
+
+    Args:
+        sql: a single statement. No semicolon-separated batches.
+        max_rows: rows to return at most.
+        max_chars: total characters of row data to return at most, applied after max_rows.
+    """
+    return db.read_query(CFG, sql, max_rows=max_rows, max_chars=max_chars)
+
+
+@server.tool()
+def anomalies() -> dict:
+    """What has moved, judged against the recorded history rather than a threshold.
+
+    Reads the series the dashboard writes as it runs. With no dashboard running there is no history
+    to judge against and this says so — it does not fall back to a single instant, because a
+    baseline of one sample would report every value as normal.
+    """
+    hist = history.load(PERF)
+    if not hist:
+        return {"available": False,
+                "reason": f"no history at {history.path(PERF)}",
+                "fix": "run the dashboard (serenedash) - it records one sample per tick, and the "
+                       "file outlives it",
+                "note": "the threshold findings in status() do not need this; only the drift ones do"}
+    n = max((len(v) for v in hist.values()), default=0)
+    if n < anomaly.MIN_SPIKE:
+        # An empty list from a window this short would read as "nothing is wrong". It is not the
+        # same claim, and the difference is exactly the one this tool exists to keep straight.
+        return {"available": False, "samples": n,
+                "reason": f"only {n} samples recorded; no rule may speak below "
+                          f"{anomaly.MIN_SPIKE}",
+                "fix": "leave the dashboard running - one sample per tick, 5s by default",
+                "note": "not a report that nothing tripped: there is not enough history to judge"}
+    scanned = anomaly.scan(hist)
+    return {
+        "available": True,
+        "samples": n,
+        "series": sorted(hist),
+        "anomalies": [a.as_finding() for a in scanned],
+        "note": "nothing here means nothing tripped over the recorded window, not that nothing was "
+                "looked at. Every series is checked for a level shift, a monotonic climb, and a "
+                "single-sample excursion, in that order.",
+    }
 
 
 def _install_write_tools():

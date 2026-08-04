@@ -71,3 +71,47 @@ def test_legend_covers_every_panel():
     # nobody can check.
     sections = {name for name, _ in LEGEND}
     assert {"storage", "memory", "activity", "threads", "profile", "host", "config"} <= sections
+
+
+def render_offline(w, h, why=("no credentials", "set a password: PGPASSWORD")):
+    """The frame with no server. Everything on it comes from /proc, du and perf captures."""
+    sz = {"duck": 2**35, "index": 2**34, "temp": 2**30, "total": 2**36, "temp_files": [],
+          "temp_d": 0, "dt": 60}
+    host = {"cores": 24, "load": ["1", "2", "3"], "threads": 100, "rss": 2**33, "swap": 2**32,
+            "peak": 2**34, "uptime": 3600, "ram_total": 128 * 2**30, "pid": 1, "container": "c"}
+    thr = [(50.0, "tid 1", "R", "1"), (10.0, "tid 2", "S", "2")]
+    return frame(None, None, sz, {}, (None, [], {}), thr, 60.0, host, False, w, h, why)
+
+
+@pytest.mark.parametrize(("w", "h"), SIZES)
+def test_a_frame_without_a_server_still_fits_and_still_says_why(w, h):
+    # It used to be one line saying it could not connect, which threw away the threads panel, the
+    # profile and the host - none of which need a connection.
+    lines = render_offline(w, h)
+    assert len(lines) <= h
+    assert max(len(strip(ln)) for ln in lines) <= w
+    flat = strip("\n".join(lines))
+    assert "no credentials" in flat
+    assert "PGPASSWORD" in flat
+
+
+def test_the_panels_that_do_not_need_sql_keep_their_numbers():
+    # du and /proc are still readable. Dropping them with the SQL panels was throwing away the
+    # half of the screen that still worked.
+    flat = strip("\n".join(render_offline(150, 46)))
+    assert "columnar" in flat and "search idx" in flat, "du sizes are not the server's"
+    assert "resident" in flat and "swapped" in flat, "/proc is not the server's"
+    assert "tid 1" in flat, "the threads panel is /proc"
+
+
+def test_no_sql_panel_invents_a_number():
+    # `sessions 0` above `nothing running`, drawn off an empty result, would not be a degraded
+    # panel - it would be a false one.
+    flat = strip("\n".join(render_offline(150, 46)))
+    assert "nothing running" not in flat
+    assert "sessions" not in flat
+
+
+def test_the_frame_keeps_its_height_with_and_without_a_server():
+    # Otherwise losing the connection reshuffles every panel on the screen.
+    assert len(render(150, 46)) == len(render_offline(150, 46))

@@ -13,6 +13,7 @@ this dashboard has had over and over.
 import re
 import textwrap
 
+from .anomaly import series_of
 from .fmt import COL_BAR, COL_LABEL, COL_VALUE, SPARK, strip
 
 # What the panel as a whole is, for a pointer that is on a border, a heading, or a row whose label
@@ -120,8 +121,13 @@ def _phrases(text, col):
     return out
 
 
-def describe(lines, row, col, view="main"):
-    """(title, body) for the point, or None. Title is `panel · term`."""
+def describe(lines, row, col, view="main", found=None):
+    """(title, body) for the point, or None. Title is `panel · term`.
+
+    `found` is anomaly.index(hist). A row a rule fired on answers with what was measured before it
+    answers with what the label means — the panel can only afford to colour that label, so the
+    reasoning has to be reachable, and under the pointer is where someone will look for it.
+    """
     if not (0 <= row < len(lines)):
         return None
     text = strip(lines[row])
@@ -143,6 +149,10 @@ def describe(lines, row, col, view="main"):
     # panel itself.
     if sec and set("┌└─┐┘") & set(seg or text):
         return sec, PANELS[sec]
+
+    hit = (found or {}).get(series_of(label)) if label else None
+    if hit:
+        return f"{sec or hit.name} · {hit.label()}", hit.detail
 
     lookups = _phrases(seg, off) + ([label.lower()] if label else [])
     for key in lookups:

@@ -70,6 +70,29 @@ data tick.
   the longest line **plus one** — sized to the longest line itself, that row's padding went negative
   and it printed a column past its own border, over the frame beneath.
 
+## Degrade by panel, not by process
+
+Losing the connection used to replace the whole screen with one line saying it could not reach the
+server. Most of what is on screen never needed it: the threads panel and the profile are /proc and
+perf captures, the storage directory sizes are `du`, and `resident`/`swapped` are `/proc/<pid>`.
+A server that will not accept a connection is exactly when those are worth looking at.
+
+So each panel keeps the rows it can still measure and says which of `no driver` /
+`no credentials` / `cannot connect` applies to the rest, with the fix. What it must NOT do is draw
+the shape with zeros in it: `sessions 0` above `nothing running`, rendered from an empty result, is
+not a degraded panel, it is a false one. Activity and config are replaced wholesale for that reason
+and storage and memory are not.
+
+The frame keeps its height either way. A layout that depends on whether a password is set is one
+you have to re-read whenever the connection blips.
+
+## Absence of evidence
+
+`findings: []` means nothing tripped. `anomalies` on eleven samples means nothing could have
+tripped, and reporting those the same way is the one mistake this whole file exists to prevent — it
+is the same error as `sleeping` on a thread at 60%, one level up. Anything that judges a window
+says how much window it had, and refuses when there is not enough.
+
 ## Explanations live in one place
 
 The tooltip does not carry its own prose. It looks up `LEGEND`, which already claims to document
@@ -96,6 +119,11 @@ target — those genuinely differ.
 
 One implementation of each collector, shared by the TUI and the MCP server. Two copies of the thread
 accounting would drift within a week.
+
+That applies above the collectors too. The whole-server snapshot lived inside the MCP server, which
+made `--format json` impossible to write without either a second implementation or a dependency on
+`mcp` for a flag that has nothing to do with it. It is `snapshot.py` now: one builder, three callers
+— `status()`, `--format json`, and the findings the dashboard shows.
 
 `perf-snap.sh` must pass `shellcheck` and `shfmt` before it ships.
 

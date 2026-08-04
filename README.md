@@ -8,7 +8,14 @@ Live terminal dashboard for a SereneDB server, and the same collectors over MCP.
 
     serenedash                    refresh every 5s
     serenedash --once             one frame (scripts, logs)
+    serenedash --once --format json   the same snapshot the MCP server returns
     serenedash --print-config     resolved settings, and which layer each came from
+
+Credentials are optional. Without them the threads, profile and host panels are live, the storage
+directory sizes and the process's resident and paged-out memory are live — all of that is /proc, du
+and perf captures — and the panels that genuinely need the server say which of "no driver", "no
+credentials" or "cannot connect" applies, and how to fix it. Nothing is drawn off an empty result:
+`sessions 0` above `nothing running` would be a false panel, not a degraded one.
 
 Configuration is layered: flag > environment > config file > default. Nothing about a particular
 deployment is compiled in — see `serenedash.toml.example` and `.envrc.example`, and `--print-config`
@@ -47,6 +54,29 @@ Every bar and its history share one denominator, and each panel says what that d
 thread bar is a share of one core; storage shares add to 100 against the on-disk total; a memory
 sparkline is its own bar over time.
 
+## Anomalies
+
+Everything else here compares against a threshold somebody chose — WAL over 1x the database,
+memory_limit over 75% of RAM. Those cannot catch a pool that has been climbing all afternoon, which
+is not over any limit until it is. So each series is also judged against **its own recent past**:
+
+| rule | shape | example |
+|---|---|---|
+| `spike` | one sample far from the window behind it | a query allocates 22 GB and gives it back |
+| `step up` / `step down` | the recent quarter sits at a different level from everything before it | RSS moves and stays moved |
+| `climbing` | materially higher than it started, in many small increments | the leak shape — something is not being released |
+
+The baseline is a median and the spread a median absolute deviation, not a mean and a standard
+deviation. Both are computed over a window that *contains* the event being looked for: a mean is
+dragged toward a spike and a standard deviation inflated by it, so a large enough excursion raises
+the bar enough to hide itself. The median pair survives up to half the window being the event.
+
+A detected row gets a coloured label on the main frame — that is all the space there is — and `m`,
+the tooltip and the MCP `findings` carry what was measured, what was expected, and over how long.
+Samples are also written to `<perf_dir>/history.jsonl` as the dashboard runs, so the baseline
+outlives a restart and the MCP server (a different process, one instant per call) has something to
+judge against. Under 24 samples nothing speaks, and it says that rather than reporting all clear.
+
 ## MCP
 
 `serenedash-mcp` exposes the same collectors as MCP tools, so an agent can read the server's
@@ -68,11 +98,20 @@ For Claude Code, from the directory you start it in:
 
     claude mcp add serenedash -- /path/to/.venv/bin/serenedash-mcp
 
-Tools: `status` `storage` `memory` `activity` `threads` `profile` `callgraph` `host` `config`, plus
-`set_setting` under `--allow-write`. `status` is one round trip and leads with `findings` — each
-one a condition that was measured, with the numbers behind it and how to check it, rather than a
-verdict to be taken on trust. Same environment variables as the dashboard
-(`SERENEDB_CONTAINER`, `PGPASSWORD`, `SERENEDASH_PERF_DIR`, …).
+Tools: `status` `storage` `memory` `activity` `threads` `profile` `callgraph` `host` `config`
+`query` `anomalies`, plus `set_setting` under `--allow-write`. `status` is one round trip and leads
+with `findings` — each one a condition that was measured, with the numbers behind it and how to
+check it, rather than a verdict to be taken on trust. Same environment variables as the dashboard
+(`SERENEDB_CONTAINER`, `PGPASSWORD`, `SERENEDASH_PERF_DIR`, …), and the same snapshot builder as
+`--format json`, so the two cannot disagree about what a snapshot contains.
+
+`query` runs **one read-only statement** and returns the rows. The panels answer the questions they
+were built for; this is for the ones they were not, and without it the honest move on a question the
+panels do not cover is to write the SQL out and ask someone else to run it — a diagnosis that stops
+halfway. Three independent bounds: the statement's leading keyword must be one that cannot write
+(an allowlist, checked before any connection is opened, and it sees through comments and brackets),
+no semicolon batches, and the connection is opened read-only regardless — so the server would reject
+a write that got past the check. Results are capped by rows and then by characters.
 
 Rates arrive next to their base — `{"cpu_percent_of_one_core": 94.9, "cores": 24}`, storage shares
 with the total they divide. Every display bug this dashboard has had was a unit error rather than a

@@ -50,6 +50,97 @@ def query(cfg, sql, timeout=30):
         return None
 
 
+# Statement kinds that cannot change anything. An allowlist rather than a blocklist of DDL/DML: a
+# blocklist has to be complete to be correct, and DuckDB grows statement kinds faster than anyone
+# will remember to update it. Anything not named here is refused, including anything unparseable.
+#
+# This is a second line, not the only one. The connection is opened read-only, so the server itself
+# rejects a write regardless of what gets past this — but "the server would have refused it" is a
+# poor thing to find out from a caller's error message, and read-only does not stop a statement
+# from being expensive.
+READ_ONLY = ("select", "with", "show", "describe", "explain", "summarize", "pragma", "values",
+             "table", "from", "call")
+
+# `call` and `pragma` are the two that need thinking about: both reach procedures, and DuckDB's
+# read-only mode is what actually stops the ones that write. They are here because the settings and
+# memory views this whole tool is built on are pragmas, and refusing them would mean an agent can
+# read every panel except through the one tool meant for asking its own questions.
+
+
+def statement_kind(sql):
+    """The leading keyword, with comments and leading punctuation stripped. '' if there is none."""
+    s = (sql or "").strip()
+    while True:
+        if s.startswith("--"):
+            s = s.split("\n", 1)[1].strip() if "\n" in s else ""
+        elif s.startswith("/*"):
+            s = s.split("*/", 1)[1].strip() if "*/" in s else ""
+        elif s.startswith("("):
+            s = s[1:].strip()
+        else:
+            break
+    m = re.match(r"[A-Za-z_]+", s)
+    return m.group(0).lower() if m else ""
+
+
+def read_query(cfg, sql, max_rows=200, max_chars=20000, timeout=30):
+    """One read-only statement, with its column names. Returns a dict, never raises.
+
+    Bounded in three independent ways because a caller here is a context window rather than a
+    terminal: the statement kind must be one that cannot write, the row count is capped, and the
+    rendered size is capped after that — a hundred rows of a wide table is still megabytes, and the
+    tool result limit is the same one that a 1.66 MB `activity` response blew through once already.
+    """
+    drv = pg_driver()
+    if drv is None:
+        return {"error": "no driver", "fix": "pip install 'psycopg[binary]'"}
+    if not cfg.get("password"):
+        return {"error": "no credentials",
+                "fix": "PGPASSWORD, `password`, or `password_command` in the config file"}
+    if ";" in sql.strip().rstrip(";"):
+        return {"error": "one statement at a time",
+                "detail": "a batch would let a read-only kind carry a write behind it"}
+    kind = statement_kind(sql)
+    if kind not in READ_ONLY:
+        return {"error": f"refused: {kind or 'unrecognised'} is not a read-only statement",
+                "allowed": list(READ_ONLY),
+                "detail": "the connection is opened read-only as well, so this is the first of two "
+                          "checks rather than the only one"}
+    try:
+        with drv.connect(host=cfg.get("host") or "127.0.0.1", port=int(cfg["port"]),
+                         user=cfg.get("user") or "postgres", password=cfg["password"],
+                         dbname=cfg.get("database") or "postgres",
+                         connect_timeout=min(10, timeout)) as cn:
+            cn.read_only = True
+            with cn.cursor() as cur:
+                cur.execute(sql)
+                cols = [d.name for d in cur.description] if cur.description else []
+                rows = cur.fetchmany(max_rows + 1) if cur.description else []
+    except Exception as e:                                       # noqa: BLE001
+        # The server's own message, which is the useful half of a failed query. Trimmed, because a
+        # DuckDB parse error quotes the statement back with a caret diagram.
+        return {"error": "query failed", "detail": str(e).strip()[:2000]}
+    more = len(rows) > max_rows
+    rows = [["" if v is None else str(v) for v in r] for r in rows[:max_rows]]
+    out = {"columns": cols, "rows": rows, "row_count": len(rows)}
+    if more:
+        out["truncated_rows"] = True
+        out["note"] = f"stopped at {max_rows} rows; add LIMIT or raise max_rows"
+    size = sum(len(v) for r in rows for v in r)
+    if size > max_chars:
+        keep, used = [], 0
+        for r in rows:
+            used += sum(len(v) for v in r)
+            if used > max_chars:
+                break
+            keep.append(r)
+        out["rows"], out["row_count"] = keep, len(keep)
+        out["truncated_chars"] = True
+        out["note"] = (f"{size} characters over the {max_chars} limit; kept the first "
+                       f"{len(keep)} of {len(rows)} rows")
+    return out
+
+
 def sql_status(cfg):
     """Why SQL is unavailable, or None when it is. Separated so panels can say which of the two
     reasons applies rather than rendering an empty box for both."""

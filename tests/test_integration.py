@@ -109,3 +109,51 @@ def test_mcp_status_is_small_enough_to_return(cfg):
     payload = json.dumps(mcp.status(thread_window=0.3))
     assert len(payload) < 200_000, f"status() is {len(payload)} chars"
     assert "findings" in json.loads(payload)
+
+
+def test_a_read_only_query_returns_columns_and_rows(cfg):
+    from serenedash.db import read_query
+    out = read_query(cfg, "select 1 as one, 'x' as two")
+    assert out["columns"] == ["one", "two"]
+    assert out["rows"] == [["1", "x"]]
+
+
+def test_the_server_itself_refuses_a_write_on_this_connection(cfg):
+    # The allowlist is checked first, so this goes round it with a kind that IS allowed and asks
+    # the server to write. read_only on the connection is the line being tested here.
+    from serenedash.db import read_query
+    out = read_query(cfg, "with x as (select 1) select * from x")
+    assert "rows" in out, "a genuine read must still work"
+    out = read_query(cfg, "create table serenedash_should_not_exist (a int)")
+    assert out["error"].startswith("refused")
+
+
+def test_read_query_bounds_what_it_returns(cfg):
+    from serenedash.db import read_query
+    out = read_query(cfg, "select * from duckdb_settings()", max_rows=3)
+    assert out["row_count"] == 3
+    assert out["truncated_rows"] is True
+    out = read_query(cfg, "select repeat('a', 400) from range(100)", max_chars=1000)
+    assert out["truncated_chars"] is True
+    assert sum(len(v) for r in out["rows"] for v in r) <= 1000 + 400
+
+
+def test_the_snapshot_carries_every_panel_and_stays_small(cfg):
+    import json
+
+    from serenedash.snapshot import collect
+    d = collect(cfg, thread_window=0.3)
+    assert d["sql"]["available"] is True
+    for key in ("findings", "storage", "memory", "activity", "threads", "profile", "host"):
+        assert key in d, key
+    assert len(json.dumps(d)) < 200_000
+
+
+def test_a_snapshot_without_credentials_still_reports_the_host(cfg):
+    # The half that does not need the server has to survive losing it - that is the whole point of
+    # collecting /proc, du and perf separately from SQL.
+    from serenedash.snapshot import collect
+    d = collect(dict(cfg, password="", password_command=""), thread_window=0.3)
+    assert d["sql"]["available"] is False
+    assert d["sql"]["reason"] == "no credentials"
+    assert "threads" in d and "host" in d and "storage" not in d

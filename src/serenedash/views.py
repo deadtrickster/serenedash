@@ -4,8 +4,22 @@ import shutil
 import textwrap
 import time
 
+from .anomaly import index, scan
 from .fmt import C, COL_BAR, COL_LABEL, COL_VALUE, NOCOLOR, bar, clip, dur, human, line, spark, strip
 from .hazards import HAZARDS, kernel_of
+
+
+def anom_colour(c, a):
+    """The label colour for a row a rule fired on, or None.
+
+    Only the label, and only a colour. The rows are already at their width — the memory notes fill
+    their field exactly — so there is nowhere to put a word without taking one away, and the panel
+    is not the place for the reasoning anyway. This marks the row; `m`, the tooltip and the MCP
+    findings carry what was measured and why.
+    """
+    if a is None:
+        return None
+    return c["red"] if a.rule == "spike" else c["yel"]
 
 
 # ── what every label and number on the screen means ─────────────────────────────────────────────
@@ -86,6 +100,17 @@ LEGEND = (
         ("uptime", "how long serened has been up. A WAL that has not checkpointed for two days means "
                    "nothing if the process started an hour ago"),
         ("serened", "host-side pid, and the container it is in. This is the pid perf attaches to"),
+    )),
+    ("anomalies", (
+        ("a coloured label", "a rule fired on that row's history: yellow for a level change or a "
+                             "steady climb, red for a single-sample excursion. The threshold "
+                             "findings elsewhere compare against a fixed number; these compare "
+                             "against the row's own recent past, which is the only way to see a "
+                             "pool that has been growing all afternoon without being over any "
+                             "limit yet. Point at the row, or press m, for what was measured"),
+        ("baseline", "a median, and the spread a median absolute deviation. Both survive up to "
+                     "half the window being the event itself, so a big excursion cannot inflate "
+                     "the bar it has to clear — which a mean and a standard deviation would"),
     )),
     ("config", (
         ("temp_directory", "where spills go. A RELATIVE path cannot be created from the server's "
@@ -332,6 +357,7 @@ def memory_frame(s, hist, host, col, width, scroll):
     """
     c = C if col else NOCOLOR
     W = max(70, width)
+    found = index(hist)
     tags = sorted(s["memtags"], key=lambda kv: -kv[1])
     tot = sum(v for _, v in tags) or 1
     top = max((v for _, v in tags), default=1) or 1
@@ -355,7 +381,7 @@ def memory_frame(s, hist, host, col, width, scroll):
                         bar(val / max(s["memlimit"] or 1, 1), COL_BAR, bcol if col else ""),
                         f"{c['dim']}{note:<20}{c['r']}{bcol}"
                         f"{spark(h, top=ptop) if h else ''}{c['r']}",
-                        vc=c["b"]))
+                        lc=anom_colour(c, found.get(key)), vc=c["b"]))
     out += ["", f"{c['cyn']}{c['b']}pools{c['r']}  {c['dim']}duckdb_memory(), largest first{c['r']}"]
     for tag, v in tags:
         h = (hist.get(f"t:{tag}") or [])[-room:]
@@ -364,7 +390,18 @@ def memory_frame(s, hist, host, col, width, scroll):
                         f"{c['dim']}{f'{v / tot * 100:.1f}% of tagged':<20}{c['r']}"
                         f"{c['cyn'] if v else c['dim']}"
                         f"{spark(h, top=top) if h else ''}{c['r']}",
-                        lc=lc, vc=lc))
+                        lc=lc or anom_colour(c, found.get(f"t:{tag}"))))
+    # The main frame can only colour a label — it has no line to spare. Here there is room to say
+    # what was actually measured, which is the part that makes a highlight arguable rather than
+    # something to be believed.
+    hits = scan(hist)
+    if hits:
+        out += ["", f"{c['yel']}{c['b']}anomalies{c['r']}  {c['dim']}against each series' own "
+                    f"recent past, not a threshold{c['r']}"]
+        for a in hits:
+            for i, part in enumerate(textwrap.wrap(f"{a.label()} — {a.detail}", max(40, W - 26))):
+                out.append(f"  {c['yel']}{a.name if i == 0 else '':<22}{c['r']} {c['dim']}{part}"
+                           f"{c['r']}")
     return out[scroll:]
 
 
@@ -395,8 +432,28 @@ def doctor_frame(rows, fix, col, width, scroll, msg=None):
     return out[scroll:]
 
 
-def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
+NOSQL = {"db": "", "size": 0, "wal": 0, "mem": 0, "memlimit": 0, "blocks": (0, 0, 0, 0),
+         "memtags": [], "states": {}, "queries": [], "settings": {}, "t": 0}
+
+
+def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_why=None):
+    """The main screen. `s` is None when SQL is unavailable; `sql_why` is sql_status's (reason, fix).
+
+    Named `sql_why` and not `why` because the config panel below already binds `why` per hazard, and
+    a parameter this function overwrites halfway through is a parameter that reads correctly and is
+    not — the same shape as the local `bar` that once shadowed the imported one.
+
+    Without a connection this used to be a single line saying it could not reach the server, which
+    threw away everything that does not need one — the whole threads panel, the profile, the host,
+    and every finding derived from them. The dashboard is running on the machine; /proc, du and the
+    perf captures are all still there, and a server that will not accept a connection is exactly
+    when the host-side numbers are worth looking at.
+    """
     c = C if col else NOCOLOR
+    nosql = s is None
+    if nosql:
+        s = dict(NOSQL)
+    found = index(hist)
     newest, tops, by_tid = perf
     # The whole terminal, both ways. The old 120-column cap threw away every column past it while
     # the panels below truncated SQL at 92 and symbols at 52 — three different limits, none of them
@@ -451,7 +508,9 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
     # ── storage ─────────────────────────────────────────────────────────────────────────────────
     ratio = s["wal"] / s["size"] if s["size"] else 0
     wcol = c["red"] if ratio > 1 else (c["yel"] if ratio > 0.3 else c["grn"])
-    rows = [line(c, "database", human(s["size"]), " " * COL_BAR,
+    # The database and WAL sizes are the server's own; the directory rows below are du and do not
+    # need it. Only this row is dropped when there is no connection.
+    rows = [] if nosql else [line(c, "database", human(s["size"]), " " * COL_BAR,
                  f"{c['dim']}wal{c['r']} {wcol}{human(s['wal'])}{c['r']}  "
                  f"{wcol}{ratio:.2f}x{c['r']} "
                  + (f"{c['red']}checkpoint not completing{c['r']}" if ratio > 1
@@ -552,7 +611,8 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
                           # "of 100.2G" named no quantity — it is memory_limit, and which quantity
                           # it is decides whether 34% is comfortable or a machine oversubscribed.
                           trace("mem", f"{f * 100:.1f}% {c['dim']}of memory_limit{c['r']}",
-                                c["mag"], s["memlimit"]), vc=c["b"]))
+                                c["mag"], s["memlimit"]),
+                          lc=anom_colour(c, found.get("mem")), vc=c["b"]))
     # RSS against what the store thinks it holds. The gap is allocator arenas, the wire layer, code
     # and everything else that is not a DuckDB buffer — and it is the number the OOM killer reads,
     # so a memory_limit set from duckdb_memory() alone is set against the wrong quantity.
@@ -568,6 +628,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
                                                          c["grn"] if col else ""),
                           trace("rss", f"{c['dim']}RSS, peak {human(peak)}{c['r']}", c["grn"],
                                 max(rss + swap, 1)),
+                          lc=anom_colour(c, found.get("rss")),
                           vc=c["yel"] if swap else None))
         # Both unconditional once /proc has answered at all. Emitting `swapped` only when non-zero
         # made the panel one row taller the moment the kernel first paged something out, which is
@@ -577,6 +638,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
                                                          else ""),
                           trace("swap", f"{c['red'] if swap else c['dim']}paged out{c['r']}",
                                 c["red"], max(rss + swap, 1)),
+                          lc=anom_colour(c, found.get("swap")),
                           vc=c["red"] if swap else None))
     # No `headroom` row: it was memory_limit minus in-use, which is the `in use` row's own
     # "33.9% of 100.2G" with one subtraction done for you, on a panel that has better uses for a line.
@@ -593,7 +655,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
     top = max((v for _, v in s["memtags"]), default=1) or 1
     mtags = [line(c, tag, human(v), bar(v / top, COL_BAR, c["cyn"] if col else ""),
                   trace(f"t:{tag}", f"{c['dim']}{v / tot_tag * 100:.0f}% of tagged{c['r']}",
-                        c["cyn"], top))
+                        c["cyn"], top), lc=anom_colour(c, found.get(f"t:{tag}")))
              for tag, v in s["memtags"] if v > 0]
     # ── activity ────────────────────────────────────────────────────────────────────────────────
     st = s["states"]
@@ -724,6 +786,23 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
             val = ""
         crows.append(line(c, name, val, " " * COL_BAR, tail, vc=c["red"] if warn else None))
 
+    # Panels that need a connection say so, in place, and the rest of the frame is unaffected. Each
+    # keeps its box rather than disappearing: a panel that vanishes reads as "nothing to report",
+    # which is the opposite of what is true here, and a frame whose shape depends on whether the
+    # password is set is a frame you have to re-read every time.
+    if nosql:
+        reason, fix = sql_why or ("no connection", "")
+        note = [f"{c['yel']}{reason}{c['r']}",
+                *[f"{c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(fix, max(30, WIDE))]]
+        # Storage and memory keep the rows that never needed the server: the directory sizes are du
+        # and `resident`/`swapped` are /proc, so the panels lose `database`, `blocks`, `in use` and
+        # the pools and keep the rest. Activity and config are replaced whole — every number in them
+        # is the server's. `sessions 0` and `nothing running` drawn off an empty result would not be
+        # a degraded panel, it would be a false one.
+        srows, mrows = note + srows, note + mrows
+        ahead, crows = note, note
+        mtags, abody = [], []
+
     # ── fit to the terminal ─────────────────────────────────────────────────────────────────────
     #
     # Everything above built every row it has. What actually fits is decided here, once, and the
@@ -785,7 +864,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40):
                   # self-scaled, a process idling between 2% and 3% drew a full-height trace.
                   f"{cpu_note}  {c['grn']}"
                   f"{spark(cpu_hist[-cpu_room:], top=cores * 100) if cpu_room and cpu_hist else ''}"
-                  f"{c['r']}", vc=c["b"]),
+                  f"{c['r']}", lc=anom_colour(c, found.get("cpu")), vc=c["b"]),
              ""]                 # the total is a different quantity from the rows; give it its own space
 
     # Built before the budget so its rows are COUNTED by it. thead was added to the threads box

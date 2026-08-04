@@ -43,6 +43,18 @@ jobs:
         run: |
           serenedash --print-config
           serenedash --help > /dev/null
+      # No server, no credentials, no /proc for it: the frame has to render anyway and say why the
+      # SQL panels are empty. It used to collapse to a single "cannot reach" line.
+      - name: a frame renders with nothing to connect to
+        run: |
+          serenedash --once --no-color | tee /tmp/frame.txt
+          grep -q "no credentials" /tmp/frame.txt
+          serenedash --once --format json | python -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['sql']['available'] is False, d['sql']
+          assert 'threads' in d and 'host' in d, sorted(d)
+          print('json ok:', sorted(d))"
       - name: the MCP server completes a handshake and lists its tools
         run: |
           python - <<'PY'
@@ -57,7 +69,7 @@ jobs:
                       tools = sorted(t.name for t in (await s.list_tools()).tools)
                       print("tools:", ", ".join(tools))
                       missing = {"status", "storage", "memory", "activity", "threads",
-                                 "profile", "host", "config"} - set(tools)
+                                 "profile", "host", "config", "query", "anomalies"} - set(tools)
                       if missing:
                           sys.exit(f"missing tools: {sorted(missing)}")
           asyncio.run(main())
@@ -113,6 +125,19 @@ jobs:
           PGPASSWORD: ci-password
           SERENEDB_TARGET: remote
         run: serenedash --once
+
+      - name: the json snapshot is the same collector, against the same server
+        env:
+          PGPASSWORD: ci-password
+          SERENEDB_TARGET: remote
+        run: |
+          serenedash --once --format json | python -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['sql']['available'] is True, d['sql']
+          for k in ('storage', 'memory', 'activity', 'threads', 'host', 'findings'):
+              assert k in d, (k, sorted(d))
+          print('snapshot ok:', len(json.dumps(d)), 'chars')"
 
   shell:
     runs-on: ubuntu-latest
