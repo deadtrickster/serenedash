@@ -57,11 +57,25 @@ HAZARDS = {
 #   columnar duckdb::RLEState<float>::UpdateFlatValid — column encode.
 #   wire     sdb::message::Buffer::ReadableSize at 96% of a fourteen-hour load — the COPY feeder
 #            walking its whole chunk list per message to test a five-byte threshold.
+#   parse    duckdb::ListMatcher/KeywordMatcher/ChoiceMatcher::MatchParseResult at 9.9% combined.
+#            These are the PEG grammar's matchers, i.e. reading the statement TEXT. They land in the
+#            duckdb:: namespace, so `columnar` used to claim them and the panel reported a tenth of
+#            the profile as storage work when it was the parser. SereneDB's own developer spotted
+#            the same misreading off a screenshot of this dashboard, which is how it was found.
+#            A large share here means the statements themselves are expensive to read - on this
+#            deployment, 1024-dim embeddings sent as 21,684-character text literals.
 KERNELS = (
     ("vector", ("gemm", "sgemm", "faiss", "IndexIVF", "Quantizer", "distance", "l2_", "knn",
                 "cblas", "openblas", "simsimd", "hnsw")),
     ("text", ("irs::", "BM25", "Posting", "FieldData", "Tokenizer", "analysis::", "term_",
               "iresearch")),
+    # Before `columnar`, which would otherwise take every duckdb:: symbol including these.
+    # Deliberately NOT a bare "Matcher": `RowMatcher` is the hash-join row comparator and
+    # `ExpressionMatcher` is the optimizer's rewriter, and neither reads statement text. Every PEG
+    # grammar matcher goes through `MatchParseResult`, which is the precise handle.
+    ("parse", ("MatchParseResult", "PEGParser", "PEGTransformer", "peg::", "duckdb::Parser",
+               "ParseResult", "MatcherFactory", "MatcherList", "MatcherToken",
+               "MatchNumberLiteral", "MatchIdentifier", "MatchOperator")),
     ("columnar", ("duckdb::", "RLE", "ColumnData", "RowGroup", "Vector::", "Compress")),
     ("wire", ("sdb::message", "pg_wire", "Buffer::", "CopyEod")),
     ("alloc", ("je_", "malloc", "free", "arena", "tcache")),

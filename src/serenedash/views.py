@@ -87,8 +87,14 @@ LEGEND = (
         ("engines", "share of sampled cycles per subsystem, over the WHOLE profile. Shares sum to "
                     "100; the rows below are individual symbols against the same total, so a flat "
                     "profile shows big engine shares over small per-symbol ones"),
-        ("vector / text / columnar / wire / alloc / kernel", "the engine a symbol is attributed "
-            "to, matched on the symbol name. `other` is a symbol no pattern claimed, not an engine"),
+        ("vector / text / parse / columnar / wire / alloc / kernel", "the engine a symbol is "
+            "attributed to, matched on the symbol name. `other` is a symbol no pattern claimed, "
+            "not an engine"),
+        ("parse", "reading the statement TEXT - the PEG grammar's matchers. A large share means the "
+                  "statements themselves are expensive to read, which usually means big literals: "
+                  "a 1024-dim embedding sent as text is ~21,700 characters re-parsed on every "
+                  "query. Binary bind parameters fix it. These symbols are in the duckdb:: "
+                  "namespace, so they used to be counted as `columnar` and read as storage work"),
         ("symbols unresolved", "perf could not name the addresses. Register the matching binary: "
                                "perf buildid-cache --add <serened>. Needed again after every rebuild"),
     )),

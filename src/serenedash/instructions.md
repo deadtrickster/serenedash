@@ -246,6 +246,7 @@ SELECT timestamp, log_level, message FROM duckdb_logs() WHERE type = 'Search' OR
 - **A flat profile is a result.** If no symbol exceeds a couple of percent, the answer is "the cost is spread", and pointing at the top row is misleading. Read the engine split instead.
 - **The engine split is the useful axis, not user-vs-kernel.** `vector` dominating usually means clustering, not search. `text` means inverted-index work. `wire` means the front end, which should never be the expensive part. `alloc` is the allocator.
 - **`other` is not an engine.** It is a symbol no pattern claimed — often an unresolved address. A large `other` share usually means missing symbols.
+- **`parse` means the statements are expensive to read**, not that the data is expensive to process. It is the PEG grammar's matchers, and it is per-statement rather than per-row. The usual cause is a large literal: a 1024-dimensional embedding sent as SQL text is about 21,700 characters, re-parsed on every execution. This deployment does exactly that — 31% of a 68 KB hybrid-search statement is one float literal — and the fix is client-side, binary bind parameters instead of interpolated text. Check it with `SELECT length(query) FROM pg_stat_activity` and look at what the statement actually carries.
 - **Compression symbols mean writes, not reads.** `libfsst::`, `AlpRD`, `RLEAnalyze`, `GreaterThan<float> (analyze)` are the store choosing and applying a codec, which happens at checkpoint. How *often* they run is a checkpoint question, not a codec question.
 
 ### Diagnosing unexpected results
@@ -368,7 +369,16 @@ Inverted indexes are **eventually consistent**. Rows are not searchable until a 
 
 `VACUUM` takes exactly one maintenance option, scoped `_INDEX` / `_TABLE` / `_SCHEMA` / `_DATABASE` / `_ALL`: `REFRESH_*`, `COMPACT_*`, `RECOMPUTE_STATS_*`.
 
-**For reading this server:** "the rows are not there yet" after an insert is expected behaviour. `num_buffered_docs` is how many are waiting; `refresh_pending` is whether the publisher is keeping up.
+**Refresh is coupled to the checkpoint, and it is not parallel.** An autocheckpoint of the WAL
+triggers an index refresh, and refresh currently runs single-threaded with a synchronous segment
+flush that includes building the vector index. That is the mechanism behind periodic CPU spikes and
+insertion-latency stalls on a write-heavy load: the store checkpoints, the index refreshes, and one
+thread does the flush while the rest wait. It also means `checkpoint_threshold` is not only a
+compression dial — lowering it makes this happen more often. (Stated by SereneDB's own developer;
+parallel refresh and async flush are planned. If the spikes are CPU without a latency effect,
+compaction is the likelier cause.)
+
+**For reading this server:** "the rows are not there yet" after an insert is expected behaviour. `num_buffered_docs` is how many are waiting; `refresh_pending` is whether the publisher is keeping up. A stall that lines up with `refresh_active` going to 1 is this, not a query.
 
 ### What indexing costs
 

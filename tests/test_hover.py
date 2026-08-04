@@ -152,3 +152,26 @@ def test_a_malformed_report_is_not_a_keystroke():
     from serenedash.tui import mouse_event
     assert mouse_event("<35;4", "M") == ""
     assert mouse_event("<a;b;c", "M") == ""
+
+
+def test_the_parser_is_not_reported_as_columnar_storage_work():
+    # SereneDB's PEG matchers live in the duckdb:: namespace, so the `columnar` pattern claimed
+    # them and 9.5% of a profile read as storage work when it was the parser reading statement
+    # text. SereneDB's own developer spotted that off a screenshot of this dashboard.
+    from serenedash.hazards import kernel_of
+    for sym in ("duckdb::ListMatcher::MatchParseResult(duckdb::MatchState&) const",
+                "duckdb::KeywordMatcher::MatchParseResult(duckdb::MatchState&) const",
+                "duckdb::ChoiceMatcher::MatchParseResult(duckdb::MatchState&) const",
+                "duckdb::PEGTransformerFactory::TransformExpression(...)",
+                "duckdb::Parser::ParseQuery(...)"):
+        assert kernel_of(sym) == "parse", sym
+
+
+def test_the_parse_bucket_does_not_steal_row_matching_or_the_optimizer():
+    # RowMatcher is the hash-join row comparator and ExpressionMatcher is the optimizer's rewriter.
+    # Both contain "Matcher" and neither reads statement text, which is why the pattern keys on
+    # MatchParseResult rather than on the word.
+    from serenedash.hazards import kernel_of
+    assert kernel_of("duckdb::RowMatcher::GetMatchFunction<true>(...)") != "parse"
+    assert kernel_of("duckdb::ExpressionMatcher::Match(duckdb::Expression&, ...)") != "parse"
+    assert kernel_of("irs::DelimitedTokenizer::next()") == "text"
