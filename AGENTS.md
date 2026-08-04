@@ -93,6 +93,53 @@ tripped, and reporting those the same way is the one mistake this whole file exi
 is the same error as `sleeping` on a thread at 60%, one level up. Anything that judges a window
 says how much window it had, and refuses when there is not enough.
 
+## SQL that came from outside this file
+
+`query(sql)` over MCP hands an agent a statement runner against someone's database, and `config`
+and `set_setting` take arguments that end up in one. These rules are in `db.py`; the last of them
+is there because writing this list down found a violation.
+
+**Bind, do not interpolate.** `query(cfg, sql, params=[(v,)])`, one tuple per statement. The MCP
+`config` tool built `where name = '{name}'` from its own argument — read-only connection, so it
+could not write, but it could read anything. "The damage is bounded" is not "the query is correct".
+
+**Two interpolations are allowed and both are vetted:** `left(query, {int(query_head)})`, cast to
+int at the boundary so it can only be a number, and the `HAZARDS` name list, which is this file's
+own table. A test walks every f-string in `db.py` carrying a SQL keyword and fails on anything
+else — the next one of these will be somewhere new, so the check is for the class, not the case.
+
+**Identifiers cannot be bound, so validate them.** `SET GLOBAL {name}` has no parameter form;
+`name` must match `[A-Za-z_][A-Za-z0-9_]*` or it is refused. It comes from the server's own
+settings list, but a dashboard that can be talked into running SQL by a setting name is a dashboard
+with an injection bug, and the check costs nothing. Values in that statement are single-quoted with
+`'` doubled.
+
+**Caller SQL passes an allowlist of statement kinds, not a blocklist.** `select with show describe
+explain summarize pragma values table from call`. A blocklist has to be complete to be correct, and
+DuckDB grows statement kinds faster than anyone will remember to update one.
+
+**Read the kind past comments and brackets.** `-- harmless\nDELETE FROM t`, `/* x */ drop table t`
+and `((select 1))` all have to resolve to what they actually are. A naive prefix check is the
+obvious way past this.
+
+**One statement.** `select 1; drop table x` has a read-only leading keyword and a write behind it.
+A single trailing semicolon is not a batch.
+
+**Check before connecting**, so a refusal costs nothing and cannot hang on an unreachable host.
+
+**Open the connection read-only anyway.** `cn.read_only` unless `_write` is set, which only
+`apply_setting` does. The allowlist is the first of two lines, not the only one — but it exists
+because "the server would have rejected it" is a poor thing to learn from an error message, and
+read-only does not stop a statement from being expensive.
+
+**Bound the output twice**: rows, then total characters. A hundred rows of a wide system view is
+still megabytes and the reader is a context window. Truncation is always reported
+(`truncated_rows`, `truncated_chars`) — a silently short answer is a wrong answer.
+
+**Return the server's error, trimmed.** Not raised, not swallowed: it is the useful half of a
+failed query. Cut at 2000 characters, because a DuckDB parse error quotes the statement back with
+a caret diagram.
+
 ## Explanations live in one place
 
 The tooltip does not carry its own prose. It looks up `LEGEND`, which already claims to document
