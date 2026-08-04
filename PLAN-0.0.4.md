@@ -46,11 +46,22 @@ One thing that does survive the redesign, and it matters to us: `DiscoverResult`
 `instructions`. The staleness mechanism in `instructions.md` moves from `InitializeResult` to
 `DiscoverResult` and otherwise stands.
 
-**Recommendation: treat MCP as the deciding factor, not the footnote.** Either accept a revision-old
-server, or budget for hand-rolling against the current spec - JSON-RPC over stdio is not the hard
-part, `server/discover` plus stateless `_meta` handling plus comptime-generated tool schemas is.
-Decide this before writing any Zig, because it is the piece most likely to make the whole rewrite
-not worth it.
+**Recommendation: defer this decision, do not gate the rewrite on it.** An earlier draft of this
+plan said to decide before writing any Zig. That was wrong for two reasons.
+
+It is not on the critical path. MCP is phase 3 of 4 below; the collectors and the differential
+harness come first and do not touch it. By the time it matters, `mcp.zig` may well have caught up -
+the spec is eight days old and SDKs normally lag a release by weeks.
+
+And the fallback got cheaper, not more expensive. The old protocol had a handshake, session state,
+subscription bookkeeping and server-initiated requests. 2026-07-28 deleted all of it. A stdio server
+exposing tools plus one resource needs `server/discover`, `tools/list`, `tools/call`,
+`resources/list` and `resources/read` - stateless request/response, with comptime generating the
+tool schemas from function signatures the way Python's decorators do by introspection. That is a few
+hundred lines, not a protocol project.
+
+So: bet on `mcp.zig` catching up, and hand-roll against the current spec if it has not. Either way
+the answer arrives when you reach phase 3, and nothing before then depends on it.
 
 ## What the rewrite buys, honestly
 
