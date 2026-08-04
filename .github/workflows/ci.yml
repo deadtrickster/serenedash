@@ -55,6 +55,20 @@ jobs:
           assert d['sql']['available'] is False, d['sql']
           assert 'threads' in d and 'host' in d, sorted(d)
           print('json ok:', sorted(d))"
+      # instructions.md is package data, not code: an editable install finds it in the source
+      # tree whatever the build config says, so only a real wheel proves it ships. Losing it
+      # degrades silently to a one-line fallback.
+      - name: a built wheel carries the MCP instructions
+        run: |
+          pip wheel --no-deps -q -w /tmp/whl .
+          python - <<'PY'
+          import glob, sys, zipfile
+          whl = glob.glob("/tmp/whl/serenedash-*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          want = "serenedash/instructions.md"
+          print(want, "present" if want in names else "MISSING")
+          sys.exit(0 if want in names else 1)
+          PY
       - name: the MCP server completes a handshake and lists its tools
         run: |
           python - <<'PY'
@@ -65,13 +79,22 @@ jobs:
               params = StdioServerParameters(command="serenedash-mcp")
               async with stdio_client(params) as (r, w):
                   async with ClientSession(r, w) as s:
-                      await s.initialize()
+                      init = await s.initialize()
                       tools = sorted(t.name for t in (await s.list_tools()).tools)
                       print("tools:", ", ".join(tools))
                       missing = {"status", "storage", "memory", "activity", "threads",
                                  "profile", "host", "config", "query", "anomalies"} - set(tools)
                       if missing:
                           sys.exit(f"missing tools: {sorted(missing)}")
+                      # The instructions are the context an agent reasons from, and the
+                      # revision is how it tells that context from the running server.
+                      text = init.instructions or ""
+                      if len(text) < 5000 or "{{" in text:
+                          sys.exit(f"instructions look wrong: {len(text)} chars")
+                      res = [str(r.uri) for r in (await s.list_resources()).resources]
+                      if "serenedash://instructions" not in res:
+                          sys.exit(f"no instructions resource to re-read: {res}")
+                      print("instructions:", len(text), "chars, resources:", res)
           asyncio.run(main())
           PY
 

@@ -28,6 +28,9 @@ number with no defined meaning.
 Requires the `mcp` package (see requirements.txt). serenedash.py itself stays stdlib-only.
 """
 import argparse
+import functools
+import hashlib
+import os
 import time
 
 from mcp.server import MCPServer
@@ -45,13 +48,80 @@ CFG, _PROV = _config.load_config()
 CONTAINER, PORT, PASSWORD = CFG["container"], CFG["port"], CFG["password"]
 DATA, PERF = CFG["data"], CFG["perf_dir"]
 
+
+VERSION = "0.1.0"
+
+INSTRUCTIONS_URI = "serenedash://instructions"
+
+
+def instructions():
+    """(text, revision) for instructions.md — what the client puts in front of the model.
+
+    A file rather than a string literal, because it is the one piece of this server read by
+    something that cannot ask a follow-up question. It has to be reviewable in a diff like any other
+    document, and every rule in it exists because the vocabulary here is misreadable: `orphaned` is
+    not spill, a thread percentage is not a share of the machine, and "not enough history to judge"
+    is not "nothing is wrong".
+
+    The revision is a hash of the file, stamped into the text itself and returned again by every
+    tool. Instructions are injected once, when the client connects, and stay in the model's context
+    for the whole session — so upgrading this server mid-session leaves an agent reasoning from
+    documentation that no longer describes it, with nothing to notice it by. Comparing the two is
+    that missing signal.
+
+    Falls back to one line if the file is missing. An install that lost its package data should give
+    an agent less context, not no server.
+    """
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "instructions.md"), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ("Live state of a SereneDB server. Call status() first. Every rate carries the "
+                "denominator it was measured against - do not read one without the other."), "none"
+    rev = hashlib.sha256(raw).hexdigest()[:12]
+    text = raw.decode("utf-8", "replace")
+    return text.replace("{{VERSION}}", VERSION).replace("{{REVISION}}", rev), rev
+
+
+INSTRUCTIONS, REVISION = instructions()
+
+
+def _stamp():
+    """What every tool result carries so an agent can tell its context from the running server."""
+    return {"version": VERSION, "instructions_revision": REVISION,
+            "instructions_uri": INSTRUCTIONS_URI}
+
+
+def stamped(fn):
+    """Add `server` to every dict a tool returns.
+
+    On every tool rather than only on `status`, because an agent that goes straight to `memory()`
+    is exactly the one whose context is oldest. `functools.wraps` keeps the signature and docstring
+    the SDK builds the tool schema from.
+    """
+    @functools.wraps(fn)
+    def wrapped(*a, **kw):
+        out = fn(*a, **kw)
+        if isinstance(out, dict):
+            out.setdefault("server", _stamp())
+        return out
+    return wrapped
+
+
 server = MCPServer(
     name="serenedash",
-    version="1.0.0",
-    instructions="Live state of a SereneDB server: storage, memory, sessions, per-thread CPU, and "
-                 "a perf-backed profile. Call status() first — it is one round trip and carries "
-                 "the findings the individual tools would each have to be asked for.",
+    version=VERSION,
+    instructions=INSTRUCTIONS,
 )
+
+
+@server.resource(INSTRUCTIONS_URI, name="serenedash instructions", mime_type="text/markdown",
+                 description="How to read this server's numbers. The same text injected at "
+                             "connect time - re-read it when a tool result reports a revision "
+                             "that does not match the copy in your context.")
+def _instructions_resource() -> str:
+    """Re-readable, so a stale context has a remedy that does not need a reconnect."""
+    return INSTRUCTIONS
 
 
 def _sample(query_head: int = 400):
@@ -84,6 +154,7 @@ def _threads(window: float = 1.0):
 
 
 @server.tool()
+@stamped
 def status(thread_window: float = 1.0) -> dict:
     """Everything the dashboard shows, in one call, with the findings called out.
 
@@ -101,6 +172,7 @@ def status(thread_window: float = 1.0) -> dict:
 
 
 @server.tool()
+@stamped
 def storage() -> dict:
     """Disk: database and WAL, the store's directories, and the live/orphaned spill split.
 
@@ -116,6 +188,7 @@ def storage() -> dict:
 
 
 @server.tool()
+@stamped
 def memory() -> dict:
     """RAM: duckdb_memory() by pool, against RSS, swap and memory_limit.
 
@@ -130,6 +203,7 @@ def memory() -> dict:
 
 
 @server.tool()
+@stamped
 def activity(max_query_chars: int = 2000) -> dict:
     """Sessions and their current statements, excluding this connection.
 
@@ -148,6 +222,7 @@ def activity(max_query_chars: int = 2000) -> dict:
 
 
 @server.tool()
+@stamped
 def threads(window: float = 1.0) -> dict:
     """Per-thread CPU as a share of one core, with what each thread was running.
 
@@ -166,6 +241,7 @@ def threads(window: float = 1.0) -> dict:
 
 
 @server.tool()
+@stamped
 def profile() -> dict:
     """Sampled CPU by symbol and engine, from the newest perf captures.
 
@@ -180,6 +256,7 @@ def profile() -> dict:
 
 
 @server.tool()
+@stamped
 def callgraph(limit: int = 40) -> dict:
     """Caller-oriented call graph from the newest usable capture.
 
@@ -195,6 +272,7 @@ def callgraph(limit: int = 40) -> dict:
 
 
 @server.tool()
+@stamped
 def host() -> dict:
     """The machine: cores, load, RAM, swap, uptime, and memory_limit as a share of RAM.
 
@@ -208,6 +286,7 @@ def host() -> dict:
 
 
 @server.tool()
+@stamped
 def config(name: str = "") -> dict:
     """Effective settings. Without a name, the ones with measured consequences and their verdicts.
 
@@ -243,6 +322,7 @@ def config(name: str = "") -> dict:
 
 
 @server.tool()
+@stamped
 def query(sql: str, max_rows: int = 200, max_chars: int = 20000) -> dict:
     """Run one read-only statement against the server and get the rows back.
 
@@ -266,6 +346,7 @@ def query(sql: str, max_rows: int = 200, max_chars: int = 20000) -> dict:
 
 
 @server.tool()
+@stamped
 def anomalies() -> dict:
     """What has moved, judged against the recorded history rather than a threshold.
 
@@ -307,6 +388,7 @@ def _install_write_tools():
     surface that can quietly mutate the thing it reports on is the wrong default."""
 
     @server.tool()
+    @stamped
     def set_setting(name: str, value: str) -> dict:
         """SET GLOBAL a setting on the live server. Reverts on restart.
 
