@@ -42,13 +42,14 @@ LEGEND = (
                      "allocator arenas, the wire layer and code on top of the store's own buffers; "
                      "under means the store counts memory that is not resident. RSS is the number "
                      "the OOM killer reads"),
-        ("headroom", "memory_limit minus what is in use — what is left before queries spill"),
         ("swapped", "how much of the process the kernel has paged out to swap. Every touch of it is "
                     "a disk read, memory_limit does not count it, and it is the usual reason "
                     "`resident` sits below duckdb_memory()"),
         ("peak", "high-water RSS since serened started — what it has held at its worst, which the "
                  "current figure will not tell you"),
-        ("tags", "per-tag breakdown, largest first. Tags under 1% are counted, not listed"),
+        ("tags", "per-tag breakdown, every pool holding anything. The bar is against the largest "
+                 "pool so the small ones are still visible; the note is its share of all tagged "
+                 "memory, which is the number that adds to 100"),
     )),
     ("activity", (
         ("sessions", "connected sessions by state, EXCLUDING this dashboard's own session"),
@@ -72,6 +73,8 @@ LEGEND = (
         ("engines", "share of sampled cycles per subsystem, over the WHOLE profile. Shares sum to "
                     "100; the rows below are individual symbols against the same total, so a flat "
                     "profile shows big engine shares over small per-symbol ones"),
+        ("vector / text / columnar / wire / alloc / kernel", "the engine a symbol is attributed "
+            "to, matched on the symbol name. `other` is a symbol no pattern claimed, not an engine"),
         ("symbols unresolved", "perf could not name the addresses. Register the matching binary: "
                                "perf buildid-cache --add <serened>. Needed again after every rebuild"),
     )),
@@ -106,7 +109,7 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 # on a 96-column terminal.
 KEYS = (("q", "quit"), ("s", "storage"), ("m", "memory"), ("a", "activity"), ("t", "threads"),
         ("p", "profile"), ("g", "graph"), ("c", "config"), ("h", "host"), ("d", "doctor"),
-        ("l", "legend"))
+        ("l", "legend"), ("x", "mouse"))
 
 
 def status(c, width, extra=""):
@@ -152,7 +155,7 @@ def legend_frame(col, width, scroll):
     c = C if col else NOCOLOR
     W = max(70, width)
     out = [f"{c['b']}legend{c['r']}  {c['dim']}what every label and number on the main screen "
-           f"means{c['r']}", ""]
+           f"means — or point at one, these are what the tooltip says{c['r']}", ""]
     for section, items in LEGEND:
         out.append(f"{c['cyn']}{c['b']}{section}{c['r']}")
         for term, meaning in items:

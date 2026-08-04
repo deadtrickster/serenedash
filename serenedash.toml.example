@@ -30,3 +30,9 @@ data = "/var/lib/serenedb"
 # local tree resolves the same capture. It does not have to be the same machine the server runs on,
 # only the same build.
 # symbol_paths = ["/path/to/build/bin", "/opt/serenedb/bin"]
+
+# Pointer tracking: hover tooltips explaining whatever is under the pointer, click a panel to open
+# its view, wheel to scroll. On by default. Turning it off here is permanent for this config; `x`
+# toggles it for a moment, which is what you want when copying a symbol out of the profile panel —
+# while tracking is on the terminal's own text selection is off, though Shift usually bypasses it.
+# mouse = false

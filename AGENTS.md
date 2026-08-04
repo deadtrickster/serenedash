@@ -46,6 +46,12 @@ arrival would have fixed neither — the bytes still cross the wire to be thrown
 `length()` alongside the head so a truncated value is never mistaken for a short one, and let the
 one view that shows whole statements re-fetch them, only while it is open.
 
+**Nothing that costs a round trip belongs on the redraw path.** That view re-fetched them inside the
+render lambda, so it ran per keypress rather than per tick — invisible until pointer tracking landed
+and started reporting every cell the mouse crossed, which turned a 185 KB fetch into one per cell of
+mouse movement. A redraw is free by construction; keep it that way and gate everything else on the
+data tick.
+
 ## Layout
 
 - **Constant height.** A panel's height comes from a budget, not from how many rows it happens to
@@ -57,6 +63,25 @@ one view that shows whole statements re-fetch them, only while it is open.
   it as truncated appends an ellipsis worth one real column, which is how one memory row ended up a
   cell right of every other.
 - **Fit the terminal both ways**, and never exceed it. The status bar is pinned to the last line.
+- **An overlay draws over the frame, never into it.** The tooltip is written after the frame and
+  marks the rows it covered dirty so the next pass repaints them. Inserting it into the line list
+  would push the panels down and move the thing being pointed at. Its own border arithmetic is the
+  usual trap: a box row is `│` + a space + the text + padding + `│`, so the inner width has to be
+  the longest line **plus one** — sized to the longest line itself, that row's padding went negative
+  and it printed a column past its own border, over the frame beneath.
+
+## Explanations live in one place
+
+The tooltip does not carry its own prose. It looks up `LEGEND`, which already claims to document
+every label on screen, so `l` and the pointer cannot disagree and there is no second copy to go
+stale — the drift showed up immediately, in a `headroom` entry for a row that had been removed. The
+same rule as the collectors: one implementation, two consumers. It also inherits the constraint that
+matters — the legend says only what was measured, so the tooltip cannot invent a reading of a number
+that the panel itself would not make.
+
+Where the legend cannot answer, say less rather than guessing: a symbol name or a statement is the
+server's text, not the dashboard's vocabulary, and matching words in it against the legend answered
+`flat_map` with the storage panel's definition of `flat`.
 
 ## Dependencies
 

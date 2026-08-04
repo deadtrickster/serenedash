@@ -21,3 +21,6 @@ export SERENEDB_DATA=/var/lib/serenedb
 
 # Colon-separated, like PATH. Build trees holding a binary that matches your captures' build-id.
 # export SERENEDASH_SYMBOL_PATHS="$PWD/build/bin:/opt/serenedb/bin"
+
+# Tooltips and click-to-open, on by default. 0/false/no/off all turn them off.
+# export SERENEDASH_MOUSE=0

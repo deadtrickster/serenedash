@@ -20,26 +20,6 @@ NOCOLOR = dict.fromkeys(C, "")
 COL_LABEL, COL_VALUE, COL_BAR = 22, 10, 18
 
 
-# ── one column grid for every panel ─────────────────────────────────────────────────────────────
-#
-# Same discipline as ragdash: every row goes through line(), so the glyph column is a single ruler
-# down the frame and the number after it lands on the same screen column in every panel. Building
-# rows ad hoc is why the storage and memory bars used to start at different offsets.
-# 22, not 16: `checkpoint_threshold` is 20 characters and `preserve_insertion_order` is 24, and a
-# panel naming the settings that matter must not render them as `checkpoint_thres`.
-COL_LABEL, COL_VALUE, COL_BAR = 22, 10, 18
-
-
-# ── one column grid for every panel ─────────────────────────────────────────────────────────────
-#
-# Same discipline as ragdash: every row goes through line(), so the glyph column is a single ruler
-# down the frame and the number after it lands on the same screen column in every panel. Building
-# rows ad hoc is why the storage and memory bars used to start at different offsets.
-# 22, not 16: `checkpoint_threshold` is 20 characters and `preserve_insertion_order` is 24, and a
-# panel naming the settings that matter must not render them as `checkpoint_thres`.
-COL_LABEL, COL_VALUE, COL_BAR = 22, 10, 18
-
-
 SPARK = "▁▂▃▄▅▆▇█"
 
 

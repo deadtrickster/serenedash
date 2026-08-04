@@ -11,7 +11,8 @@ def clean_env(monkeypatch, tmp_path):
     """No global config, no inherited environment - otherwise the developer's own setup decides."""
     for var in ("SERENEDB_CONTAINER", "SERENEDB_PORT", "PGPASSWORD", "SERENEDB_DATA",
                 "SERENEDASH_PERF_DIR", "SERENEDASH_INTERVAL", "SERENEDASH_CONFIG",
-                "SERENEDASH_SYMBOL_PATHS", "SERENEDB_TARGET", "SERENEDB_HOST"):
+                "SERENEDASH_SYMBOL_PATHS", "SERENEDB_TARGET", "SERENEDB_HOST",
+                "SERENEDASH_MOUSE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.chdir(tmp_path)
@@ -97,3 +98,26 @@ def test_unreadable_or_broken_file_is_skipped(tmp_path):
     vals, prov = load_config()
     assert vals["container"] == "serenedb"
     assert prov["container"] == "default"
+
+
+def test_mouse_is_a_yes_no_and_0_means_no():
+    # The environment and the command line both deliver this as text, and bool("0") is True — a
+    # variable set to 0 to turn tooltips off would have turned them on.
+    assert load_config()[0]["mouse"] is True
+    for off in ("0", "false", "no", "off", ""):
+        os.environ["SERENEDASH_MOUSE"] = off
+        try:
+            # An empty value is "not set" to the loader, so it keeps the default rather than
+            # reading as false; every other spelling of no means no.
+            assert load_config()[0]["mouse"] is (off == ""), off
+        finally:
+            del os.environ["SERENEDASH_MOUSE"]
+
+
+def test_a_config_file_can_turn_tooltips_off_for_good(tmp_path):
+    write(tmp_path / "serenedash.toml", "mouse = false\n")
+    vals, prov = load_config()
+    assert vals["mouse"] is False
+    assert prov["mouse"].endswith("serenedash.toml")
+    # And the flag still beats it, in both directions.
+    assert load_config({"mouse": True})[0]["mouse"] is True

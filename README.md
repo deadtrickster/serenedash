@@ -18,10 +18,18 @@ runs in a container here, as a process here, or on another host (`target = docke
 Every panel has a view behind it, keyed by its own name, and every view is a toggle:
 
 `q` quit · `s` storage · `m` memory · `a` activity · `t` threads · `p` profile · `g` call graph ·
-`c` config · `h` host · `d` doctor · `l` legend · `j`/`k` scroll
+`c` config · `h` host · `d` doctor · `l` legend · `x` mouse · `j`/`k` scroll
 
 `l` documents every label and number on the screen; `d` checks every precondition for a full
 picture and tells you what each missing one costs you. Those two are the place to look first.
+
+Point at anything and it says what it is — the same text `l` carries, looked up by where the
+pointer is instead of read top to bottom, so a bar answers for its own row and a word in a tail
+answers from its own panel. Clicking a panel opens its view and the wheel scrolls. Esc closes the
+tooltip before it closes anything else, and it expires on its own after two refreshes, because the
+protocol has no "pointer left the window" event to hang it on. `x` turns tracking off for a moment
+— while it is on the terminal's own text selection is off (Shift usually bypasses it) — and
+`mouse = false` or `SERENEDASH_MOUSE=0` turns it off for good.
 
 ## Panels
 

@@ -11,6 +11,7 @@ import tty
 
 from .config import config_files, load_config
 from .fmt import C, HIST, NOCOLOR
+from .hover import describe, panel_at, place, tip_box
 from .db import apply_setting, full_queries, query, sample
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
@@ -44,6 +45,16 @@ def _on_usr1(_sig, _frm):
         os.write(_WAKE_W, b"x")
     except OSError:
         pass
+
+
+# 1003 is any-event tracking: the pointer reports where it is without a button held, which is what
+# a hover needs. 1006 is the SGR encoding of the reply — the original one offsets each coordinate by
+# 32 into a single byte and so cannot name a column past 223.
+#
+# While this is on, the terminal's own text selection is off, which is why `x` turns it off again.
+# Most terminals also let Shift bypass tracking and select as usual.
+MOUSE_ON = "\033[?1003h\033[?1006h"
+MOUSE_OFF = "\033[?1003l\033[?1006l"
 
 
 def write_pidfile(perf_dir):
@@ -114,8 +125,32 @@ def wait_key(timeout):
                 if not fin or "\x40" <= fin <= "\x7e":
                     break
                 code += fin
+            if code.startswith("<"):
+                return mouse_event(code, fin)
             return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
                 fin, {"5": "pgup", "6": "pgdn"}.get(code, ""))
+
+
+def mouse_event(code, fin):
+    """An SGR mouse report (\\033[<b;x;yM) as ('mouse', col, row, kind), 0-based. '' if malformed.
+
+    SGR (1006) rather than the original encoding: that one packs the coordinates into single bytes
+    offset by 32, so it cannot address a column past 223 and silently reports the wrong cell on a
+    wide terminal — which is most of them here.
+
+    Bit 32 of the button byte marks motion, and 64 marks the wheel. Everything else is a press we
+    do not distinguish: the pointer only ever selects a panel.
+    """
+    parts = code[1:].split(";")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return ""
+    b, x, y = (int(p) for p in parts)
+    if b & 64:
+        return ("mouse", x - 1, y - 1, "wheelup" if b & 1 == 0 else "wheeldn")
+    if b & 32:
+        return ("mouse", x - 1, y - 1, "move")
+    # A release carries no button identity, so it would land on panel 0 — only the press acts.
+    return ("mouse", x - 1, y - 1, "press" if fin == "M" else "release")
 
 
 def main():
@@ -129,6 +164,12 @@ def main():
     ap.add_argument("--format", choices=("text", "json"), default="text",
                     help="--once only. json emits the same structure the MCP server returns.")
     ap.add_argument("--no-color", action="store_true")
+    # Both directions, and neither defaults — otherwise the flag could not lose to the config file,
+    # which is the layer someone who does not want tooltips will actually set.
+    ap.add_argument("--mouse", dest="mouse", action="store_true", default=None,
+                    help="pointer tracking: hover tooltips, click a panel to open it, wheel to "
+                         "scroll. On unless turned off in config or with --no-mouse")
+    ap.add_argument("--no-mouse", dest="mouse", action="store_false", default=None)
     ap.add_argument("--container", default=None)
     ap.add_argument("--port", default=None)
     ap.add_argument("--password", default=None)
@@ -145,7 +186,8 @@ def main():
     if a.config:
         os.environ["SERENEDASH_CONFIG"] = a.config
     cfg, prov = load_config({k: getattr(a, k) for k in
-                             ("container", "port", "password", "data", "perf_dir", "interval")})
+                             ("container", "port", "password", "data", "perf_dir", "interval",
+                              "mouse")})
     if a.print_config:
         for k in sorted(cfg):
             shown_val = "<set>" if k == "password" and cfg[k] else cfg[k]
@@ -165,9 +207,14 @@ def main():
     crows = []
     thr, tcpu, tprev, tlast = [], 0.0, {}, time.time()
     hinfo, wh = {}, (0, 0)
-    drows, dfix, dmsg = None, None, None
+    drows, dfix, dmsg, fullq = None, None, None, None
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
+    # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
+    # produced it — any-motion tracking reports every cell the pointer crosses, and rebuilding the
+    # frame for a move that lands on the same row saying the same thing is pure heat.
+    mouse = cfg["mouse"] and not a.once and sys.stdout.isatty()
+    tip, tipkey, tipon, tipage, mpos = None, None, False, 0, (0, 0)
     hpid = host_pid(cfg)
     # Prime the tick counters before the first frame. Percentages are deltas, so a cold start has
     # nothing to subtract from and the panel came up empty — for the whole of a first tick that also
@@ -192,6 +239,8 @@ def main():
         # is handed back untouched on exit. Without it a session's worth of frames is left in the
         # buffer, and a frame one line too tall scrolls the terminal instead of just being clipped.
         sys.stdout.write("\033[?1049h\033[?25l\033[2J")
+        if mouse:
+            sys.stdout.write(MOUSE_ON)
     try:
         while True:
             # A keypress redraws; it does not re-query. Falling through to the sampler on every key
@@ -258,13 +307,17 @@ def main():
                     lines = body[:max(1, h - len(keybar))]
                     lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
                 elif view in DETAIL:
+                    # The one view that shows whole statements is the one that pays to fetch them,
+                    # and only while it is open — but on the data tick, not on every redraw. Inline
+                    # in the lambda below it ran per keypress, and with the pointer reporting every
+                    # cell it crosses that became a round trip for 185 KB statements per mouse move.
+                    if view != "activity":
+                        fullq = None
+                    elif fresh or fullq is None:
+                        fullq = full_queries(cfg)
                     body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll),
                             "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
-                            # The one view that shows whole statements is the one that pays to
-                            # fetch them, and only while it is open.
-                            "activity": lambda: activity_frame(
-                                s, col, w, scroll,
-                                full=full_queries(cfg)),
+                            "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
                             "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                              scroll),
                             "profile": lambda: profile_frame(perf, col, w, scroll),
@@ -298,13 +351,84 @@ def main():
                     sys.stdout.write(f"\033[{i + 1};1H\033[2K{ln}")
             for i in range(len(lines), len(shown)):
                 sys.stdout.write(f"\033[{i + 1};1H\033[2K")
-            shown = lines
+            # A copy, not the list itself: the tooltip marks the rows it covered dirty so the next
+            # frame repaints them, and doing that through an alias would edit the frame instead.
+            shown = list(lines)
+            # Re-derived from the frame that is about to be drawn, not carried over from the move
+            # that produced it. A tooltip is a statement about what is on screen, so it has to be
+            # recomputed when the screen changes under a pointer that has not moved — otherwise it
+            # keeps answering for the row that used to be there after a scroll, a view change, or a
+            # thread dropping off the list.
+            tip = describe(lines, mpos[1], mpos[0], view) if tipon else None
+            if tip:
+                # Drawn over the finished frame rather than into it. The frame's height is a budget
+                # every panel is fitted to, and a box that pushed rows down to make room for itself
+                # would move the very thing being pointed at.
+                box, bw = tip_box(tip, cc, w)
+                top, left = place(bw, len(box), *mpos, w, h)
+                for i, ln in enumerate(box):
+                    if 0 <= top + i < h:
+                        sys.stdout.write(f"\033[{top + i + 1};{left + 1}H{ln}")
+                        if top + i < len(shown):
+                            shown[top + i] = None
             sys.stdout.write(f"\033[{len(lines) + 1};1H")
             sys.stdout.flush()
             k = wait_key(a.interval)
             # '' is the interval elapsing, 'wake' is perf-snap signalling a new capture. Anything
-            # else is a keystroke, and a keystroke only changes what is drawn, never what is known.
+            # else is a keystroke or a mouse report, and neither changes what is known, only what is
+            # drawn. Set before the mouse block below, which returns to the top of the loop by its
+            # own routes — leaving it after them let a pointer move inherit the previous tick's
+            # `fresh` and re-run the whole sampler for a redraw.
             fresh = k in ("", "wake")
+            # A tooltip has to be able to go away on its own. There is no "pointer left the window"
+            # event in the protocol — the last thing reported is whatever cell it crossed on the way
+            # out — so a box that lives until the next move sits on top of the frame for as long as
+            # the terminal is in the background. It expires after two refreshes instead, which is
+            # long enough to read and short enough not to be furniture. Any keypress also drops it:
+            # the keyboard taking over says the pointer is not what is being looked at.
+            if tipon and fresh:
+                tipage += 1
+                tipon = tipage < 2
+            elif tipon and not isinstance(k, tuple) and k and k != "\x1b":
+                tipon = False
+            if isinstance(k, tuple):
+                _, mx, my, kind = k
+                mpos, tipage = (mx, my), 0
+                # Leaving through an edge is the one exit that does report a cell. The outermost
+                # ring carries the frame's border and the key bar, and neither has a tooltip worth
+                # keeping, so treating it as "gone" costs nothing and catches the common case.
+                if kind == "move" and (mx <= 0 or my <= 0 or mx >= wh[0] - 1 or my >= wh[1] - 1):
+                    if not tipon:
+                        continue
+                    tipon, tipkey = False, None
+                    continue
+                if kind in ("wheelup", "wheeldn"):
+                    # The wheel scrolls whatever j/k scroll, so there is nothing new to learn.
+                    if view == "config" and not detail:
+                        sel = max(0, sel + (-1 if kind == "wheelup" else 1))
+                    else:
+                        scroll = max(0, scroll + (-3 if kind == "wheelup" else 3))
+                    shown = [None] * len(shown)
+                    continue
+                if kind == "press":
+                    # Clicking a panel opens its view, the same one its key opens. Only from the
+                    # main frame, so a click inside a view cannot silently switch to another.
+                    p = panel_at(lines, my, mx, view)
+                    if view == "main" and p in DETAIL:
+                        view, scroll, tipon = p, 0, False
+                        shown = [None] * len(shown)
+                    continue
+                if kind == "release":
+                    continue
+                new = describe(lines, my, mx, view)
+                # Redraw only when the answer or the row changes. Moving along a row leaves the box
+                # exactly where it is: any-event tracking fires once per cell crossed, so following
+                # the pointer sideways costs a frame rebuild per column and gives a box that jitters
+                # while you read it.
+                if (my, new) == tipkey and tipon:
+                    continue
+                tipkey, tipon, mpos = (my, new), True, (mx, my)
+                continue
             if edit is not None:
                 # A tiny line editor. Enter applies, Esc cancels, backspace deletes; anything
                 # printable appends. Deliberately no history or cursor movement — this is for
@@ -340,11 +464,17 @@ def main():
                     edit, msg = (row[1] if len(row) > 1 else ""), None
                     shown = [None] * len(shown)
                 continue
-            if k == "\x1b" and (detail or view != "main"):
+            if k == "\x1b" and (tipon or detail or view != "main"):
                 # One level at a time. Escaping out of a setting's description dropped the config
                 # list as well and landed on the main frame, so getting back to where you were meant
                 # pressing c and scrolling to the row again.
-                if detail:
+                #
+                # The tooltip is the innermost level, and the only one that can be reached with the
+                # terminal filling the screen: there is no cell outside the window for the pointer
+                # to leave through there, so the edge rule never fires and Esc is the way out.
+                if tipon:
+                    tipon, tipkey = False, None
+                elif detail:
                     detail = None
                 else:
                     view = "main"
@@ -352,6 +482,14 @@ def main():
                 continue
             if k == "q":
                 return 0
+            if k == "x":
+                # Tracking off hands text selection back to the terminal, which is the one thing it
+                # costs. Kept as a key rather than a flag because it is wanted for a moment — copy a
+                # symbol out of the profile panel, then turn it back on.
+                mouse, tipon = not mouse, False
+                sys.stdout.write(MOUSE_ON if mouse else MOUSE_OFF)
+                shown = [None] * len(shown)
+                continue
             # One toggle rule for every view, so a key never means two things and no view can be
             # reached that its own key does not leave.
             bykey = {v: n for n, v in DETAIL.items()}
@@ -385,8 +523,10 @@ def main():
         if not a.once:
             # Wipe the scratch screen before handing the terminal back, then leave the alternate
             # buffer and restore the cursor — all in the finally block, so a crash or a kill cannot
-            # strand the terminal on the scratch buffer or leave a half-drawn frame behind.
-            sys.stdout.write("\033[2J\033[H\033[?25h\033[?1049l")
+            # strand the terminal on the scratch buffer or leave a half-drawn frame behind. Mouse
+            # tracking goes out the same way and for the same reason: left on, every movement over
+            # the shell that follows prints escape sequences into the prompt.
+            sys.stdout.write(MOUSE_OFF + "\033[2J\033[H\033[?25h\033[?1049l")
             sys.stdout.flush()
         if pidfile:
             try:
