@@ -18,7 +18,7 @@ def pg_driver():
         return None
 
 
-def query(cfg, sql, timeout=30):
+def query(cfg, sql, timeout=30, params=None):
     """Run each statement, return list-of-rowlists. One client for every target.
 
     A driver rather than shelling out to psql, and the same path whether the server runs in a
@@ -29,6 +29,12 @@ def query(cfg, sql, timeout=30):
 
     Values come back as strings, matching what psql's text output gave, so every parser downstream
     is unchanged. `None` means the query did not run — the caller reports why (see `sql_status`).
+
+    `params` is a list aligned with `sql`: one tuple per statement, or None for statements that take
+    none. Anything from outside this file goes here rather than into an f-string. The MCP `config`
+    tool interpolated its `name` argument directly, which is an injection an agent can reach — the
+    connection is read-only so it could not write, but "the damage is bounded" is not the same as
+    "the query is correct".
     """
     drv = pg_driver()
     if drv is None or not cfg.get("password"):
@@ -41,8 +47,9 @@ def query(cfg, sql, timeout=30):
             cn.read_only = not cfg.get("_write")
             out = []
             with cn.cursor() as cur:
-                for stmt in sql:
-                    cur.execute(stmt)
+                for i, stmt in enumerate(sql):
+                    args = (params or [])[i] if params and i < len(params) else None
+                    cur.execute(stmt, args) if args else cur.execute(stmt)
                     rows = cur.fetchall() if cur.description else []
                     out.append([["" if v is None else str(v) for v in r] for r in rows])
             return out

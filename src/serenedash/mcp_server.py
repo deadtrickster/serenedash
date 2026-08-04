@@ -218,9 +218,11 @@ def config(name: str = "") -> dict:
     if err:
         return err
     if name:
+        # Bound, not interpolated. `name` arrives from the caller, and this was an f-string.
         rows = db.query(CFG,
-                         ["select name, value, coalesce(description,''), input_type, scope "
-                          f"from duckdb_settings() where name = '{name}'"])
+                        ["select name, value, coalesce(description,''), input_type, scope "
+                         "from duckdb_settings() where name = %s"],
+                        params=[(name,)])
         r = (rows[0] or [[]])[0] if rows else []
         if len(r) < 2:
             return {"error": f"no such setting: {name}"}
