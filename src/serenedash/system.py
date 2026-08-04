@@ -1,4 +1,5 @@
 """serenedash.system"""
+import math
 import os
 import subprocess
 import time
@@ -6,6 +7,49 @@ import time
 
 
 SLOW_EVERY = 12
+
+
+def rlimit_nofile(pid, root="/proc"):
+    """(soft, hard) RLIMIT_NOFILE for a pid, read from /proc/<pid>/limits. None if it cannot be read.
+
+    None means "could not check" and never "fine": a pid that has gone, a /proc this user cannot
+    reach, and a kernel that spells the line differently all land here, and a caller that reports
+    any of them as a pass is making the same error as `sleeping` on a thread at 60%.
+
+    Read from /proc rather than through `resource.prlimit`, which needs CAP_SYS_RESOURCE for another
+    process - measured on this box: prlimit(526418, RLIMIT_NOFILE) raises EPERM for an unprivileged
+    reader while /proc/526418/limits is mode 0444 and readable by anyone. Same asymmetry as perf and
+    /proc/<pid>/root, and the same workaround: read what is world-readable.
+
+    `unlimited` comes back as math.inf so a caller can compare against a target without a case for
+    it.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"{root}/{pid}/limits") as f:
+            for ln in f:
+                if ln.startswith("Max open files"):
+                    p = ln.split()
+                    return tuple(math.inf if v == "unlimited" else int(v) for v in (p[3], p[4]))
+    except (OSError, ValueError, IndexError):
+        return None
+    return None                          # no such line: an unexpected kernel, not a passing limit
+
+
+def sysctl(name, root="/proc/sys"):
+    """A /proc/sys value as an int, or None if it cannot be read or is not a plain number.
+
+    THIS host's /proc/sys on purpose, even when the server is in a container: vm.max_map_count is
+    not namespaced - which is why docker refuses `--sysctl vm.max_map_count`, its allowlist being
+    kernel.shm*/msg*/sem, fs.mqueue.* and net.* - so the container shares the host's value. Only
+    valid when the server runs on this machine, which the caller establishes with a host pid.
+    """
+    try:
+        with open(os.path.join(root, *name.split("."))) as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def hostinfo(pid, container):

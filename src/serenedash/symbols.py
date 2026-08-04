@@ -1,10 +1,18 @@
 """serenedash.symbols"""
+import math
 import os
 import shutil
 import subprocess
 
-from .db import sample
-from .system import host_pid
+from .db import query, sample
+from .system import host_pid, rlimit_nofile, sysctl
+
+# Documented host preconditions. Neither number is a guess: NOFILE_TARGET is the documented target
+# for a server whose text index holds a file per segment (this box runs 16 of them over 54.1 GB),
+# and MAP_COUNT_MIN is the documented minimum because IResearch memory-maps every one of those
+# segments - the kernel default of 65530 is below it.
+NOFILE_TARGET = 131072
+MAP_COUNT_MIN = 262144
 
 
 def elf_build_id(path):
@@ -161,6 +169,10 @@ def register_symbols(path):
         return False, str(e)
 
 
+def _count(v):
+    return "unlimited" if v == math.inf else f"{int(v)}"
+
+
 def doctor(cfg, perf_dir):
     """Every precondition for a full picture, each with what it costs you and how to fix it.
 
@@ -188,6 +200,103 @@ def doctor(cfg, perf_dir):
                  f"serened is pid {pid} on the host" if pid else
                  "cannot resolve the container's pid - the threads panel needs it",
                  "" if pid else "docker inspect must be usable by this user"))
+
+    # ── host preconditions ──────────────────────────────────────────────────────────────────────
+    #
+    # None of these three stops the server from starting, and none of them is visible in a healthy
+    # hour. They are spent by the workload: file descriptors by segments, mappings by segments,
+    # allocator work by whatever thread happens to be allocating. The failure arrives under load,
+    # with a message that names the symptom ("Too many open files", ENOMEM from mmap) and not the
+    # limit, which is the shape this whole view exists for.
+    #
+    # A source that cannot be read is reported as info, not as a pass. `absence of evidence` in
+    # AGENTS.md: no pid and no /proc are "could not check", and printing `ok` off them would be a
+    # sentence the data does not support.
+    #
+    # Details lead with the measurement and the threshold, and the reasoning goes in the fix. The
+    # frame packs a wrapped detail into ONE list element while the next element is written to an
+    # absolute row, so every continuation line is overwritten before it is read - checked in a pty
+    # at 80, 100 and 120 columns, where only the first wrapped line of each detail reached the
+    # screen. The fix lines are separate elements and survive intact. Until that is fixed in
+    # views.py, a detail whose first 54 columns (max(30, 80 - 26), the narrowest wrap) do not carry
+    # the number says nothing at all.
+    lim = rlimit_nofile(pid)
+    if lim is None:
+        rows.append(("info", "open files",
+                     f"could not read /proc/{pid}/limits - unchecked, which is not the same as "
+                     f"fine" if pid else
+                     "no host pid, so RLIMIT_NOFILE is unchecked - which is not the same as fine",
+                     ""))
+    else:
+        soft, hard = lim
+        if soft >= NOFILE_TARGET:
+            rows.append(("ok", "open files",
+                         f"soft {_count(soft)} of a documented {NOFILE_TARGET}, hard "
+                         f"{_count(hard)}", ""))
+        else:
+            raisable = hard >= NOFILE_TARGET
+            rows.append(("warn", "open files",
+                         f"soft {_count(soft)} of a documented {NOFILE_TARGET}, hard "
+                         f"{_count(hard)}. A descriptor per index segment, so it is the growing "
+                         f"index that spends this - and it arrives as 'Too many open files' under "
+                         f"load, hours after a clean start",
+                         (f"sudo prlimit --pid {pid} --nofile={NOFILE_TARGET}: raises it on the "
+                          f"running process - the trailing colon leaves the hard limit alone. "
+                          if raisable else
+                          f"the hard limit is {_count(hard)}, itself under {NOFILE_TARGET}, and a "
+                          f"process cannot raise its own. ")
+                         + f"The server sets its own soft limit to 65535 at startup (or the hard "
+                           f"limit, if that is lower), so it has to be given a bigger one to keep: "
+                           f"docker run --ulimit nofile={NOFILE_TARGET}:{NOFILE_TARGET}, or "
+                           f"LimitNOFILE={NOFILE_TARGET} in the systemd unit"))
+
+    # Only meaningful when the server is on this machine: vm.max_map_count is not namespaced, so a
+    # container shares the host's value, but a remote target has no pid here and the local sysctl
+    # would then describe the wrong kernel.
+    mmc = sysctl("vm.max_map_count") if pid else None
+    if mmc is None:
+        rows.append(("info", "memory maps",
+                     "could not read /proc/sys/vm/max_map_count" if pid else
+                     "no host pid, so a local vm.max_map_count would describe this kernel and not "
+                     "necessarily the server's - unchecked", ""))
+    elif mmc >= MAP_COUNT_MIN:
+        rows.append(("ok", "memory maps",
+                     f"vm.max_map_count={mmc}, documented minimum {MAP_COUNT_MIN}", ""))
+    else:
+        rows.append(("warn", "memory maps",
+                     f"vm.max_map_count={mmc} against a documented minimum of {MAP_COUNT_MIN}"
+                     + (" (the kernel default)" if mmc == 65530 else "")
+                     + ". IResearch memory-maps every index segment, so mmap starts failing as the "
+                       "index grows - under load, not at startup",
+                     f"sudo sysctl -w vm.max_map_count={MAP_COUNT_MIN}, and the same line in "
+                     f"/etc/sysctl.d/ to survive a reboot. It goes on the HOST: docker will not "
+                     f"take it as a --sysctl, because it is not namespaced - which is also why the "
+                     f"container shares whatever the host has"))
+
+    # One extra round trip, and only when the server answered. `sample()` fetches the settings the
+    # HAZARDS table has an opinion about and this is not one of them, and doctor() is off the redraw
+    # path - the TUI caches its rows and rebuilds them on the data tick, not per keypress.
+    b = query(cfg, ["select value from duckdb_settings() "
+                    "where name = 'allocator_background_threads'"]) if s else None
+    alloc = b[0][0][0] if b and b[0] and b[0][0] else None
+    cores = os.cpu_count() or 0
+    if alloc is None:
+        rows.append(("info", "allocator",
+                     "duckdb_settings() has no allocator_background_threads row - unchecked" if s
+                     else "no connection, so allocator_background_threads is unchecked - not that "
+                          "it is at its default", ""))
+    elif alloc.lower() in ("true", "on", "1", "yes"):
+        rows.append(("ok", "allocator",
+                     f"background threads on - jemalloc purges asynchronously, off the thread that "
+                     f"allocated ({cores} cores)", ""))
+    else:
+        rows.append(("warn", "allocator",
+                     f"background threads {alloc} (the default) on {cores} cores - jemalloc then "
+                     f"purges dirty pages in the foreground, inside whichever query allocated "
+                     f"them, rather than on a thread of its own",
+                     "SET GLOBAL allocator_background_threads=true (the c view sets it in place), "
+                     "and the server's config so it survives a restart. Documented as worth "
+                     "enabling on many-core CPUs"))
 
     rows.append(("ok" if have("perf") else "warn", "perf",
                  "installed" if have("perf") else "not installed - no profile or call graph",
