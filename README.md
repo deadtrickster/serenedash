@@ -106,10 +106,17 @@ check it, rather than a verdict to be taken on trust. Same environment variables
 `--format json`, so the two cannot disagree about what a snapshot contains.
 
 The server ships `src/serenedash/instructions.md`, which the client injects as context before the
-model calls anything: how to read the numbers, what the vocabulary means, and a knowledge base on
-the mechanics behind them — DuckDB's buffer manager and spill behaviour, IResearch and FAISS cost
-shapes, `/proc` accounting, perf build-ids. It is a file rather than a string literal so it is
-reviewable in a diff.
+model calls anything: how to read the numbers, the vocabulary that is easy to misread, how to reason
+about what you are seeing, and a knowledge base on the mechanics behind it — row groups and zonemaps,
+why compression frequency is a checkpoint setting, what does and does not spill, ART indexes sitting
+outside the buffer manager, inverted-index refresh and consolidation, IVF training versus search,
+`/proc` accounting, perf build-ids. Each section ends with what the mechanic means for reading a
+live server, and the examples are ones this deployment produced.
+
+It also points at the three system tables no panel exposes — `sdb_metrics` (segment counts, buffered
+docs, refresh and consolidation backlogs, per-index size), `sdb_settings` (the server's own thread
+pools and connection limits, which `duckdb_settings()` does not contain) and `sdb_progress` (how far
+along a running query is). That is most of what `query` is for.
 
 Instructions are injected **once**, at connect time, and held for the session — so an upgrade
 mid-session leaves an agent reasoning from documentation that no longer describes the server. Every

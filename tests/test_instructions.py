@@ -94,3 +94,41 @@ def test_it_names_the_tools_that_exist():
     for name in ("status", "storage", "memory", "activity", "threads", "profile", "callgraph",
                  "host", "config", "query", "anomalies", "set_setting"):
         assert f"`{name}`" in t, f"{name} is not mentioned in the instructions"
+
+
+def test_it_documents_the_system_tables_no_panel_exposes():
+    # The point of the query tool is reaching what the panels do not, and these three are where
+    # the answers live. A document that omits them leaves an agent guessing at table names.
+    t = text()
+    for tbl in ("sdb_metrics", "sdb_settings", "sdb_progress"):
+        assert tbl in t, f"{tbl} is not documented"
+    for col in ("num_segments", "num_live_docs", "refresh_pending", "avg_consolidation_time_ms",
+                "cpu_threads", "io_threads", "background_threads", "rows_processed"):
+        assert col in t, f"{col} is not documented"
+
+
+def test_it_carries_the_numbers_that_make_the_mechanics_checkable():
+    # Each of these was read out of the docs or off the live server. They are here because a
+    # mechanic without its number is a story - "row groups are the unit of parallelism" is only
+    # actionable once you know it is 122,880 rows.
+    t = text()
+    for n in ("122,880",          # row group size, and the parallelism floor
+              "16 MiB",           # checkpoint_threshold default - the compression frequency lever
+              "80%",              # memory_limit default share of RAM
+              "125 MB",           # documented memory floor per thread
+              "1-4 GB", "1–4 GB", # working range per thread (either dash)
+              "131072",           # RLIMIT_NOFILE
+              "262144"):          # vm.max_map_count, and this server's block size
+        if n in ("1-4 GB", "1–4 GB"):
+            continue
+        assert n in t, f"{n} is no longer in the instructions"
+    assert "1-4 GB" in t or "1–4 GB" in t
+
+
+def test_it_explains_the_engines_the_profile_splits_into():
+    t = text()
+    for engine in ("columnar", "text", "vector", "wire", "alloc"):
+        assert engine in t, f"the {engine} engine bucket is not explained"
+    # And the two that are easy to misread as something else.
+    assert "other" in t
+    assert "IVF" in t and "BM25" in t
