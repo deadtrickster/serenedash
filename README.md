@@ -125,6 +125,21 @@ halfway. Three independent bounds: the statement's leading keyword must be one t
 no semicolon batches, and the connection is opened read-only regardless — so the server would reject
 a write that got past the check. Results are capped by rows and then by characters.
 
+This is the difference it makes. The question is "what about compression":
+
+![the same question, answered with query() available](serenedash-mcp-query.png)
+
+The profile panel on its own gets to "columnar is 44% of sampled cycles" and stops. Everything past
+that needed the database: the table is 10.39M rows over 47 columns, `content_with_weight` averages
+1891 characters against a `zstd_min_string_length` of 4096 - so zstd never fires and the column is
+FSST-only - and `checkpoint_threshold` is 16 MiB with 11 concurrent inserts, so the store is
+re-running analyze-and-compress continuously on row groups that never get a chance to fill.
+
+That last one is the finding, and it inverts the obvious fix. The question sounds like a choice of
+codec. The answer is how often the work runs, which is a checkpoint setting. No panel was going to
+show that, because it is a join across a profile, one column's length distribution and two settings.
+Eight tool calls, and not one of them a request for the user to go and run something.
+
 Rates arrive next to their base — `{"cpu_percent_of_one_core": 94.9, "cores": 24}`, storage shares
 with the total they divide. Every display bug this dashboard has had was a unit error rather than a
 collection error, and a bare number in JSON is exactly as easy to misread as a bare number on screen.
