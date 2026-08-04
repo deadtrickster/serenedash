@@ -49,6 +49,44 @@ LEGEND = (
                    "spilling; du cannot tell held-open from abandoned. T is the gap between du "
                    "runs, which happen every SLOW_EVERY ticks and so follow -n: 60s at the default "
                    "5s refresh, 24s at -n 2"),
+        ("duckdb_temporary_files()", "how many temp files the SERVER has open, and how many "
+            "bytes, against the count du found on disk. The orphan split above is inferred from "
+            "file mtimes, which is circumstantial; this is the server's own answer, and 0 held "
+            "against 24 present is that inference proving itself"),
+        ("indexes", "how many indexes sdb_metrics reports, with their live documents, segments and "
+                    "deleted count. Deleted is num_docs - num_live_docs: removed, but still held in "
+                    "a segment until a consolidation drops them. Press i for the per-index rows"),
+        ("engine tasks", "search refresh, compaction and cleanup tasks the server reports "
+                         "running, and how many are waiting behind them. Refresh and compaction "
+                         "are the two candidate explanations for the periodic CPU spikes on this "
+                         "deployment, and this row is what tells them apart while one happens"),
+    )),
+    ("search", (
+        ("search engine", "sdb_metrics — the counters SereneDB's own search engine keeps. Every "
+                          "other panel measures the process, the column store or the host; this is "
+                          "the engine, and it is what SereneDB is"),
+        ("refresh / compaction / cleanup", "tasks currently running, and tasks waiting to run, "
+                                           "server-wide rather than per index. The server's own "
+                                           "words for the four counters behind them"),
+        ("connections", "pg_connections and http_connections. pg_connections counts every pg-wire "
+                        "client the server has, including whatever connection this dashboard is "
+                        "holding while it reads — the activity panel's `sessions` excludes its "
+                        "own, so the two are counting different sets and will not agree"),
+        ("live docs", "num_live_docs, with num_docs beside it. The difference is documents that "
+                      "were deleted and are still occupying a segment; consolidation is what "
+                      "removes them"),
+        ("buffered", "num_buffered_docs — 'documents buffered in the writer, not yet committed', "
+                     "in the server's own description"),
+        ("segments", "num_segments, and the num_files backing them. Every segment is memory-mapped, "
+                     "which is why vm.max_map_count is a limit that matters here"),
+        ("index size", "index_size, and this index's share of every index sdb_metrics reports. It is "
+                    "the engine's own figure for its own files, not du of a directory, so it will "
+                    "not match the storage panel's `search idx`"),
+        ("avg commit / avg consolidation / avg cleanup", "avg_commit_time_ms, "
+            "avg_consolidation_time_ms, avg_cleanup_time_ms. 'Average time of the last few', in the "
+            "server's words — a recent average, not a lifetime one, so it moves. Beside each is its "
+            "num_failed_* count. This deployment read 672 ms in one sample and 16,893 ms an hour "
+            "later, which is the difference a lifetime average would have flattened away"),
     )),
     ("memory", (
         ("in use", "duckdb_memory() total against memory_limit; the sparkline is its recent history"),
@@ -64,10 +102,23 @@ LEGEND = (
         ("tags", "per-tag breakdown, every pool holding anything. The bar is against the largest "
                  "pool so the small ones are still visible; the note is its share of all tagged "
                  "memory, which is the number that adds to 100"),
+        ("spill", "duckdb_memory()'s temporary_storage_bytes, per pool — WHICH pool put bytes in "
+                  "the temp directory, not just that the directory has files in it. Listed by `m` "
+                  "whether or not anything spilled, so an empty list is a reading rather than a "
+                  "panel that never appeared"),
     )),
     ("activity", (
         ("sessions", "connected sessions by state, EXCLUDING this dashboard's own session"),
         ("▸ / ·", "active / idle. The text is the statement the server reports for that session"),
+        ("statement size", "the statement's length in characters, base 1000, shown before it once "
+                           "it is over 2000 — the row itself only ever carries one line of it. "
+                           "68.2k is 68,209 characters, and length() is the server's, so it counts "
+                           "the whole statement and not the head that was fetched"),
+        ("one literal", "the largest single quoted literal or bracketed list in the statement, and "
+                        "its share of the statement's characters — only in the `a` view, which is "
+                        "the one that fetches whole statements. Yellow when that one literal is "
+                        "over a quarter of the statement: a 1024-dim embedding sent as text is "
+                        "~21,700 characters the parser re-reads on every query"),
         ("nothing running", "no session is executing. A pinned core with this showing means work "
                             "with no session behind it — an orphaned server-side task"),
     )),
@@ -131,16 +182,45 @@ LEGEND = (
 
 # One key per panel, named after the panel it opens, plus g for the call graph and l for the
 # legend. Every view is a toggle: the same key returns to the main frame, as does Esc.
+# `search` takes i, for index: s was storage before there was a search engine on screen at all, and
+# moving it would retrain the one key that is used most.
 DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
-          "host": "h", "doctor": "d", "legend": "l"}
+          "host": "h", "doctor": "d", "legend": "l", "search": "i"}
 
 
 # No j/k here: nothing on the main frame scrolls, so it is carried by the views that do scroll and
 # the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
 # on a 96-column terminal.
 KEYS = (("q", "quit"), ("s", "storage"), ("m", "memory"), ("a", "activity"), ("t", "threads"),
-        ("p", "profile"), ("g", "graph"), ("c", "config"), ("h", "host"), ("d", "doctor"),
-        ("l", "legend"), ("x", "mouse"))
+        ("p", "profile"), ("i", "search"), ("g", "graph"), ("c", "config"), ("h", "host"),
+        ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
+
+
+def qty(n):
+    """A count, abbreviated base 1000. NOT human() — that is base 1024 and these are documents.
+
+    11,216,808 live documents through human() prints 10.7M, which is the right glyph over the wrong
+    arithmetic on a quantity that is not bytes.
+    """
+    n = float(n)
+    for u in ("", "k", "M", "G"):
+        if abs(n) < 1000 or u == "G":
+            return f"{n:,.0f}" if not u else f"{n:.1f}{u}"
+        n /= 1000
+    return f"{n:.1f}G"
+
+
+def msec(v):
+    """A millisecond figure from sdb_metrics, in the unit that can be read at a glance.
+
+    16893 ms is the number the server reports and 16.9s is the number anyone reads it as; both are
+    the same measurement, so only the second is printed and the legend names the metric.
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{v:,.0f}ms" if v < 1000 else f"{v / 1000:.1f}s"
 
 
 def status(c, width, extra=""):
@@ -201,12 +281,16 @@ def legend_frame(col, width, scroll):
     return out[scroll:]
 
 
-def storage_frame(s, sz, host, col, width, scroll):
+def storage_frame(s, sz, host, col, width, scroll, held=None):
     """The `s` view: where the bytes on disk actually are, file by file for the temp directory.
 
     The main panel has room for a size and a verdict. This has room for the evidence behind the
     verdict — every temp file with its age, so "orphaned" is something you can check rather than
     something the dashboard asserts.
+
+    `held` is temp_files_held(): (count, bytes) the server has open right now. The orphan split
+    below it is inferred from mtimes against the process start time, which is sound and still
+    circumstantial; the server's own count of open temp files is the other half of the argument.
     """
     c = C if col else NOCOLOR
     tot = (sz or {}).get("total") or 1
@@ -226,10 +310,15 @@ def storage_frame(s, sz, host, col, width, scroll):
         if v is not None:
             out.append(line(c, label, human(v), bar(v / tot, COL_BAR, c["blu"] if col else ""),
                             f"{c['dim']}{v / tot * 100:5.1f}%  {what}{c['r']}"))
+    # The server's own count of open temp files, next to du's count on disk. Two independent
+    # measurements of the same directory: 0 held against 24 present is what turns "these look
+    # orphaned" into "nothing has a descriptor into any of them".
+    holds = (f"  {c['dim']}·  the server holds {held[0]} of them open "
+             f"({human(held[1])}){c['r']}" if held else "")
     out += ["", f"{c['cyn']}{c['b']}temp files{c['r']}  "
             + (f"{c['dim']}{len(files)} files, {len(orph)} older than this serened "
-               f"({human(sum(f[1] for f in orph))} reclaimable){c['r']}" if files
-               else f"{c['dim']}none — nothing has spilled{c['r']}")]
+               f"({human(sum(f[1] for f in orph))} reclaimable){c['r']}{holds}" if files
+               else f"{c['dim']}none — nothing has spilled{c['r']}{holds}")]
     for mtime, size, name in files[:64]:
         old = started and mtime < started
         age = dur(time.time() - mtime)
@@ -237,6 +326,119 @@ def storage_frame(s, sz, host, col, width, scroll):
                         f"{c['yel'] if old else c['grn']}{'orphan' if old else 'live  '}{c['r']}  "
                         f"{c['dim']}{age:>8} old  {name[:52]}{c['r']}"))
     return out[scroll:]
+
+
+def _m(d, key):
+    """One sdb_metrics value as a number, 0 if it is not one.
+
+    The table is (metric, value) text and `search()` casts what it can, so a value the server ever
+    reports in another shape must not take the whole panel down with it.
+    """
+    try:
+        return float(d.get(key, 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def search_frame(sea, col, width, scroll):
+    """The `i` view: sdb_metrics, per index and server-wide.
+
+    The dashboard measured the process, the column store and the host, and had no number at all from
+    the search engine — which is what SereneDB is. This deployment runs a 54.1 GiB inverted index
+    over 11.2M documents in 15 segments, and none of it was on screen.
+
+    The row that pays for the view on its own is `avg consolidation`: it read 672 ms in one sample
+    and 16.9s an hour later with compaction_active at 1, and refresh-versus-compaction was the
+    open question about this server's periodic CPU spikes for a week.
+    """
+    c = C if col else NOCOLOR
+    W = max(70, width)
+    if sea is None:
+        # Not a degraded panel with zeros in it: every number on this screen is from one table, so
+        # there is nothing left to show when that table does not answer.
+        return [f"{c['b']}search engine{c['r']}  {c['yel']}sdb_metrics did not answer{c['r']}", "",
+                f"  {c['dim']}every number in this view comes from that one table — an index count "
+                f"of 0 drawn from an empty result would be a false panel, not a degraded one{c['r']}",
+                ][scroll:]
+    srv, idx = sea.get("server") or {}, sea.get("indexes") or {}
+    live = sum(_m(m, "num_live_docs") for m in idx.values())
+    segs = sum(_m(m, "num_segments") for m in idx.values())
+    disk = sum(_m(m, "index_size") for m in idx.values())
+    out = [f"{c['b']}search engine{c['r']}  {c['dim']}sdb_metrics · {len(idx)} indexes · "
+           f"{qty(live)} live docs · {qty(segs)} segments · {human(disk)} on disk{c['r']}", "",
+           f"{c['cyn']}{c['b']}server{c['r']}  {c['dim']}the counters that are not per index{c['r']}"]
+    for kind, what in (("refresh", "reopening the index for readers"),
+                       ("compaction", "merging segments together"),
+                       ("cleanup", "dropping files no segment references")):
+        act, pend = int(_m(srv, f"{kind}_active")), int(_m(srv, f"{kind}_pending"))
+        out.append(line(c, kind, f"{act:,}", " " * COL_BAR,
+                        f"{c['yel'] if pend else c['dim']}{pend:,} pending{c['r']}  "
+                        f"{c['dim']}{what}{c['r']}",
+                        vc=c["b"] if act else None))
+    out.append(line(c, "connections", f"{int(_m(srv, 'pg_connections')):,}", " " * COL_BAR,
+                    f"{c['dim']}pg-wire · {int(_m(srv, 'http_connections')):,} HTTP{c['r']}"))
+    if not idx:
+        out += ["", f"{c['dim']}sdb_metrics reports no per-index rows on this server{c['r']}"]
+    for rel, m in sorted(idx.items(), key=lambda kv: -_m(kv[1], "index_size")):
+        nd, nl, size = _m(m, "num_docs"), _m(m, "num_live_docs"), _m(m, "index_size")
+        out += ["", f"{c['cyn']}{c['b']}index {rel}{c['r']}  "
+                f"{c['dim']}sdb_metrics relation_id{c['r']}"]
+        # Every bar in this block divides by something named on its own row: live documents by the
+        # documents in the index, bytes by the bytes of every index. Nothing divides by "the biggest
+        # one on screen", which is how the thread bars were wrong for a month.
+        out.append(line(c, "live docs", f"{nl:,.0f}", bar(nl / (nd or 1), COL_BAR,
+                                                          c["grn"] if col else ""),
+                        f"{c['dim']}of {nd:,.0f} in the index  ·  {nd - nl:,.0f} deleted{c['r']}",
+                        vc=c["b"]))
+        out.append(line(c, "buffered", f"{_m(m, 'num_buffered_docs'):,.0f}", " " * COL_BAR,
+                        f"{c['dim']}in the writer, not yet committed{c['r']}"))
+        out.append(line(c, "segments", f"{_m(m, 'num_segments'):,.0f}", " " * COL_BAR,
+                        f"{c['dim']}{_m(m, 'num_files'):,.0f} files back the index{c['r']}"))
+        out.append(line(c, "index size", human(size),
+                        bar(size / (disk or 1), COL_BAR, c["blu"] if col else ""),
+                        f"{c['dim']}{size / (disk or 1) * 100:.0f}% of {human(disk)} across "
+                        f"{len(idx)} indexes{c['r']}"))
+        for label, metric, failed, noun in (
+                ("avg commit", "avg_commit_time_ms", "num_failed_commits", "commits"),
+                ("avg consolidation", "avg_consolidation_time_ms", "num_failed_consolidations",
+                 "consolidations"),
+                ("avg cleanup", "avg_cleanup_time_ms", "num_failed_cleanups", "cleanups")):
+            nf = int(_m(m, failed))
+            # "average time of the last few", in the server's own words — so this is a recent
+            # average and not a lifetime one, and it is why the number moves between samples.
+            out.append(line(c, label, msec(_m(m, metric)), " " * COL_BAR,
+                            f"{c['dim']}of the last few  ·  {c['r']}"
+                            f"{c['red'] if nf else c['dim']}{nf:,} failed {noun}{c['r']}",
+                            vc=c["b"] if label == "avg consolidation" else None))
+    # Clipped to the terminal here rather than row by row: every row above is built to say what it
+    # has to say, and only the screen decides where that stops. clip(), because these rows are full
+    # of escapes and a byte slice would cut one in half and eat the row after it — and to W - 1,
+    # because a clipped row spends one more real column on the ellipsis (mkbox has the same -1).
+    return [clip(ln, W - 1) for ln in out][scroll:]
+
+
+# A quoted literal or a bracketed list. `'[^']*'` rather than anything that understands a doubled
+# quote: the alternation form is a nested quantifier that backtracks catastrophically on an
+# unterminated string, and splitting one escaped literal into two only ever understates a share.
+_LITERAL = re.compile(r"'[^']*'|\[[^\[\]]*\]", re.S)
+
+
+def biggest_literal(q):
+    """(length, head) of the largest quoted literal or bracketed list in a statement.
+
+    Spans only until the winner is known: this runs over every statement the view shows on every
+    redraw, and the statements on this deployment are 68 KB each.
+
+    It exists for one finding. A RAGFlow query here is 68,209 characters, 21,684 of them (31.8%) a
+    single 1024-dimension embedding sent as a text literal — three copies of it, in fact. A panel
+    showing the first 90 characters of that statement cannot say so, and it took a vendor reading a
+    screenshot of this dashboard to spot it.
+    """
+    best = max((m.span() for m in _LITERAL.finditer(q)), key=lambda sp: sp[1] - sp[0], default=None)
+    if best is None:
+        return 0, ""
+    lo, hi = best
+    return hi - lo, q[lo:lo + 48]
 
 
 def activity_frame(s, col, width, scroll, full=None):
@@ -259,8 +461,26 @@ def activity_frame(s, col, width, scroll, full=None):
         out.append(f"{c['dim']}no sessions{c['r']}")
     for stt, q, n in rows:
         run = stt == "active"
-        size = f"  {c['dim']}{human(n)}{c['r']}" if n > 2000 else ""
-        out.append(f"{(c['grn'] + '▸') if run else (c['dim'] + '·')} {stt}{c['r']}{size}")
+        head = f"{(c['grn'] + '▸') if run else (c['dim'] + '·')} {stt}{c['r']}"
+        # Only measured against a statement held in full. Against the 200-character head the share
+        # would be a share of the head, which is a different question wearing the same words.
+        lit, preview = biggest_literal(q) if n > 2000 and len(q) >= n else (0, "")
+        if n > 2000:
+            # Characters, not bytes — human() is base 1024 and this is text the server measured with
+            # length(). One denominator for the row: every figure on it divides by these characters.
+            head += f"  {c['dim']}{n:,} chars{c['r']}"
+            if lit:
+                # A quarter is the comparison, and it is named rather than left as a colour: the
+                # figure goes yellow when one literal is more than a quarter of the statement.
+                lc = c["yel"] if lit > n / 4 else c["dim"]
+                head += (f"  {lc}{lit:,} ({lit / n * 100:.0f}%) of them in one literal"
+                         f"{', over a quarter' if lit > n / 4 else ''}{c['r']}")
+        out.append(head)
+        if lit > n / 4:
+            # Only for the case the row above flagged, and the ellipsis says the literal runs on
+            # rather than that this line was cut - the two are different claims about the same row.
+            txt = "that literal starts " + preview + ("…" if lit > len(preview) else "")
+            out.append(f"    {c['dim']}{clip(txt, max(30, W - 8))}{c['r']}")
         # Wrapped, not truncated: the interesting part of a statement is rarely in its first line,
         # and the main panel already shows the head of it.
         shown = q if len(q) >= n else q + f"  … {human(n - len(q))} more not fetched"
@@ -397,6 +617,23 @@ def memory_frame(s, hist, host, col, width, scroll):
                         f"{c['cyn'] if v else c['dim']}"
                         f"{spark(h, top=top) if h else ''}{c['r']}",
                         lc=lc or anom_colour(c, found.get(f"t:{tag}"))))
+    # temporary_storage_bytes, off the same duckdb_memory() row as the pool above it. The storage
+    # panel can say the temp directory holds files; only this says which pool put them there, and
+    # the two are not the same claim — du sees a killed query's wreckage exactly as it sees a live
+    # spill, and this does not.
+    #
+    # Drawn whether or not anything spilled. A section that appears only when it is non-empty makes
+    # "nothing spilled" and "this dashboard never looked" the same picture.
+    spill = sorted((s.get("memspill") or {}).items(), key=lambda kv: -kv[1])
+    stot = sum(v for _, v in spill) or 1
+    out += ["", f"{c['cyn']}{c['b']}spill{c['r']}  {c['dim']}temporary_storage_bytes, per pool"
+                f"{c['r']}"]
+    for tag, v in spill:
+        out.append(line(c, tag, human(v), bar(v / stot, COL_BAR, c["red"] if col else ""),
+                        f"{c['dim']}{v / stot * 100:.0f}% of the {human(stot)} spilled{c['r']}",
+                        lc=c["red"]))
+    if not spill:
+        out.append(f"{' ' * COL_LABEL}{c['dim']}no pool reports any{c['r']}")
     # The main frame can only colour a label — it has no line to spare. Here there is room to say
     # what was actually measured, which is the part that makes a highlight arguable rather than
     # something to be believed.
@@ -439,10 +676,11 @@ def doctor_frame(rows, fix, col, width, scroll, msg=None):
 
 
 NOSQL = {"db": "", "size": 0, "wal": 0, "mem": 0, "memlimit": 0, "blocks": (0, 0, 0, 0),
-         "memtags": [], "states": {}, "queries": [], "settings": {}, "t": 0}
+         "memtags": [], "memspill": {}, "states": {}, "queries": [], "settings": {}, "t": 0}
 
 
-def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_why=None):
+def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_why=None,
+          sea=None, held=None):
     """The main screen. `s` is None when SQL is unavailable; `sql_why` is sql_status's (reason, fix).
 
     Named `sql_why` and not `why` because the config panel below already binds `why` per hazard, and
@@ -454,6 +692,10 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     and every finding derived from them. The dashboard is running on the machine; /proc, du and the
     perf captures are all still there, and a server that will not accept a connection is exactly
     when the host-side numbers are worth looking at.
+
+    `sea` is search() and `held` is temp_files_held(), both optional and both refreshed on the data
+    tick — never on a redraw. Each buys exactly two rows and one tail here; the rest of what they
+    carry is behind `i` and `s`.
     """
     c = C if col else NOCOLOR
     nosql = s is None
@@ -577,11 +819,52 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
         if orphaned:
             # Its own labelled row, directly under spill: a number with an action attached, not an
             # annotation on someone else's number. In the tail it was the first thing truncated.
+            #
+            # `server holds N` is the second measurement of the same directory: du counted the files
+            # and duckdb_temporary_files() says how many of them the server has open. 0 held against
+            # 24 present is what turns an inference from mtimes into something checked from inside.
+            holds = f"{c['dim']}server holds {held[0]}{c['r']}  " if held else ""
             rows.append(line(c, "orphaned", human(orph_b),
                              bar(orph_b / tot, COL_BAR, c["yel"] if col else ""),
-                             f"{c['yel']}{orph_n} old temp files{c['r']}  "
+                             f"{c['yel']}{orph_n} old temp files{c['r']}  {holds}"
                              f"{c['dim']}{orph_b / tot * 100:.0f}% reclaimable{c['r']}",
                              vc=c["yel"]))
+
+    # ── search ──────────────────────────────────────────────────────────────────────────────────
+    #
+    # Two rows, always two, folded into the panel that already carries `search idx`: the store's
+    # directory sizes and the engine's own counts of what is in that directory belong next to each
+    # other, and a box of its own costs two more borders than an 80x24 terminal has. `i` opens the
+    # per-index rows behind these. Held apart from `rows` until the budget below has decided whether
+    # they fit — on an 80x30 terminal two more pinned rows cost four, because the pair is stacked.
+    searchrows = []
+    if not nosql:
+        srv = (sea or {}).get("server") or {}
+        idx = (sea or {}).get("indexes") or {}
+        kinds = ("refresh", "compaction", "cleanup")
+        if sea is None:
+            # Still two rows. A panel whose height depends on whether one extra query answered would
+            # move everything below it the first time it did not, which is the same complaint as a
+            # frame that resizes when a query ends.
+            searchrows += [line(c, "indexes", "?", " " * COL_BAR,
+                                f"{c['dim']}sdb_metrics did not answer{c['r']}"), ""]
+        else:
+            live = sum(_m(m, "num_live_docs") for m in idx.values())
+            dead = sum(_m(m, "num_docs") - _m(m, "num_live_docs") for m in idx.values())
+            segs = sum(_m(m, "num_segments") for m in idx.values())
+            searchrows.append(line(c, "indexes", str(len(idx)), " " * COL_BAR,
+                                   f"{c['dim']}{qty(live)} live docs · {qty(segs)} segments · "
+                                   f"{qty(dead)} deleted{c['r']}", vc=c["b"] if idx else None))
+            act = sum(int(_m(srv, f"{k}_active")) for k in kinds)
+            pend = sum(int(_m(srv, f"{k}_pending")) for k in kinds)
+            # Which ones, when there is a which. Idle, the tail names the three counters it is the
+            # total of, so the row says what it is watching rather than only that it is zero.
+            busy = "  ".join(f"{k} {int(_m(srv, f'{k}_active'))}+{int(_m(srv, f'{k}_pending'))}"
+                             for k in kinds if _m(srv, f"{k}_active") or _m(srv, f"{k}_pending"))
+            searchrows.append(line(c, "engine tasks", str(act), " " * COL_BAR,
+                                   f"{c['yel'] if pend else c['dim']}{pend} pending{c['r']}  "
+                                   f"{c['dim']}{busy or 'refresh, compaction, cleanup'}{c['r']}",
+                                   vc=c["yel"] if act else None))
     srows = rows
 
     # ── memory ──────────────────────────────────────────────────────────────────────────────────
@@ -677,10 +960,17 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     # slots off the one session doing something, which is the whole point of the panel.
     ordered = sorted((qq for qq in s["queries"] if "pg_stat_activity" not in qq[1]),
                      key=lambda qq: (qq[0] != "active", not qq[1], qq[0]))
-    abody = [f"{(c['grn'] + '▸') if stt == 'active' else (c['dim'] + '·')}{c['r']} "
-             f"{'' if stt == 'active' else c['dim']}"
-             f"{clip(q, WIDE) if q else f'({stt}, no statement)'}{c['r']}"
-             for stt, q, _ in ordered]
+    # The head is all that was fetched, so the row itself cannot show how long the statement is —
+    # length() rides along beside it for exactly this. `68.2k` in front of a one-line row is the
+    # difference between a query and a query carrying three copies of a 21,684-character embedding,
+    # and `a` is where the split between statement and literal is measured.
+    abody = []
+    for stt, q, n in ordered:
+        mark = f"{(c['grn'] + '▸') if stt == 'active' else (c['dim'] + '·')}{c['r']} "
+        size = f"{c['dim']}{qty(n)}{c['r']} " if n > 2000 else ""
+        body = (clip(q, max(20, WIDE - len(strip(size)))) if q
+                else f"({stt}, no statement)")
+        abody.append(f"{mark}{size}{'' if stt == 'active' else c['dim']}{body}{c['r']}")
 
     # ── threads ─────────────────────────────────────────────────────────────────────────────────
     if thr:
@@ -887,12 +1177,17 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     # with `pin` alone under-counted and the frame ran off the bottom of the terminal.
     # Memory's tag rows are not counted here: they fill whatever the pair's height turns out to be,
     # so the panel is sized by storage and its own fixed head, never by how many pools are live.
-    floor_top = max(len(srows), len(mrows) + 3)
+    def floor_t(keep_sea):
+        # The search rows are two more PINNED rows, and stacked they cost four - so whether they fit
+        # is a budget question, not something to append and hope. 80x30 overran by exactly one line
+        # with them unconditional.
+        return max(len(srows) + (len(searchrows) if keep_sea else 0), len(mrows) + 3)
+
     floor_bot = max(len(crows), len(hrows))
 
-    def cost(pin, keep_cfg, keep_host, keep_cyc):
+    def cost(pin, keep_cfg, keep_host, keep_cyc, keep_sea):
         botn = keep_cfg + keep_host
-        th, bh = max(pin, floor_top) + 2, max(pin, floor_bot) + 2
+        th, bh = max(pin, floor_t(keep_sea)) + 2, max(pin, floor_bot) + 2
         top = th if pair else 2 * th
         bot = bh if (pair and botn == 2) else botn * bh
         return top + bot + (0 if keep_cyc else -(2 + len(phead)))
@@ -902,25 +1197,34 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     # context — slow-moving, and `c` shows all of it in full — while the panels above them are the
     # reason the dashboard is open. On an 80x24 terminal seven box frames alone are 14 of the rows,
     # so on the smallest screens something has to go, and it should not be live data.
-    # Order of sacrifice: pinned padding, then `host`, then `config`, then `profile` last. Profile
-    # goes only at the very end because it is live data — but it is the one live panel that depends
-    # on an external capture and has a whole view of its own behind `s`, so on a screen too small
-    # for everything it is the one that costs least to lose.
-    plans = ([(p, 1, 1, 1) for p in (5, 4, 3, 2)] + [(p, 1, 0, 1) for p in (4, 3, 2)]
-             + [(2, 0, 0, 1), (2, 0, 0, 0)])
+    # Order of sacrifice: the two search rows, then pinned padding, then `host`, then `config`, then
+    # `profile` last. Profile goes only at the very end because it is live data — but it is the one
+    # live panel that depends on an external capture and has a whole view of its own behind `s`, so
+    # on a screen too small for everything it is the one that costs least to lose.
+    #
+    # The search rows go first, and the ladder below them is exactly the one that was here before
+    # them, so no terminal loses a panel it used to get in order to gain two rows. They cost more
+    # than they look: the two pinned panels share one height, so stacked they are four rows for two,
+    # and at 120x45 keeping them meant giving up the whole config panel — seven rows carrying five
+    # predicates — for a net three. Every figure in them is behind `i` in full.
+    plans = ([(p, 1, 1, 1, 1) for p in (5, 4, 3, 2)] + [(p, 1, 1, 1, 0) for p in (5, 4, 3, 2)]
+             + [(p, 1, 0, 1, 0) for p in (4, 3, 2)]
+             + [(2, 0, 0, 1, 0), (2, 0, 0, 0, 0)])
     # Two passes: first insisting on three rows per list, then accepting one. The fixed panels have
     # a hard floor now that they never truncate — storage alone is six rows, and stacked on a narrow
     # 24-line terminal the pair is 16 before anything else is drawn — so without the second pass the
     # frame gave up and ran off the bottom, which loses the top of the screen rather than the least
     # important row of a list.
-    pin, keep_cfg, keep_host, keep_cyc = next(
+    pin, keep_cfg, keep_host, keep_cyc, keep_sea = next(
         (pl for need in (9, 3) for pl in plans if height - overhead - cost(*pl) >= need),
         plans[-1])
     if not keep_cyc:
         overhead -= 2 + len(phead)
         phead, psyms = [], []
+    if keep_sea:
+        srows = srows + searchrows
 
-    top_n, bot_n = max(pin, floor_top), max(pin, floor_bot)
+    top_n, bot_n = max(pin, floor_t(keep_sea)), max(pin, floor_bot)
     # Tags fill the height storage set, and overflow is counted on the last row — the same contract
     # the threads and query lists have, applied inside a pinned panel.
     mrows = mrows + fit(mtags, max(1, top_n - len(mrows)))

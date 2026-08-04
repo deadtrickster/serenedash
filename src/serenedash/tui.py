@@ -17,7 +17,7 @@ from .anomaly import index as anom_index
 from .hover import describe, panel_at, place, tip_box
 from . import history
 from . import snapshot as snap
-from .db import apply_setting, full_queries, query, sample, sql_status
+from .db import apply_setting, full_queries, query, sample, search, sql_status, temp_files_held
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
@@ -31,6 +31,7 @@ from .views import (
     legend_frame,
     memory_frame,
     profile_frame,
+    search_frame,
     status,
     storage_frame,
     threads_frame,
@@ -63,8 +64,9 @@ MOUSE_OFF = "\033[?1003l\033[?1006l"
 
 
 # The views whose numbers all come from SQL. Everything else on the screen is /proc, du or a perf
-# capture, and none of that stops working because a password is wrong.
-NEEDS_SQL = ("storage", "memory", "activity")
+# capture, and none of that stops working because a password is wrong. `search` is here for the same
+# reason as the rest: every figure in it is one row of sdb_metrics.
+NEEDS_SQL = ("storage", "memory", "activity", "search")
 
 
 def write_pidfile(perf_dir):
@@ -219,6 +221,7 @@ def main():
     col = not a.no_color and sys.stdout.isatty()
 
     prev, sz, tick, shown, fresh, s = None, {}, 0, [], True, None
+    sea, held = None, None
     hist = {"mem": []}
     perf = (None, [], {})
     crows = []
@@ -270,6 +273,12 @@ def main():
                 # terminal is read first precisely so the query can be sized to it.
                 s = sample(cfg, query_head=max(200, shutil.get_terminal_size((100, 40)).columns))
             if fresh:
+                # sdb_metrics on the same tick as the sample, and never on a redraw. A second round
+                # trip rather than a column in sample(): it is the search engine's own table, a
+                # deployment without an index has nothing in it, and sample() runs on every tick of
+                # every deployment. 4 ms against sample's 111 ms here - 8 server rows and 12 per
+                # index.
+                sea = search(cfg) if s is not None else None
                 # Only on the data tick: sql_status opens its own connection to find out WHY, and
                 # doing that per keypress would put a failing connect in front of every redraw.
                 why = sql_status(cfg) if s is None else None
@@ -278,6 +287,10 @@ def main():
                 # the filesystem this process can see perfectly well.
                 if tick % SLOW_EVERY == 0:
                     sz = slow(cfg, a.data, sz)
+                    # On the du tick, not the sample tick, because it is only ever read against du's
+                    # count of the same directory. Two measurements a minute apart would be a
+                    # comparison of two different moments printed as one sentence.
+                    held = temp_files_held(cfg) if s is not None else None
             if fresh and s is not None:
                 hist["mem"] = (hist["mem"] + [s["mem"]])[-HIST:]
                 # Per tag as well as in total. The total tells you memory moved; only the per-tag
@@ -355,13 +368,14 @@ def main():
                     fullq = None
                 elif fresh or fullq is None:
                     fullq = full_queries(cfg)
-                body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll),
+                body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
                         "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
                         "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
                         "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                          scroll),
                         "profile": lambda: profile_frame(perf, col, w, scroll),
                         "host": lambda: host_frame(hinfo, s, col, w, scroll),
+                        "search": lambda: search_frame(sea, col, w, scroll),
                         "legend": lambda: legend_frame(col, w, scroll)}[view]()
                 keybar = status(cc, w, f"{cc['b']}{DETAIL[view]}{cc['r']} "
                                        f"{cc['dim']}back{cc['r']}  {cc['dim']}·{cc['r']}  "
@@ -387,7 +401,8 @@ def main():
                     crows = rows_[0] if rows_ else []
                 lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
             else:
-                lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why)
+                lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why,
+                              sea, held)
             prev = s
             tick += 1
             if a.once:
