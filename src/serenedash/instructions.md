@@ -178,6 +178,33 @@ FROM pragma_storage_info('t') GROUP BY 1, 2 ORDER BY 3 DESC;
 
 `pragma_storage_info` reports the codec actually chosen per column segment, plus `row_group_id`, `segment_type`, `count`, `stats`, `has_updates` and `persistent`. It is the ground truth behind any argument about compression. Note `estimated_size` can come back empty — do not build a claim on it without checking.
 
+### Per-query profiling metrics
+
+`EXPLAIN ANALYZE` gives per-operator time and row counts. The metric catalog behind it goes much
+further, and several entries answer questions no panel can:
+
+- `SYSTEM_PEAK_TEMP_DIR_SIZE` — peak temp directory size **for that query**. This is how you
+  attribute spill to a statement instead of observing it on the filesystem.
+- `SYSTEM_PEAK_BUFFER_MEMORY` and `TOTAL_MEMORY_ALLOCATED` — peak and total from the buffer manager.
+- `BLOCKED_THREAD_TIME` — time spent waiting for a thread. Large means the query was starved, not
+  slow, which is a different fix.
+- `CHECKPOINT_LATENCY`, `WRITE_TO_WAL_LATENCY`, `COMMIT_LOCAL_STORAGE_LATENCY`,
+  `WAL_REPLAY_ENTRY_COUNT` — the write path, timed.
+- `TOTAL_BYTES_READ` / `TOTAL_BYTES_WRITTEN` — actual I/O, including remote requests.
+- `OPERATOR_ROWS_SCANNED` against `OPERATOR_CARDINALITY` — read versus produced, which is the
+  selectivity check a plan alone does not give you.
+
+`CPU_TIME` is the sum of operator timings and excludes parsing and planning, so `LATENCY` at the
+query root can legitimately exceed it. `profiling_mode = 'detailed'` adds phase timings and a
+per-optimizer breakdown (`OPTIMIZER_<NAME>`, one per entry in `duckdb_optimizers()`).
+
+```sql
+SELECT name, value FROM duckdb_profiling_settings();
+```
+
+On this deployment that returns `tracked_metrics = [*]` — all metrics — where upstream DuckDB
+defaults to a JSON map of individually-toggled names. Read it rather than assuming either shape.
+
 ### The rest of the introspection surface
 
 `duckdb_settings()`, `duckdb_indexes()` (secondary indexes only — constraint indexes are in `duckdb_constraints()`), `duckdb_constraints()`, `duckdb_columns()`, `duckdb_optimizers()` (41 rules here; the valid names for `disabled_optimizers`), `duckdb_extensions()`, `duckdb_external_file_cache()`, `pragma_database_size()`, `pragma_metadata_info()`, and `duckdb_logs()` — which needs logging enabled (`CALL enable_logging()`, or the server started with `--log_storage=memory`) and carries server subsystem types `Startup`, `Search`, `IResearch`, `Storage`, `SSL`, `HTTP`:
@@ -247,13 +274,27 @@ SereneDB is a search-and-analytics database behind a PostgreSQL wire front end.
 - **A pg-wire front end** provides the PostgreSQL protocol and catalogs. Symbols in `sdb::` are this layer.
 - **`sdb_`-prefixed tables are SereneDB's own**: `sdb_metrics`, `sdb_settings`, `sdb_progress`.
 
+**The DuckDB layer is a fork, and it is ahead of DuckDB's published documentation.** Its storage
+version enum tops out at `V2_0_0` (storage version 69) plus a SereneDB-specific one above that,
+where the newest documented upstream release is storage 68 / v1.5.x. `PRAGMA version` is scrubbed
+and reports `v0.0.1`, so it will not tell you which upstream commit it tracks. Two consequences:
+published DuckDB documentation is a good guide but not authoritative here, and any setting, default
+or table function you are about to rely on should be confirmed with `duckdb_settings()` or a probe
+query rather than quoted from memory.
+
 **For reading this server:** when a number looks like DuckDB's, DuckDB's mechanics explain it. Search segments, refresh and consolidation are IResearch and live in `sdb_metrics`. Thread pools, connections and listeners are the server layer and live in `sdb_settings`.
 
 ## The columnar store
 
 ### Row groups, vectors and zonemaps
 
-Data is stored column by column in row groups of **122,880 rows**, and executed over vectors of 2048 values (`STANDARD_VECTOR_SIZE`) so inner loops stay branch-free and in cache. Each column within a row group is compressed independently.
+Data is stored column by column in row groups of **122,880 rows**, and executed over vectors of 2048 values (`STANDARD_VECTOR_SIZE`) pushed through the operator tree, so inner loops stay branch-free and in cache. Each column within a row group is compressed independently.
+
+Vectors are not always flat arrays: a **constant** vector stores one value, a **dictionary** vector stores a child plus a selection vector, and a **sequence** vector stores an offset and an increment. The storage emits the compressed forms directly, so constant- and dictionary-compressed columns stay compressed through execution. Strings of 12 bytes or fewer are inlined into the value; longer ones carry a 4-byte prefix used as an early-out in comparisons.
+
+The optimizer pipeline is: expression rewriter (constant folding), filter pushdown (also duplicating filters across equivalency sets and pruning provably-empty subtrees), join order (`DPhyp` dynamic programming), common subexpression extraction, and an IN-clause rewriter that turns large static `IN` lists into a join.
+
+As a rough sizing rule, 100 GB of uncompressed CSV lands in about 25 GB of database file, while 100 GB of Parquet expands to about 120 GB — Parquet is already compressed, so loading it trades space for statistics and speed.
 
 Every row group carries a zonemap — the min and max of each column in it. A filter outside a group's range skips the whole group unread. So **physical ordering is a performance property of the data itself**: ordered data eliminates row groups, random data (a UUID, a hash, a shuffled load) eliminates nothing. The documented microbenchmark on a `DATETIME` column measured 1.3 GB / 0.6 s ordered against 3.3 GB / 0.9 s unordered — 2.5x the storage and 1.5x the time, from ordering alone. An auto-increment `INTEGER` key beats a `UUID` for the same reason.
 
@@ -279,6 +320,21 @@ Writes go to a write-ahead log and are folded into the database file by a checkp
 
 `auto_checkpoint_skip_wal_threshold` deserves its own line: above that estimated write size the store skips the WAL and checkpoints directly, and **concurrent commits are blocked while that happens**. It is the documented mechanism behind "the WAL is empty but commits stall".
 
+Three more properties that decide what a checkpoint actually does:
+
+- **It is what reclaims space, and only partially.** A checkpoint merges row groups with a
+  significant share of deletes; the current implementation needs roughly **25% of rows deleted in
+  adjacent row groups** before anything is reclaimed. Below that, deleted rows keep occupying the
+  file no matter how often you checkpoint.
+- **A plain `CHECKPOINT` fails if transactions are running.** `FORCE CHECKPOINT` waits for the
+  checkpoint lock instead (it used to abort transactions, before v1.4).
+- **It gets slow with size.** Checkpointing a TPC-H SF1000 database after adding a handful of rows
+  takes about five seconds — so on a large database, checkpoint frequency is a real cost, not just
+  a compression trigger.
+
+The WAL file itself is a signal: it is deleted on a clean exit and only present after a crash, so
+finding one at startup means the previous exit was not orderly.
+
 ### Spilling and the temporary directory
 
 When the working set exceeds `memory_limit` the store spills rather than failing. `temp_directory` is where; `max_temp_directory_size` caps it at 90% of available disk.
@@ -301,6 +357,8 @@ Adaptive radix trees, created implicitly by `PRIMARY KEY`, `UNIQUE` and `FOREIGN
 - They slow every insert, update and delete, and must fit in memory *during creation*.
 - **An `UPDATE` on an indexed column is rewritten as `DELETE` + `INSERT`**, rewriting whole rows — expensive on wide tables. It also produces a real surprise: because the rewrite happens per 2048-row chunk, `UPDATE t SET i = i + 1` on a primary key over more than 2048 rows raises a duplicate-key error. The workaround is an explicit delete-and-reinsert inside a transaction.
 - Building them before a bulk load is much slower than adding them after.
+- **`VACUUM` skips tables that have ART indexes** unless `vacuum_rebuild_indexes` is set to a row
+  threshold, so an indexed table does not get its row groups compacted by default.
 
 ## Search: the inverted index
 
@@ -363,7 +421,7 @@ It is on this list because it has not always been cheap. A fourteen-hour load he
 
 Swapped memory is still memory the store believes it holds. `memory_limit` does not know about it, the store will not spill because of it, and every touch is a disk read. This is the usual explanation for `resident_bytes` below `duckdb_memory_bytes`.
 
-The allocator explains part of the gap in the other direction. `allocator_flush_threshold` (128 MiB) is the peak allocation above which the allocator flushes after a task; `allocator_bulk_deallocation_flush_threshold` is 512 MiB; `allocator_background_threads` is off by default and is worth enabling on many-core machines.
+The allocator explains part of the gap in the other direction. This is jemalloc, statically linked. `allocator_flush_threshold` (128 MiB) is the peak allocation above which it flushes after a task; `allocator_bulk_deallocation_flush_threshold` is 512 MiB. `allocator_background_threads` is **off by default**, and turning it on makes purging asynchronous instead of something foreground threads pay for — documented as noticeable on allocation-heavy workloads on many-core CPUs, which is exactly this machine. jemalloc itself can be tuned through the `DUCKDB_JE_MALLOC_CONF` environment variable (a rename of `MALLOC_CONF`, to avoid clashing with other software in the process).
 
 **For reading this server:** a store reporting 49.9 GiB of buffers with 37.5 GiB in swap looks healthy on its own accounting and is anything but. Read the two together, always.
 

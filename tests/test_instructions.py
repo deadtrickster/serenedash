@@ -132,3 +132,25 @@ def test_it_explains_the_engines_the_profile_splits_into():
     # And the two that are easy to misread as something else.
     assert "other" in t
     assert "IVF" in t and "BM25" in t
+
+
+def test_it_carries_the_duckdb_mechanics_that_change_a_diagnosis():
+    # Each of these changes what you would tell the user, and each came out of the DuckDB docs
+    # rather than SereneDB's rebranded subset of them.
+    t = text()
+    for claim in ("25%",                      # deleted rows needed before a checkpoint reclaims
+                  "SYSTEM_PEAK_TEMP_DIR_SIZE",  # per-query spill attribution
+                  "BLOCKED_THREAD_TIME",        # starved, not slow
+                  "vacuum_rebuild_indexes",     # VACUUM skips ART-indexed tables
+                  "DUCKDB_JE_MALLOC_CONF",      # the allocator is tunable
+                  "storage version 69"):        # the fork is ahead of the published docs
+        assert claim in t, f"{claim} is no longer in the instructions"
+
+
+def test_it_warns_that_published_duckdb_docs_are_not_authoritative_here():
+    # PRAGMA version reports a scrubbed v0.0.1, so an agent cannot look up "the" version - and the
+    # fork is past the newest documented release. Guessing from upstream docs is the trap.
+    t = text()
+    assert "fork" in t
+    assert "v0.0.1" in t
+    assert "duckdb_settings()" in t
