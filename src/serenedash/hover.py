@@ -33,6 +33,9 @@ PANELS = {
     "host": "the machine and the process — the context every other number on the screen is read "
             "against",
     "config": "settings with measured consequences, each predicate run against this server",
+    "search": "the inverted indexes and the engine's own maintenance counters, from sdb_metrics - "
+              "segments, live against deleted documents, and how long a commit or consolidation "
+              "has been taking",
     "doctor": "every precondition for a full picture, and what each missing one costs you",
     "legend": "what every label and number on the main screen means",
     "graph": "call graph from the newest capture, callers above callees",

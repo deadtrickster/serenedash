@@ -655,14 +655,24 @@ def doctor_frame(rows, fix, col, width, scroll, msg=None):
             "fail": (c["red"], "fail"), "info": (c["dim"], "note")}
     out = [f"{c['b']}doctor{c['r']}  {c['dim']}what is working, what is missing, and what it "
            f"costs you{c['r']}", ""]
-    for st, name, detail, fix in rows:
+    # `rowfix`, not `fix`: the loop used to rebind the parameter, so by the time the `r` hint below
+    # tested it, it held the LAST ROW's fix string rather than the caller's (kind, arg) tuple. The
+    # hint therefore never rendered, and would have raised on unpacking a string if the last row had
+    # ever carried one. Third time this shadowing has cost something here, after `bar` and `why`.
+    for st, name, detail, rowfix in rows:
         col_, tag = mark[st]
-        out.append(f"  {col_}{tag}{c['r']}  {c['b']}{name:<15}{c['r']}"
-                   + textwrap.fill(detail, max(30, W - 26),
-                                   subsequent_indent=" " * 24).lstrip())
-        if fix:
+        # One list element per LINE. `textwrap.fill` returns a single string with newlines in it,
+        # and tui.py writes each element to an absolute row (\033[{i+1};1H) - so every line after
+        # the first was written to the same row and immediately overwritten by the next element.
+        # Only the opening line of a wrapped detail ever reached the screen, which is why the
+        # `kernel symbols` and `recording` rows have always looked truncated. It also made the
+        # frame's height accounting wrong, because element count was not line count.
+        wrapped = textwrap.wrap(detail, max(30, W - 26)) or [""]
+        out.append(f"  {col_}{tag}{c['r']}  {c['b']}{name:<15}{c['r']}{wrapped[0]}")
+        out += [f"{' ' * 24}{cont}" for cont in wrapped[1:]]
+        if rowfix:
             out += [f"        {c['cyn']}{ln}{c['r']}" for ln in
-                    textwrap.wrap(fix, max(30, W - 10), initial_indent="→ ",
+                    textwrap.wrap(rowfix, max(30, W - 10), initial_indent="→ ",
                                   subsequent_indent="  ")]
         out.append("")
     if fix:
@@ -1269,9 +1279,27 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     # height exactly, but when a plan comes up a row or two short the keys should still be on the
     # last line rather than floating above a gap.
     keybar = status(c, W)          # not `bar` — that is the bar-glyph helper this frame calls
-    L += [""] * max(0, height - len(L) - len(keybar))
+    body = max(0, height - len(keybar))
+    # The invariant, enforced rather than aimed at. The plan ladder above tries to fit the content
+    # to the terminal, but below about 26 lines nothing fits: storage and memory stacked are sixteen
+    # rows with their borders before activity and threads get one each, so no amount of dropping
+    # panels helps and the ladder's last plan still overran — 27 lines into an 80x24 terminal, and
+    # 27 into a 70x20. Overrunning is the worst outcome available: the terminal scrolls, so the TOP
+    # of the frame is what is lost, along with the key bar. Cutting the bottom instead costs a
+    # border and keeps the keys on the last line. A clipped box is ugly; a scrolled frame is unusable.
+    if len(L) > body:
+        L = L[:body]
+    L += [""] * max(0, body - len(L))
     L.extend(keybar)
-    return L
+    # The other half of the same invariant. `W = max(70, width)` gives the layout a floor to compute
+    # against, which is deliberate - the grid stops meaning anything below that - but it also means
+    # a 60-column terminal was handed 70-column rows and wrapped every one of them, turning a
+    # 15-line frame into 25 wrapped lines and undoing the height work above. Clip on the way out,
+    # and only when it can bite, so the normal case pays nothing.
+    # `width - 1`, because clip() spends a column on its ellipsis when it actually truncates - the
+    # same reason mkbox asks it for `iw - 2` to fill `iw - 1`. Asking for `width` yields `width + 1`
+    # on any line that gets cut, which is the invariant failing by one and looking like it passed.
+    return [clip(ln, width - 1) for ln in L] if width < W else L
 
 
 def persistence(scope):

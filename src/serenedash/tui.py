@@ -531,15 +531,19 @@ def main():
                 # list as well and landed on the main frame, so getting back to where you were meant
                 # pressing c and scrolling to the row again.
                 #
-                # The tooltip is the innermost level, and the only one that can be reached with the
-                # terminal filling the screen: there is no cell outside the window for the pointer
-                # to leave through there, so the edge rule never fires and Esc is the way out.
-                if tipon:
+                # A tooltip is NOT one of those levels, and treating it as one was wrong. You never
+                # navigate into a tooltip - it appears because the pointer happens to be somewhere.
+                # So while the pointer rests over a panel you clicked into, every Esc was spent
+                # dismissing a box you did not ask for, and leaving the view took two or three
+                # presses. It only counts as a level when there is nothing else to leave, which is
+                # what keeps the escape hatch for a terminal filling the screen: no cell outside the
+                # window means the edge rule never fires, and Esc is then the only way out.
+                if detail:
+                    detail, tipon = None, False
+                elif view != "main":
+                    view, scroll, tipon = "main", 0, False
+                elif tipon:
                     tipon, tipkey = False, None
-                elif detail:
-                    detail = None
-                else:
-                    view = "main"
                 shown = [None] * len(shown)
                 continue
             if k == "q":

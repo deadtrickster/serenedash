@@ -9,7 +9,12 @@ import pytest
 from serenedash.fmt import strip
 from serenedash.views import KEYS, LEGEND, frame, status
 
-SIZES = [(200, 60), (150, 46), (120, 45), (100, 40), (96, 40), (80, 30)]
+# Down to sizes nobody sane uses on purpose, because "never exceed the terminal" has no exceptions
+# and both ends of it have been broken: 80x24 rendered 27 lines (the layout ladder ran out of plans
+# and nothing enforced the budget afterwards), and 60x15 rendered 70 columns wide (W has a floor of
+# 70 so the grid stays meaningful, and nothing clipped on the way out).
+SIZES = [(200, 60), (150, 46), (120, 45), (110, 30), (100, 40), (96, 40), (80, 30),
+         (80, 24), (70, 20), (60, 15)]
 
 
 def sample_state(sessions=3, tags=3, memlimit=100 * 2**30):
@@ -54,6 +59,14 @@ def test_height_does_not_depend_on_content(w, h):
 @pytest.mark.parametrize(("w", "h"), SIZES)
 def test_box_borders_line_up(w, h):
     edges = {len(strip(ln)) for ln in render(w, h) if strip(ln).endswith(("┐", "┘"))}
+    if w < 70:
+        # Below the layout's 70-column floor every row is cut on the way out, so there is no right
+        # border left to be ragged. That is the honest outcome - the grid stops meaning anything at
+        # that width - and asserting "they all line up" against an empty set would pass for the
+        # wrong reason. What still has to hold is the frame not exceeding the terminal, which
+        # test_frame_fits_the_terminal covers.
+        assert not edges, f"a right border survived at {w} columns, so something skipped the clip"
+        return
     assert len(edges) == 1, f"ragged right border at {w}x{h}: {sorted(edges)}"
 
 

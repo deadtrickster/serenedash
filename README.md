@@ -25,16 +25,18 @@ runs in a container here, as a process here, or on another host (`target = docke
 Every panel has a view behind it, keyed by its own name, and every view is a toggle:
 
 `q` quit · `s` storage · `m` memory · `a` activity · `t` threads · `p` profile · `g` call graph ·
-`c` config · `h` host · `d` doctor · `l` legend · `x` mouse · `j`/`k` scroll
+`c` config · `h` host · `i` search · `d` doctor · `l` legend · `x` mouse · `j`/`k` scroll
 
 `l` documents every label and number on the screen; `d` checks every precondition for a full
 picture and tells you what each missing one costs you. Those two are the place to look first.
 
 Point at anything and it says what it is — the same text `l` carries, looked up by where the
 pointer is instead of read top to bottom, so a bar answers for its own row and a word in a tail
-answers from its own panel. Clicking a panel opens its view and the wheel scrolls. Esc closes the
-tooltip before it closes anything else, and it expires on its own after two refreshes, because the
-protocol has no "pointer left the window" event to hang it on. `x` turns tracking off for a moment
+answers from its own panel. Clicking a panel opens its view and the wheel scrolls. Esc leaves
+whatever you actually navigated into, and only dismisses a tooltip when there is nothing else to
+leave — a tooltip appears because the pointer is somewhere, not because you opened it, so it should
+not cost a keypress. It also expires on its own after two refreshes, because the protocol has no
+"pointer left the window" event to hang it on. `x` turns tracking off for a moment
 — while it is on the terminal's own text selection is off (Shift usually bypasses it) — and
 `mouse = false` or `SERENEDASH_MOUSE=0` turns it off for good.
 
@@ -47,6 +49,7 @@ protocol has no "pointer left the window" event to hang it on. `x` turns trackin
 | activity | live query text from `pg_stat_activity`; **and** it says so when nothing is running, because a pinned core with no session is orphaned server-side work |
 | threads | total process CPU against every core, then the threads carrying it. 100% of one core reads as 4% at process level and as a pinned thread here. Rows are identified by tid — 103 of serened's 107 threads inherit the process name |
 | profile | sampled symbols by engine over a sliding window of captures, joined per thread so a row says what it is running |
+| search | the inverted indexes: segments, live against deleted documents, buffered writes not yet searchable, and how long commits and consolidations are taking. A rising pending queue is maintenance falling behind the write rate |
 | host | cores, load, RAM, swap, and `memory_limit` as a share of the machine — the context every other number is read against |
 | config | the settings with measured consequences, each predicate evaluated against the live server. `c` opens all 297 with the server's own descriptions |
 
@@ -98,8 +101,8 @@ For Claude Code, from the directory you start it in:
 
     claude mcp add serenedash -- /path/to/.venv/bin/serenedash-mcp
 
-Tools: `status` `storage` `memory` `activity` `threads` `profile` `callgraph` `host` `config`
-`query` `anomalies`, plus `set_setting` under `--allow-write`. `status` is one round trip and leads
+Tools: `status` `storage` `memory` `activity` `search` `threads` `profile` `callgraph` `host`
+`config` `query` `anomalies`, plus `set_setting` under `--allow-write`. `status` is one round trip and leads
 with `findings` — each one a condition that was measured, with the numbers behind it and how to
 check it, rather than a verdict to be taken on trust. Same environment variables as the dashboard
 (`SERENEDB_CONTAINER`, `PGPASSWORD`, `SERENEDASH_PERF_DIR`, …), and the same snapshot builder as
