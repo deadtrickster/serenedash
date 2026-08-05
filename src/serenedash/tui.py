@@ -13,7 +13,7 @@ import time
 import tty
 
 from .config import config_files, load_config
-from .fmt import C, HIST, NOCOLOR
+from .fmt import C, HIST, NOCOLOR, strip
 from .anomaly import index as anom_index
 from .hover import describe, panel_at, place, tip_box
 from . import export as exporter
@@ -27,17 +27,16 @@ from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
 from .views import (
-    ALIAS,
     DETAIL,
     activity_frame,
     config_frame,
     frame,
     host_frame,
+    key_to_view,
     legend_frame,
     logs_frame,
     NAV_KEYS,
     findings_frame,
-    summary_line,
     findings_nav,
     list_nav,
     mcp_frame,
@@ -47,6 +46,7 @@ from .views import (
     search_frame,
     status,
     storage_frame,
+    summary_line,
     threads_frame,
 )
 
@@ -217,17 +217,22 @@ def _web_nav(st, key, perf_dir, cfg=None):
     return {**st, **out} if out else {**st, "view": "main"}
 
 
-def _withbar(lines, width):
-    """A served panel plus the key bar, which on the page IS the navigation.
+def _withbar(lines, width, found=()):
+    """A served panel between the two pinned rows: the summary above, the key bar below.
 
-    The terminal draws the bar under every view; view_lines returns the panel alone because the
-    exporter wants a panel. The page needs it: removing the row of buttons above the frame left the
-    detail views with no visible way to switch, since the boxes are computed from the bar's own
-    text and there was no bar to compute them from.
+    The terminal draws both around every view; view_lines returns the panel alone because the
+    exporter wants a panel. The page needs both - removing the row of buttons above the frame left
+    the detail views with no visible way to switch, since the boxes are computed from the bar's own
+    text and there was no bar to compute them from - and it needs the summary for the same reason
+    the terminal does: what is wrong with the server is not a property of the panel you are on.
+
+    Returns (lines, offset). The offset is how many rows were inserted ABOVE the panel, because a
+    click lands on a row the frame reported by index and every one of those indices just moved.
     """
-    if lines and any("q quit" in ln for ln in lines[-4:]):
-        return lines                              # the main frame already carries it
-    return [*lines, "", *status(C, width)]
+    top = ["", summary_line(found, C, width), ""]
+    if lines and any("q quit" in strip(ln) for ln in lines[-4:]):
+        return [*top, *lines], len(top)           # the main frame already carries the bar
+    return [*top, *lines, "", *status(C, width)], len(top)
 
 
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
@@ -376,7 +381,7 @@ def main():
     col = (not a.no_color) and (sys.stdout.isatty() or a.format in ("html", "svg"))
 
     prev, sz, tick, shown, fresh, s = None, {}, 0, [], True, None
-    sea, held, hazards = None, None, []
+    sea, held, hazards, allfound = None, None, [], []
     hist = {"mem": []}
     perf = (None, [], {})
     crows = []
@@ -428,7 +433,7 @@ def main():
         # DETAIL already carries doctor and legend; listing them again put doctor in the nav twice.
         # DETAIL is {view: key}; the page wants {key: view}, and the same keys as the terminal so
         # the two are one tool rather than two.
-        wkeys = {k: v for v, k in DETAIL.items()}
+        wkeys = key_to_view()
         hub, wsrv = _serve.start(host or "127.0.0.1", int(port),
                                  ["main", *sorted(DETAIL)], wstate, wkeys)
         print(f"serving http://{host or '127.0.0.1'}:{int(port)}/", file=sys.stderr)
@@ -563,8 +568,8 @@ def main():
                 # not something to do on a tick for a panel nobody has open.
 
                 body = {"findings": lambda: findings_frame(
-                            hazards + snap.setup_findings(drows, dfix), col, w, fnav["scroll"],
-                            fnav["sel"], h - 1, fnav["open"]),
+                            allfound, col, w, fnav["scroll"], fnav["sel"], h - 1,
+                            fnav["open"]),
                         "mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
                                                  mnav["sel"], h - 1, mnav["open"], mnav["call"],
                                                  mnav["popup"]),
@@ -624,10 +629,10 @@ def main():
                     hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea), held=held)
                 except Exception:                                # noqa: BLE001
                     hazards = []      # a findings screen must not be able to take the frame down
+            allfound = hazards + snap.setup_findings(drows, dfix)
             # Pinned to the top of every view, the way the key bar is pinned to the bottom. What is
             # wrong with the server is not a property of the panel you happen to be reading.
-            lines = ["", summary_line(hazards + snap.setup_findings(drows, dfix), cc, w),
-                     "", *lines]
+            lines = ["", summary_line(allfound, cc, w), "", *lines]
             prev = s
             tick += 1
             if hub is not None and fresh:
@@ -646,18 +651,22 @@ def main():
                     # interval for the next one. Rebound each tick, so it always closes over current
                     # data; the lock keeps a render off a half-updated tick.
                     def _render(name, needle="", nav=None,
-                                _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww, hazards)):
+                                _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww,
+                                    allfound)):
                         wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w, _fnd = _d
                         anchors = []          # filled by the frame, so a click lands on a row
                         with wlock:
-                            return _serve.frame_payload(name, _withbar(view_lines(
+                            body, off = _withbar(view_lines(
                                 name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
                                 True, _w,
                                 full=full_queries(cfg) if name == "activity" else None,
                                 needle=needle, nav=nav, hazards=_fnd,
-                                anchors=anchors), _w), cols=_w, keys=wkeys,
+                                anchors=anchors), _w, _fnd)
+                            # Every anchor moved down by the rows inserted above it.
+                            return _serve.frame_payload(
+                                name, body, cols=_w, keys=wkeys,
                                 sid=(nav or {}).get("id", ""), nav=name in NAVIGABLE,
-                                anchors=anchors)
+                                anchors=[(r + off, i) for r, i in anchors])
                     wstate["render"] = _render
                     # One render per view someone is actually watching. Nothing is rendered when
                     # no browser is connected.
@@ -771,8 +780,7 @@ def main():
             if k == "r" and view == "findings":
                 # The action belongs to a row now, not to a view. Only the row that carries one
                 # does anything, which is why the hint appears on that row and nowhere else.
-                _shown = sorted(hazards + snap.setup_findings(drows, dfix),
-                                key=lambda f: -f.get("severity", 1))
+                _shown = sorted(allfound, key=lambda f: -f.get("severity", 1))
                 act = _shown[fnav["sel"]].get("action") if fnav["sel"] < len(_shown) else None
                 if not act:
                     continue
@@ -808,7 +816,7 @@ def main():
                 # what keeps the escape hatch for a terminal filling the screen: no cell outside the
                 # window means the edge rule never fires, and Esc is then the only way out.
                 nxt = (mcp_nav(mnav, "\x1b", mrows, mlive) if view == "mcp" else
-                       findings_nav(fnav, "\x1b", hazards) if view == "findings" else
+                       findings_nav(fnav, "\x1b", allfound) if view == "findings" else
                        list_nav(anav, "\x1b", []) if view == "activity" else None)
                 if nxt is not None:
                     # One level at a time inside the view, before the view itself is left.
@@ -842,7 +850,10 @@ def main():
                 shown = [None] * len(shown)
                 continue
             if view == "findings" and k in NAV_KEYS and k != "\x1b":
-                fnav = findings_nav(fnav, k, hazards)
+                # The SAME list the frame draws. It was bounded by `hazards` alone while the screen
+                # showed hazards plus the setup checks, so the cursor stopped at the last server
+                # finding with nine rows still below it.
+                fnav = findings_nav(fnav, k, allfound)
                 shown = [None] * len(shown)
                 continue
             if view == "activity" and k in NAV_KEYS and k != "\x1b":
@@ -887,11 +898,7 @@ def main():
                 continue
             # One toggle rule for every view, so a key never means two things and no view can be
             # reached that its own key does not leave.
-            bykey = {v: n for n, v in DETAIL.items()}
-            bykey.update({"g": "graph", "c": "config"})
-            # `d` was doctor for as long as there was a doctor view. It is the same screen now, and
-            # the fingers do not know that - so the key still lands there rather than doing nothing.
-            bykey.update(ALIAS)
+            bykey = key_to_view({"g": "graph", "c": "config"})
             if k in bykey:
                 view = "main" if view == bykey[k] else bykey[k]
                 scroll, shown = 0, [None] * len(shown)

@@ -254,3 +254,21 @@ def test_navigation_keys_are_left_alone_where_they_do_nothing(dash, page):
     page.keyboard.press("j")
     page.wait_for_timeout(700)
     assert frame(page) == before
+
+
+def test_the_key_that_doctor_used_to_have_still_opens_the_screen(dash, page):
+    # Reported as "d works in tui but not in web": each front end built its own {key: view} map and
+    # the page was handed DETAIL alone, which no longer has doctor in it.
+    page.goto(dash.url)
+    wait_for_frame(page)
+    page.keyboard.press("d")
+    page.wait_for_url(re.compile(r"view=findings"), timeout=8000)
+
+
+def test_a_view_key_pressed_on_its_own_view_goes_back(dash, page):
+    # The terminal toggles - the key that opens a view closes it - and the page did not, so a key
+    # pressed while already on its own view did nothing, which reads exactly like an unbound key.
+    page.goto(dash.url + "/?view=logs")
+    wait_for_frame(page, "checkpoint")
+    page.keyboard.press("o")
+    page.wait_for_url(re.compile(r"view=main"), timeout=8000)

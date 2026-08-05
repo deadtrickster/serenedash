@@ -145,7 +145,9 @@ box.onkeydown = e => { e.stopPropagation();          // the view keys must not f
   if (e.key === 'Escape'){ box.value = ''; box.blur(); needle = '';
                            history.replaceState(0,'',url()); connect(); } };
 
-function go(v){ if (!views.includes(v) || v === view) return;
+function go(v){ if (!views.includes(v)) return;
+  if (v === view) v = 'main';        // the key that opens a view closes it, as in the terminal
+  if (v === view) return;
   view = v; needle = ''; box.value = '';
   history.replaceState(0,'',url());
   // Say so immediately on switch. Most views re-render from data already in memory and land in

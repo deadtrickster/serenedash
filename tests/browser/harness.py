@@ -14,13 +14,13 @@ import sys
 import time
 
 from serenedash import serve
-from serenedash.views import DETAIL, logs_frame, mcp_frame, mcp_nav
+from serenedash.views import DETAIL, key_to_view, logs_frame, mcp_frame, mcp_nav
 
 from ..test_views import render  # noqa: TID252  - the same frames the other tests assert on
 
 COLS = 168
 VIEWS = ["main", *sorted(DETAIL)]
-KEYS = {k: v for v, k in DETAIL.items()}
+KEYS = key_to_view()      # aliases included, as the real server sends them
 
 # Enough lines that a filter has something to remove, and distinctive enough to assert on.
 LOGS = ([(f"08-03 10:00:{i:02d}", "Storage", "INFO", f"checkpoint {i} written") for i in range(20)]

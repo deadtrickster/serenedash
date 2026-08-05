@@ -422,18 +422,25 @@ FOUND = [{"kind": "storage", "what": "orphaned temp files", "detail": "24 files,
 
 
 def test_the_summary_line_counts_by_kind():
-    from serenedash.views import findings_frame
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import findings_frame, summary_line
 
-    head = strip(findings_frame(FOUND, False, 140, 0, 0, 20)[0])
-    assert "Status summary" in head and "3 findings" in head
-    assert "1 storage" in head and "1 memory" in head and "1 setting" in head
+    # The counts live on the pinned rule, not on the screen: a first line repeating the line
+    # directly above it is one fewer row of content and one more thing to read twice.
+    line = strip(summary_line(FOUND, NOCOLOR, 140))
+    assert "3 findings" in line
+    assert "1 storage" in line and "1 memory" in line and "1 setting" in line
+    assert "Status summary" not in strip("\n".join(findings_frame(FOUND, False, 140, 0, 0, 20)))
 
 
 def test_nothing_tripped_is_stated_rather_than_left_blank():
     from serenedash.views import findings_frame
 
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import summary_line
+
+    assert "nothing measured yet" in strip(summary_line([], NOCOLOR, 100))
     out = [strip(x) for x in findings_frame([], False, 100, 0, 0, 20)]
-    assert "nothing tripped" in out[0]
     assert any("not an absence of one" in ln for ln in out)
 
 
@@ -479,7 +486,6 @@ def test_doctors_checks_are_findings_on_the_same_screen():
     # anything" and "what did it measure" - but that distinction is the tool's, not the reader's.
     # Both are: a comparison ran, it came out a particular way, here is what to do.
     from serenedash.snapshot import setup_findings
-    from serenedash.views import findings_frame
 
     rows = [("ok", "server", "oracle-serenedb:7890", ""),
             ("warn", "open files", "soft 65535 of a documented 131072", "raise LimitNOFILE"),
@@ -487,8 +493,11 @@ def test_doctors_checks_are_findings_on_the_same_screen():
     got = setup_findings(rows, ("register", "/tmp/serened"))
     assert [f["kind"] for f in got] == ["setup"] * 3
     assert [f["severity"] for f in got] == [0, 1, 1], "ok is 0; info is NOT a pass"
-    out = [strip(x) for x in findings_frame(FOUND + got, False, 150, 0, 0, 30)]
-    assert "5 findings" in out[0] and "1 checks passed" in out[0]
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import summary_line
+
+    line = strip(summary_line(FOUND + got, NOCOLOR, 150))
+    assert "5 findings" in line and "1 passed" in line
 
 
 def test_a_passed_check_stays_on_the_list_but_below_everything_that_tripped():
@@ -500,7 +509,8 @@ def test_a_passed_check_stays_on_the_list_but_below_everything_that_tripped():
 
     got = setup_findings([("ok", "perf", "installed", "")] * 3
                          + [("fail", "server", "unreachable", "start it")])
-    body = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20)][2:-2]
+    body = [ln for ln in (strip(x) for x in findings_frame(got, False, 140, 0, 0, 20)) if ln.strip()]
+    body = body[:-1]                       # drop the key hint
     assert "server" in body[0], "the failure has to be first"
     assert all("passed" in ln for ln in body[1:4])
 
@@ -511,10 +521,10 @@ def test_the_summary_line_is_the_same_count_as_the_screen():
     from serenedash.views import findings_frame, summary_line
 
     line = strip(summary_line(FOUND, NOCOLOR, 120))
-    head = strip(findings_frame(FOUND, False, 120, 0, 0, 20)[0])
+    rows = strip("\n".join(findings_frame(FOUND, False, 120, 0, 0, 20)))
     for kind in ("storage", "memory", "setting"):
-        assert (f"1 {kind}" in line) == (f"1 {kind}" in head), kind
-    assert "3 finding" in line and "3 finding" in head
+        assert f"1 {kind}" in line and kind in rows, kind
+    assert "3 finding" in line
 
 
 def test_the_summary_says_so_when_nothing_tripped_rather_than_going_quiet():

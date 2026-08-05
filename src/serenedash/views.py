@@ -198,6 +198,17 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 ALIAS = {"d": "findings"}
 
 
+def key_to_view(extra=None):
+    """{key: view} for every key that switches a view, aliases included.
+
+    One producer, because the terminal and the page each built this themselves and drifted: the
+    page was handed DETAIL alone, so `d` did nothing there while it worked in the terminal.
+    `extra` is for the views a front end has that the other does not - the terminal's `graph` and
+    `config` are not served.
+    """
+    return {**{v: n for n, v in DETAIL.items()}, **ALIAS, **(extra or {})}
+
+
 # No j/k here: nothing on the main frame scrolls, so it is carried by the views that do scroll and
 # the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
 # on a 96-column terminal.
@@ -1806,24 +1817,10 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     # Trouble first, passed checks last, insertion order kept inside each group. A screen that
     # opens on twelve green rows makes you scroll to find the one red one.
     found = sorted(found, key=lambda f: -f.get("severity", 1))
-    tripped = [f for f in found if f.get("severity", 1) > 0]
-    passed = len(found) - len(tripped)
-    kinds = {}
-    for f in tripped:
-        kinds[f.get("kind", "other")] = kinds.get(f.get("kind", "other"), 0) + 1
-    head = f"{c['b']}Status summary{c['r']}  "
-    if tripped:
-        head += (f"{c['yel']}{c['b']}{len(tripped)} finding"
-                 f"{'s' if len(tripped) != 1 else ''}{c['r']}")
-        head += "  " + "  ".join(f"{c['dim']}·{c['r']}  {n} {KINDNAME.get(k, k)}"
-                                 for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
-    else:
-        head += f"{c['grn']}nothing tripped{c['r']}"
-    if passed:
-        # What was CHECKED and came out fine. This is the half `doctor` existed for: silence about
-        # a passing check reads the same as never having run it.
-        head += f"  {c['dim']}·{c['r']}  {c['grn']}{passed} checks passed{c['r']}"
-    out = [head, ""]
+    # No header. The counts are on the rule pinned above every view, including this one, and a
+    # screen whose first line repeats the line directly above it is a screen with one fewer row of
+    # content and one more thing to read twice.
+    out = [""]
     if not found:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
             "Nothing tripped is a result, not an absence of one: every comparison ran and none of "
