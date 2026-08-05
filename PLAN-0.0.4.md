@@ -25,6 +25,14 @@ Feasible. Both hard dependencies exist and I checked them rather than assuming:
   itself is pure string building and ports directly - `export.py` is deliberately a pure function
   from ANSI lines to a document, with no terminal in it.
 
+  zigzag has no export of its own, which looks at first like a feature lost in the port. It is the
+  opposite. `src/terminal/screen.zig` exposes a public cell grid - `Screen.getCell(x, y)` returning
+  a `Cell { char: u21, fg: ?Color, bold, dim, ... }` - which is *exactly* the tuple the SVG writer
+  needs. The Python version renders to ANSI and then parses the escapes back out to recover each
+  run's column and style; half of `export.py` is undoing work the renderer just did. In Zig you walk
+  the grid, group runs of matching style, and emit one `<text x textLength>` each. No ANSI parser.
+  Fewer lines than the Python one and less that can be wrong.
+
 The standing rule holds: use a library for the wire protocol, do not implement pg proto.
 
 **MCP is the problem, and not for the reason I first assumed.** There *is* a Zig SDK -
