@@ -30,6 +30,7 @@ Requires the `mcp` package (see requirements.txt). serenedash.py itself stays st
 import argparse
 import functools
 import hashlib
+import inspect
 import os
 import time
 
@@ -92,6 +93,13 @@ def _stamp():
             "instructions_uri": INSTRUCTIONS_URI}
 
 
+# Recording is off until a client is actually on the other end of the pipe. `stamped` is an
+# ordinary decorator, so anything that imports this module and calls a wrapped function - a test,
+# another tool, an interactive session - would otherwise land in the log as a call that no agent
+# made. It did: a test calling `stamped(lambda: [1, 2])` put a `<lambda>` row in the real one.
+_SERVING = False
+
+
 def stamped(fn):
     """Add `server` to every dict a tool returns, and record the call.
 
@@ -104,22 +112,31 @@ def stamped(fn):
     worse than none, since the hole is invisible. See `mcplog`: an MCP server has no window and no
     log of its own, so without this there is no way to see what an agent asked or what it was told.
     """
+    # Computed once, not per call. Arguments left at their default are not something the agent
+    # asked for, and `max_rows=200, max_chars=20000` on every query() pushed the SQL - the one part
+    # worth reading - off the end of the line.
+    _defaults = {k: p.default for k, p in inspect.signature(fn).parameters.items()
+                 if p.default is not inspect.Parameter.empty}
+
     @functools.wraps(fn)
     def wrapped(*a, **kw):
         t0 = time.perf_counter()
         named = dict(zip(fn.__code__.co_varnames[:fn.__code__.co_argcount], a, strict=False))
         named.update(kw)
+        named = {k: v for k, v in named.items() if k not in _defaults or _defaults[k] != v}
         try:
             out = fn(*a, **kw)
         except Exception as e:                                   # noqa: BLE001
             # Recorded and re-raised. A tool that failed is exactly the call worth seeing, and the
             # agent must still get its error rather than a dashboard's idea of one.
-            mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000,
-                          "", ok=False, err=e)
+            if _SERVING:
+                mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000,
+                              "", ok=False, err=e)
             raise
         if isinstance(out, dict):
             out.setdefault("server", _stamp())
-        mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000, out)
+        if _SERVING:
+            mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000, out)
         return out
     return wrapped
 
@@ -460,6 +477,8 @@ def main():
     a = ap.parse_args()
     if a.allow_write:
         _install_write_tools()
+    global _SERVING                                              # noqa: PLW0603
+    _SERVING = True          # from here, every call has a real client behind it
     server.run("stdio")
 
 

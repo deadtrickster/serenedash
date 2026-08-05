@@ -60,9 +60,19 @@ def client(pid=None):
             return ""
         # Just the program, then any argument that identifies the session. A full agent command
         # line runs to several hundred characters of flags nobody is reading in a panel.
+        # Program plus whatever identifies the session, with paths reduced to their basename: the
+        # useful half of `--mcp-config /home/dead/Projects/oracle/oracle-mcp.json` is the filename,
+        # and the flag alone said nothing that `claude` had not already said.
         head = os.path.basename(parts[0])
-        tail = [p for p in parts[1:] if p.startswith("--") or not p.startswith("/")][:2]
-        return " ".join([head, *tail])[:60]
+        tail = []
+        for a in parts[1:]:
+            if a.startswith("--") and "=" not in a:
+                tail.append(a[2:])
+            elif not a.startswith("-"):
+                tail.append(os.path.basename(a))
+            if len(tail) >= 2:
+                break
+        return " ".join([head, *tail])[:44]
     except (OSError, ValueError):
         return ""
 
@@ -74,6 +84,11 @@ def record(perf_dir, tool, args, ms, reply, ok=True, err=""):
         text = reply if isinstance(reply, str) else json.dumps(reply, default=str)
         row = {"t": round(time.time(), 2), "tool": tool, "ms": round(ms, 1), "ok": bool(ok),
                "client": client(), "pid": os.getpid(),
+               # Summarised HERE, with the whole object in hand. Doing it in the view means parsing
+               # the stored copy, and the stored copy of a `status()` is truncated JSON that will
+               # not parse - so the one reply most worth summarising was the one that fell back to
+               # showing raw braces.
+               "summary": _summarize(reply, err),
                "args": _short(args), "bytes": len(text),
                "reply": text[:REPLY_CHARS] + ("…" if len(text) > REPLY_CHARS else "")}
         if err:
@@ -175,3 +190,57 @@ def counts(rows):
         n, ms = out.get(r.get("tool", "?"), (0, 0.0))
         out[r["tool"]] = (n + 1, ms + (r.get("ms") or 0))
     return out
+
+
+# What a reply is ABOUT, in one line. The raw head of a `status()` is `{"sql": {"available":` and
+# tells you nothing; the count of findings and what they are is the whole content. Reading a log of
+# calls is pointless if every row says only how many bytes came back.
+def digest(row):
+    """One line describing the reply. Recorded with the call; parsed only for older rows."""
+    if row.get("summary"):
+        return row["summary"]
+    if row.get("error"):
+        return f"error: {row['error'][:60]}"
+    try:
+        return _summarize(json.loads(row.get("reply") or ""), "")
+    except ValueError:
+        return (row.get("reply") or "")[:60]      # truncated JSON from before summaries existed
+
+
+def _summarize(r, err=""):
+    """'5 findings: orphaned temp files, …', '24 rows', 'refused: delete is not read-only'."""
+    if err:
+        return f"error: {str(err)[:60]}"
+    if isinstance(r, str):
+        return r[:60]
+    if not isinstance(r, dict):
+        return f"{len(r)} items" if isinstance(r, list) else str(r)[:60]
+    if r.get("error"):
+        return str(r["error"])[:64]               # already reads as a refusal; do not prefix it
+    if isinstance(r.get("findings"), list):
+        w = ", ".join(str(f.get("what", "?")) for f in r["findings"][:2] if isinstance(f, dict))
+        return f"{len(r['findings'])} findings" + (f": {w}" if w else "")
+    if isinstance(r.get("anomalies"), list):
+        return f"{len(r['anomalies'])} anomalies over {r.get('samples', '?')} samples"
+    if isinstance(r.get("rows"), list):
+        return f"{len(r['rows'])} rows"
+    if r.get("available") is False:
+        return f"unavailable: {str(r.get('reason', ''))[:52]}"
+    keys = [k for k in r if k != "server"]
+    return ", ".join(keys[:6]) + ("…" if len(keys) > 6 else "")
+
+
+def pretty(row, width=110):
+    """The reply as lines. Indented JSON, because wrapped JSON is a wall of punctuation.
+
+    Truncated per line rather than reflowed: the structure is the readable part, and a reflow
+    destroys exactly that.
+    """
+    if row.get("error"):
+        return [row["error"]]
+    body = row.get("reply") or ""
+    try:
+        out = json.dumps(json.loads(body), indent=2, ensure_ascii=False).splitlines()
+    except ValueError:
+        return body.splitlines() or [""]
+    return [ln[:width] + ("…" if len(ln) > width else "") for ln in out]

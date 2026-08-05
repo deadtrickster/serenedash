@@ -8,6 +8,8 @@ from .anomaly import index, scan
 from .fmt import C, COL_BAR, COL_LABEL, COL_VALUE, NOCOLOR, bar, clip, dur, human, line, spark, strip
 from .hazards import HAZARDS, kernel_of
 from .logs import counts as log_counts
+from .mcplog import digest as mcp_digest
+from .mcplog import pretty as mcp_pretty
 
 
 def anom_colour(c, a):
@@ -1543,10 +1545,12 @@ def mcp_frame(rows, live, col, width, scroll, sel=0, height=40):
             max(40, W - 4))]
         return out[scroll:]
 
-    # The reply pane is fixed, so the list does not resize under the selection as replies change
-    # length. A pane that grows and shrinks per row makes j/k feel like the whole view is moving.
-    pane = min(12, max(6, height // 3))
-    room = max(1, height - len(out) - pane - 3)
+    # The reply is the point of the view, so it gets the leftover rather than a fixed slice: with
+    # four calls recorded, a fixed third of the screen left two lines of JSON under a mostly empty
+    # list. The list takes what it needs up to half, the reply takes the rest.
+    listed = min(len(rows), max(1, (height - len(out) - 4) // 2))
+    room = max(1, min(len(rows), listed))
+    pane = max(3, height - len(out) - room - 4)
     # -1 means "the newest", and stays meaning it as calls arrive. An absolute index would slide
     # onto a different call every time an agent asked something - the same mistake the log tailer
     # made by holding an offset from the end instead of freezing the buffer.
@@ -1560,21 +1564,34 @@ def mcp_frame(rows, live, col, width, scroll, sel=0, height=40):
         # Slow is relative to what these do: status() samples the server and doctor() re-runs
         # checks, so hundreds of ms is normal and seconds is not.
         mc = c["red"] if ms > 3000 else c["yel"] if ms > 800 else c["dim"]
-        out.append(f" {mark}{c['dim']}{when}{c['r']} {c['cyn']}{(r.get('tool') or '?'):<11}{c['r']}"
-                   f" {mc}{ms:>7.0f}ms{c['r']} {c['dim']}{human(r.get('bytes') or 0):>7}{c['r']} "
-                   f"{okc}{clip(r.get('client') or '?', 26):<26}{c['r']} "
-                   f"{c['dim']}{clip(r.get('args') or '', max(10, W - 70))}{c['r']}")
+        # What came back, not how many bytes came back. A row saying "18.0K" tells you nothing an
+        # agent could have acted on; "5 findings: orphaned temp files, …" is the content.
+        what = mcp_digest(r)
+        if r.get("args"):
+            what = f"{r['args']} → {what}"
+        out.append(f" {mark}{c['dim']}{when}{c['r']} {c['cyn']}{(r.get('tool') or '?'):<10}{c['r']}"
+                   f" {mc}{ms:>6.0f}ms{c['r']} "
+                   f"{okc}{clip(r.get('client') or '?', 22):<22}{c['r']} "
+                   f"{c['dim']}{clip(what, max(10, W - 56))}{c['r']}")
     if start > 0:
         out.insert(len(out) - min(room, len(rows)), f"  {c['dim']}… {start} earlier{c['r']}")
 
     r = rows[sel]
     out.append("")
+    trunc = (r.get("reply") or "").endswith("…")
     out.append(f"  {c['b']}reply{c['r']} {c['dim']}to {r.get('tool')}"
                + (f"({r['args']})" if r.get("args") else "()")
-               + f" - {human(r.get('bytes') or 0)}, {r.get('ms', 0):.0f}ms{c['r']}")
-    body = r.get("error") or r.get("reply") or ""
-    for ln in textwrap.wrap(body, max(40, W - 4))[:pane - 2]:
-        out.append(f"  {c['red'] if r.get('error') else c['dim']}{ln}{c['r']}")
+               + f" - {human(r.get('bytes') or 0)}, {r.get('ms', 0):.0f}ms"
+               + (f", showing the first {human(len(r['reply']))}" if trunc else "") + c["r"])
+    # Indented, not wrapped. Wrapped JSON is a wall of punctuation - the structure is the readable
+    # part and reflowing destroys exactly that. Long lines are cut instead, which keeps the keys.
+    body = mcp_pretty(r, max(40, W - 6))
+    for ln in body[:pane - 1]:
+        col_ = c["red"] if r.get("error") else (c["cyn"] if ln.strip().endswith(("{", "[")) else
+                                                c["r"])
+        out.append(f"  {col_}{ln}{c['r']}")
+    if len(body) > pane - 1:
+        out.append(f"  {c['dim']}… {len(body) - (pane - 1)} more lines of reply{c['r']}")
     return out
 
 

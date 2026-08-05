@@ -107,7 +107,9 @@ def rows(n=3):
 def test_the_view_shows_the_reply_of_the_selected_call():
     out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, -1, 30)]
     assert any("reply to query" in ln for ln in out)
-    assert any('"rows": [[1]]' in ln for ln in out)
+    # Indented, so the value is on its own line under its key rather than inside a wrapped blob.
+    assert any(ln.strip() == '"rows": [' for ln in out)
+    assert any(ln.strip() == "1" for ln in out)
 
 
 def test_minus_one_keeps_selecting_the_newest_as_calls_arrive():
@@ -135,3 +137,69 @@ def test_the_frame_never_exceeds_the_height_it_was_given():
 def test_the_view_has_a_key_and_appears_in_the_bar():
     assert DETAIL["mcp"] == "n"
     assert ("n", "mcp") in KEYS, "a view with no key on the bar is a view nobody finds"
+
+
+def test_a_row_says_what_came_back_not_how_many_bytes(tmp_path):
+    # The screenshot that prompted this: every row said "18.0K" and the reply pane showed two
+    # wrapped lines of braces. Bytes are not something an agent could have acted on.
+    perf = str(tmp_path)
+    mcplog.record(perf, "status", {}, 900.0,
+                  {"findings": [{"what": "orphaned temp files"}, {"what": "WAL is 27.7G"}]})
+    assert mcplog.digest(mcplog.tail(perf)[0]) == "2 findings: orphaned temp files, WAL is 27.7G"
+
+
+def test_the_summary_survives_a_reply_too_big_to_store(tmp_path):
+    # status() is tens of kilobytes, so the stored copy is truncated JSON that will not parse - the
+    # one reply most worth summarising was the one that fell back to showing raw braces. Summarised
+    # at record time, with the whole object still in hand.
+    perf = str(tmp_path)
+    mcplog.record(perf, "status", {}, 900.0,
+                  {"findings": [{"what": "orphaned temp files", "detail": "x" * 50_000}]})
+    r = mcplog.tail(perf)[0]
+    assert r["reply"].endswith("…"), "this test is pointless if the reply was not truncated"
+    assert mcplog.digest(r) == "1 findings: orphaned temp files"
+
+
+def test_a_refusal_is_not_prefixed_twice(tmp_path):
+    perf = str(tmp_path)
+    mcplog.record(perf, "query", {"sql": "delete from t"}, 1.0,
+                  {"error": "refused: delete is not a read-only statement"})
+    assert mcplog.digest(mcplog.tail(perf)[0]).count("refused") == 1
+
+
+def test_the_reply_is_indented_rather_than_wrapped(tmp_path):
+    # Wrapped JSON is a wall of punctuation; the structure is the readable part and a reflow
+    # destroys exactly that. Long lines are cut instead, which keeps the keys.
+    perf = str(tmp_path)
+    mcplog.record(perf, "host", {}, 1.0, {"cores": 24, "load": ["1", "2"]})
+    lines = mcplog.pretty(mcplog.tail(perf)[0])
+    assert lines[0] == "{" and any(ln.startswith('  "cores"') for ln in lines)
+
+
+def test_arguments_left_at_their_default_are_not_recorded():
+    # `max_rows=200, max_chars=20000` on every query() pushed the SQL off the end of the line.
+    from serenedash import mcp_server
+
+    seen = {}
+    mcp_server.mcplog.record = lambda perf, tool, args, *a, **kw: seen.update(args=args)
+    mcp_server._SERVING = True
+    try:
+        @mcp_server.stamped
+        def query(sql: str, max_rows: int = 200):
+            return {"rows": []}
+        query("select 1")
+        assert seen["args"] == {"sql": "select 1"}
+        query("select 1", max_rows=5)
+        assert seen["args"] == {"sql": "select 1", "max_rows": 5}
+    finally:
+        mcp_server._SERVING = False
+        import importlib
+        importlib.reload(mcp_server.mcplog)
+
+
+def test_nothing_is_recorded_unless_a_client_is_on_the_other_end():
+    # A test calling stamped(lambda: [1, 2]) put a `<lambda>` row in the real log. Recording starts
+    # when the server starts serving, which is the only moment a call means an agent asked.
+    from serenedash import mcp_server
+
+    assert mcp_server._SERVING is False, "importing this module must not turn recording on"
