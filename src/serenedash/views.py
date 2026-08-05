@@ -7,6 +7,7 @@ import time
 from .anomaly import index, scan
 from .fmt import C, COL_BAR, COL_LABEL, COL_VALUE, NOCOLOR, bar, clip, dur, human, line, spark, strip
 from .hazards import HAZARDS, kernel_of
+from .logs import counts as log_counts
 
 
 def anom_colour(c, a):
@@ -185,6 +186,7 @@ LEGEND = (
 # `search` takes i, for index: s was storage before there was a search engine on screen at all, and
 # moving it would retrain the one key that is used most.
 DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
+          "logs": "o",
           "host": "h", "doctor": "d", "legend": "l", "search": "i"}
 
 
@@ -192,8 +194,8 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 # the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
 # on a 96-column terminal.
 KEYS = (("q", "quit"), ("s", "storage"), ("m", "memory"), ("a", "activity"), ("t", "threads"),
-        ("p", "profile"), ("i", "search"), ("g", "graph"), ("c", "config"), ("h", "host"),
-        ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
+        ("p", "profile"), ("i", "search"), ("o", "logs"), ("g", "graph"), ("c", "config"),
+        ("h", "host"), ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
 
 
 def qty(n):
@@ -646,6 +648,69 @@ def memory_frame(s, hist, host, col, width, scroll):
                 out.append(f"  {c['yel']}{a.name if i == 0 else '':<22}{c['r']} {c['dim']}{part}"
                            f"{c['r']}")
     return out[scroll:]
+
+
+def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=True):
+    """The `o` view: the server's own log, newest last, filtered.
+
+    Newest LAST, like `tail -f` and unlike most log UIs. You read a log to find out what happened
+    just now, and the eye goes to the bottom of a terminal - putting the newest line at the top means
+    reading time backwards.
+
+    The header says which source answered. That is not decoration: an empty log means one thing when
+    it came from `docker logs` and something else entirely when nothing answered at all.
+    """
+    c = C if col else NOCOLOR
+    W = max(70, width)
+    lv, ty = log_counts(rows)
+    head = f"{c['b']}log{c['r']}  {c['grn'] if follow else c['yel']}"
+    head += f"{'following' if follow else 'paused'}{c['r']}  "
+    if source:
+        head += f"{c['dim']}{source}{c['r']}  {c['dim']}·{c['r']}  {len(rows)} lines"
+        if lv:
+            def _lc(k):
+                return (c["red"] if k.startswith(("ERR", "FATAL")) else
+                        c["yel"] if k.startswith("WARN") else c["dim"])
+            head += "  " + "  ".join(f"{_lc(k)}{n} {k.lower()}{c['r']}"
+                                     for k, n in sorted(lv.items()))
+        if ty:
+            head += f"  {c['dim']}·{c['r']}  " + " ".join(f"{c['cyn']}{k}{c['r']}" for k in sorted(ty))
+    else:
+        head += f"{c['yel']}no source answered{c['r']}"
+    out = [head]
+    if needle:
+        out.append(f"  {c['yel']}filter{c['r']} {c['b']}{needle}{c['r']}  "
+                   f"{c['dim']}{len(rows)} matching{c['r']}")
+    out.append("")
+    if why:
+        out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(why, max(40, W - 4))]
+        return out[scroll:]
+    if not rows:
+        out.append(f"  {c['dim']}nothing matched{c['r']}" if needle else
+                   f"  {c['dim']}the log is empty. That is a fact about the log, not about the "
+                   f"server - serened logs at info by default{c['r']}")
+        return out[scroll:]
+    lvcol = {"ERROR": c["red"], "FATAL": c["red"], "WARN": c["yel"], "WARNING": c["yel"],
+             "DEBUG": c["dim"], "TRACE": c["dim"]}
+    # The window is anchored to the END of the buffer, not the start. A log is read from the bottom,
+    # and slicing from the top would show the oldest lines and scroll the reader away from the new
+    # ones on every tick - the opposite of what tailing is for. `scroll` counts lines back from the
+    # newest, so 0 is "following".
+    room = max(1, height - len(out) - 3)
+    start = max(0, len(rows) - room - scroll)
+    shown = rows[start:start + room]
+    if start > 0:
+        out.append(f"  {c['dim']}… {start} older line{'s' if start != 1 else ''} above{c['r']}")
+    for when, typ, lvl, msg in shown:
+        mark = lvcol.get(lvl.upper(), c["grn"] if lvl == "INFO" else c["dim"])
+        stamp = f"{c['dim']}{when[5:] if when else ' ' * 14:<14}{c['r']}"
+        kind = f"{c['cyn']}{(typ or '')[:10]:<10}{c['r']}"
+        out.append(f"  {stamp} {mark}{lvl[:5]:<5}{c['r']} {kind} "
+                   f"{clip(msg, max(20, W - 36))}")
+    behind = len(rows) - (start + len(shown))
+    if behind > 0:
+        out.append(f"  {c['yel']}… {behind} newer below - press f to follow{c['r']}")
+    return out
 
 
 def doctor_frame(rows, fix, col, width, scroll, msg=None):

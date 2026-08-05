@@ -20,6 +20,7 @@ from . import export as exporter
 from . import history
 from . import serve as _serve
 from . import snapshot as snap
+from . import logs as _logs
 from .db import apply_setting, full_queries, query, sample, search, sql_status, temp_files_held
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
@@ -32,6 +33,7 @@ from .views import (
     frame,
     host_frame,
     legend_frame,
+    logs_frame,
     memory_frame,
     profile_frame,
     search_frame,
@@ -300,6 +302,10 @@ def main():
     hinfo, wh = {}, (0, 0)
     drows, dfix, dmsg, fullq = None, None, None, None
     why, recording = None, True
+    # Follow is the default and pausing FREEZES the buffer rather than just holding an offset. An
+    # offset from the end drifts as lines arrive - you stay N lines from the newest while the lines
+    # you were reading slide past - which is the thing that makes a tailer unusable for reading.
+    lrows, lsrc, lwhy, lfollow, lscroll, lneedle = [], "", None, True, 0, ""
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -330,9 +336,9 @@ def main():
         # DETAIL already carries doctor and legend; listing them again put doctor in the nav twice.
         # DETAIL is {view: key}; the page wants {key: view}, and the same keys as the terminal so
         # the two are one tool rather than two.
+        wkeys = {k: v for v, k in DETAIL.items()}
         hub, wsrv = _serve.start(host or "127.0.0.1", int(port),
-                                 ["main", *sorted(DETAIL)], wstate,
-                                 {k: v for v, k in DETAIL.items()})
+                                 ["main", *sorted(DETAIL)], wstate, wkeys)
         print(f"serving http://{host or '127.0.0.1'}:{int(port)}/", file=sys.stderr)
     pidfile = write_pidfile(a.perf_dir)
     # Raw-ish mode for the whole session, not per keystroke. Restored in the finally below, in the
@@ -388,6 +394,8 @@ def main():
                 for key in set(now_tags) | {k[2:] for k in hist if k.startswith("t:")}:
                     hist["t:" + key] = (hist.get("t:" + key, [])
                                         + [now_tags.get(key, 0)])[-HIST:]
+            if fresh and view == "logs" and lfollow:
+                lrows, lsrc, lwhy = _logs.tail(cfg, 400)
             if fresh:
                 perf = perf_window(a.perf_dir)
                 hpid = hpid or host_pid(cfg)
@@ -459,7 +467,12 @@ def main():
                     fullq = None
                 elif fresh or fullq is None:
                     fullq = full_queries(cfg)
-                body = {"storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
+                if view == "logs" and not lrows and not lwhy:
+                    lrows, lsrc, lwhy = _logs.tail(cfg, 400)   # first entry, before any data tick
+                body = {"logs": lambda: logs_frame(
+                            _logs.matching(lrows, lneedle), lsrc, lwhy, lneedle, col, w,
+                            lscroll, h - 1, lfollow),
+                        "storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
                         "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
                         "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
                         "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
@@ -517,7 +530,8 @@ def main():
                             return _serve.frame_payload(name, view_lines(
                                 name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
                                 True, _w,
-                                full=full_queries(cfg) if name == "activity" else None))
+                                full=full_queries(cfg) if name == "activity" else None),
+                                cols=_w, keys=wkeys)
                     wstate["render"] = _render
                     hub.publish(_render(wname))
                 except Exception:                                # noqa: BLE001
@@ -664,6 +678,21 @@ def main():
                     view, scroll, tipon = "main", 0, False
                 elif tipon:
                     tipon, tipkey = False, None
+                shown = [None] * len(shown)
+                continue
+            if view == "logs" and k in ("f", "j", "k", "down", "up", "pgup", "pgdn"):
+                if k == "f":
+                    # Resuming jumps to the newest, because "follow" and "sitting where you were"
+                    # are different requests and the key says follow.
+                    lfollow, lscroll = not lfollow, 0
+                    if lfollow:
+                        lrows, lsrc, lwhy = _logs.tail(cfg, 400)
+                else:
+                    step = 1 if k in ("j", "k", "down", "up") else 10
+                    up = k in ("k", "up", "pgup")
+                    lscroll = max(0, lscroll + (step if up else -step))
+                    if up:
+                        lfollow = False        # scrolling up IS the request to stop being moved
                 shown = [None] * len(shown)
                 continue
             if k == "q":

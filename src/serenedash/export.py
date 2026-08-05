@@ -22,14 +22,33 @@ import re
 
 # One entry per SGR colour this renderer emits. Deliberately a fixed palette rather than the
 # terminal's, because an export is read somewhere the terminal's theme does not exist.
-PAL = {"30": "#4b5263", "31": "#e06c75", "32": "#98c379", "33": "#e5c07b",
-       "34": "#61afef", "35": "#c678dd", "36": "#56b6c2", "37": "#abb2bf"}
+# Brighter than a terminal palette on purpose. A terminal is a dark room and these colours were
+# picked for it; a browser puts the same frame behind a page's own contrast, next to UI chrome, at
+# whatever the display's brightness is, and the foreground came out muddy. The hues are the same
+# One Dark hues, lifted in value.
+PAL = {"30": "#6b7280", "31": "#ff8b96", "32": "#b5e08d", "33": "#f5d08a",
+       "34": "#7cc4ff", "35": "#dc94ee", "36": "#6fd7e0", "37": "#e6eaf2"}
+
+# Dim is a de-emphasis, not an erasure. At .55 over the old palette the labels were close to
+# unreadable on a bright display, which is where a browser usually is.
+DIM = 0.72
 
 # Cell advance and line height in px. Any pair works - the pinning makes the glyphs fit the cell
 # rather than the cell follow the glyphs - so these only set how large the export renders.
 CW, LH = 7.22, 15.0
 
 _SGR = re.compile("\033\\[([0-9;]*)m")
+
+# Glyphs that are not really text: a bar is a filled area that happens to be spelled with
+# characters. Drawn as text they inherit a font's glyph box, which is not exactly the line pitch,
+# so after the page scales the SVG by a fractional factor the seams between rows land on different
+# sub-pixels and the bars look unevenly spaced. As rectangles they tile exactly at any scale.
+#
+# The sparkline glyphs carry a height as well, which the terminal can only express in eighths. A
+# rect can draw the real fraction, so the trace comes out smoother here than on the terminal.
+FILL = {"█": (1.0, 1.0), "▓": (1.0, 0.75), "▒": (1.0, 0.5), "░": (1.0, 0.22),
+        "▁": (0.125, 1.0), "▂": (0.25, 1.0), "▃": (0.375, 1.0), "▄": (0.5, 1.0),
+        "▅": (0.625, 1.0), "▆": (0.75, 1.0), "▇": (0.875, 1.0)}
 
 
 def runs(line):
@@ -59,9 +78,16 @@ def runs(line):
     return out
 
 
-def svg(lines, pad=8, background="#101318"):
-    """One SVG for a list of ANSI lines, every run pinned to its column."""
-    cols = max((sum(len(t) for _, t, *_ in runs(ln)) for ln in lines), default=0)
+def svg(lines, pad=8, background="#101318", cols=None):
+    """One SVG for a list of ANSI lines, every run pinned to its column.
+
+    `cols` fixes the grid width instead of taking it from the widest line. It matters whenever more
+    than one frame is shown at the same scale: a page that stretches each SVG to its container
+    scales a 100-column panel up more than a 168-column one, so the same dashboard rendered the
+    storage view in a visibly larger font than the main frame. One grid, one scale.
+    """
+    if cols is None:
+        cols = max((sum(len(t) for _, t, *_ in runs(ln)) for ln in lines), default=0)
     w, h = cols * CW + pad * 2, len(lines) * LH + pad * 2
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0f}" height="{h:.0f}" '
              f'viewBox="0 0 {w:.0f} {h:.0f}" font-size="12" '
@@ -72,11 +98,31 @@ def svg(lines, pad=8, background="#101318"):
         for col, text, fg, bold, dim in runs(line):
             if not text.strip():
                 continue                       # whitespace needs no element; the grid places the rest
-            attrs = f' fill="{fg or PAL["37"]}"'
+            colour = fg or PAL["37"]
+            if all(ch in FILL for ch in text):
+                # A bar or a sparkline. One rect per run of identical glyphs, so a solid bar is a
+                # single rectangle and a trace is one per step.
+                top = pad + row * LH
+                i = 0
+                while i < len(text):
+                    j = i
+                    while j < len(text) and text[j] == text[i]:
+                        j += 1
+                    hfrac, alpha = FILL[text[i]]
+                    if dim:
+                        alpha *= DIM
+                    parts.append(
+                        f'<rect x="{pad + (col + i) * CW:.2f}" '
+                        f'y="{top + LH * (1 - hfrac):.2f}" width="{(j - i) * CW:.2f}" '
+                        f'height="{LH * hfrac:.2f}" fill="{colour}"'
+                        + (f' opacity="{alpha:.2f}"' if alpha < 1 else "") + "/>")
+                    i = j
+                continue
+            attrs = f' fill="{colour}"'
             if bold:
                 attrs += ' font-weight="700"'
             if dim:
-                attrs += ' opacity=".55"'
+                attrs += f' opacity="{DIM}"'
             parts.append(
                 f'<text x="{pad + col * CW:.2f}" y="{y:.0f}" '
                 f'textLength="{len(text) * CW:.2f}" lengthAdjust="spacingAndGlyphs" '
@@ -94,7 +140,7 @@ h2{font-size:1.05rem;margin:2.2rem 0 .5rem;color:#e5c07b;font-weight:600}
 .sub{color:#7d8590;margin:0 0 1.4rem}
 .term{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.6rem;
  overflow-x:auto;margin:0}
-.term svg{display:block;max-width:none}
+.term svg{display:block;width:100%;height:auto}
 @media(prefers-color-scheme:light){body{background:#fbfbfd;color:#2b303b}h1{color:#11141a}
  .sub{color:#4b5263}}
 :root[data-theme=light] body{background:#fbfbfd;color:#2b303b}
@@ -102,7 +148,7 @@ h2{font-size:1.05rem;margin:2.2rem 0 .5rem;color:#e5c07b;font-weight:600}
 """
 
 
-def page(sections, title="serenedash", subtitle=""):
+def page(sections, title="serenedash", subtitle="", cols=None):
     """A complete HTML document. `sections` is [(heading, [ansi lines])].
 
     Complete, not a fragment: doctype, `<html>`, and above all `<meta charset>`. Every box-drawing
@@ -110,6 +156,9 @@ def page(sections, title="serenedash", subtitle=""):
     them as something else - which turns a dashboard into mojibake and looks like a rendering bug in
     the dashboard rather than a missing line in its head.
     """
+    if cols is None:
+        cols = max((sum(len(t) for _, t, *_ in runs(ln)) for _, ls in sections for ln in ls),
+                   default=80)
     body = [f"<h1>{html.escape(title)}</h1>"]
     if subtitle:
         body.append(f'<p class="sub">{html.escape(subtitle)}</p>')
@@ -117,7 +166,9 @@ def page(sections, title="serenedash", subtitle=""):
         if not lines:
             continue
         body.append(f"<h2>{html.escape(heading)}</h2>")
-        body.append(f'<div class="term">{svg(lines)}</div>')
+        # One grid for every section, so a narrow panel is not rendered in a larger font than the
+        # main frame when the page scales each block to its container.
+        body.append(f'<div class="term">{svg(lines, cols=cols)}</div>')
     return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
             f"<title>{html.escape(title)}</title>\n<style>{CSS}</style>\n</head>\n<body>\n"
