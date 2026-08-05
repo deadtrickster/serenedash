@@ -42,8 +42,17 @@ def _ckpt(v, s):
     wal = s.get("wal", 0)
     thr = to_bytes(v)
     if thr and wal > max(thr * 50, 2**30):
+        # "look for write errors" was too narrow, and it read as a diagnosis. An automatic
+        # checkpoint is attempted at commit and needs a moment with no other transaction open; a
+        # server under a steady stream of overlapping queries may simply never get one, and that
+        # looks identical from here to a failing write. Both are worth checking and neither is
+        # measured by this row - what IS measured is the ratio, and that raising the threshold is
+        # the wrong direction whichever it turns out to be.
         return (f"WAL is {human(wal)} against a threshold of {human(thr)} — {wal / thr:.0f}x. "
-                "Automatic checkpointing is not completing; look for write errors, not for tuning.")
+                "Checkpoints are not landing. Either one cannot get a window with no other "
+                "transaction open, or writes are failing; the database file's mtime tells you "
+                "which — if it has not moved, nothing has been folded in since. Not a tuning "
+                "case: raising the threshold lets the WAL grow further.")
     # The other end of the same setting, and the one that is easy to read backwards. Compression
     # runs AT CHECKPOINT: a 103-second checkpoint on this deployment was roughly half compression
     # or the analysis deciding how to compress (FSST ~22%, float analyse+ALP ~14%). So how OFTEN it

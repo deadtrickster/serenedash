@@ -136,15 +136,21 @@ def test_twelve_deleted_documents_out_of_eleven_million_are_not_a_finding():
     assert one(snapshot.search(metrics()), "deleted") == []
 
 
-def test_consolidation_over_its_interval_fires_and_names_the_default_it_compared_against():
-    # 15,368 ms was read off this deployment an hour after it read 672. The threshold is
-    # compaction_interval's documented 1000 ms default, and the finding says the interval is fixed
-    # at CREATE INDEX time so the reader knows what it did not check.
+def test_a_long_consolidation_reports_the_cost_and_not_a_backlog_it_did_not_measure():
+    # 15,368 ms was read off this deployment an hour after it read 672. What the row may NOT say is
+    # that consolidation is behind: this used to be titled "slower than its interval" and to
+    # conclude "so segments accumulate", and both halves were inference. compaction_pending is the
+    # backlog, it is measured, and on the deployment that produced the rule it was 0.
     f = one(snapshot.search(metrics(avg_consolidation_time_ms=15368)), "consolidation")
     assert len(f) == 1
-    assert f[0]["threshold_ms"] == snapshot.CONSOLIDATION_MS == 1000
     assert f[0]["avg_consolidation_time_ms"] == 15368
+    assert f[0]["documented_interval_ms"] == snapshot.CONSOLIDATION_MS == 1000
+    assert f[0]["interval_readable_here"] is False
+    assert "compaction_pending" in f[0] and "compaction_active" in f[0]
     assert "compaction_interval" in f[0]["detail"] and "CREATE INDEX" in f[0]["detail"]
+    # The conclusion the old row asserted, in the case where nothing corroborates it.
+    assert "not an observed backlog" in f[0]["detail"]
+    assert "slower than its interval" not in f[0]["what"]
 
 
 def test_a_672ms_consolidation_is_under_the_interval_and_stays_quiet():

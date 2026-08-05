@@ -67,8 +67,13 @@ def test_a_runaway_wal_is_the_other_finding_and_wins():
     # 77 GB of WAL against 16 MiB means checkpoints are NOT landing, which is the opposite of
     # "checkpoints run too often". Printing both would be two readings of one number, a line apart.
     w = ckpt("16.0 MiB", s(wal=77 * 10**9, queries=writing(11)))
-    assert "not completing" in w
+    assert "not landing" in w
     assert "row groups" not in w
+    # And it must not name ONE cause. "look for write errors" read as a diagnosis, and an
+    # automatic checkpoint that never gets a window with no other transaction open looks identical
+    # from here. Both are offered, and the direction that is wrong either way is stated.
+    assert "no other transaction" in w and "writes are failing" in w
+    assert "raising the threshold lets the WAL grow further" in w
 
 
 def test_predicates_survive_a_sample_that_is_missing_what_they_read():

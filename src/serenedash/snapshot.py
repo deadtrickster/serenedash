@@ -361,21 +361,40 @@ def search_findings(sr):
             })
         cons = ix.get("avg_consolidation_time_ms") or 0
         if cons > CONSOLIDATION_MS:
+            # What this row may NOT say: that consolidation is behind. It used to - "consolidation
+            # slower than its interval ... so segments accumulate" - and both halves were inference.
+            # The interval is fixed at CREATE INDEX and appears in no readable place on this server
+            # (35 rows in sdb_settings, 20 metrics in sdb_metrics, none of them it), so the
+            # comparison was against a documented default that may not be this index's. And a
+            # backlog is directly measured: compaction_pending and compaction_active. On the
+            # deployment that produced this rule they were 0 and 0 with num_failed_consolidations
+            # 0, which is the opposite of a merge that cannot keep up, and the row asserted it
+            # anyway. A reader downstream repeated it as fact, which is what a `what` line stating
+            # a conclusion gets you.
+            comp = (srv.get("maintenance") or {}).get("compaction") or {}
+            pend, act = comp.get("pending") or 0, comp.get("active") or 0
+            queue = (f"compaction_pending is {pend} with {act} active, so there IS work queued "
+                     f"behind this" if pend else
+                     f"compaction_pending is 0 and compaction_active is {act}: nothing is queued "
+                     f"right now, so this is the cost of a merge, not an observed backlog")
             out.append({
-                "what": f"search index {rel}: consolidation slower than its interval",
+                "what": f"search index {rel}: each consolidation takes {cons / 1000:.1f}s",
                 "detail": f"avg_consolidation_time_ms is {cons:,} across "
-                          f"{ix.get('num_segments')} segments, {cons / CONSOLIDATION_MS:.1f}x the "
-                          f"{CONSOLIDATION_MS} ms compaction_interval default. A merge that takes "
-                          f"longer than the interval it is scheduled on cannot finish between two "
-                          f"runs, so segments accumulate. The interval is fixed at CREATE INDEX "
-                          f"time and sdb_metrics does not carry it - this compared against the "
-                          f"documented default, so read the index's own setting before acting.",
+                          f"{ix.get('num_segments')} segments. {queue}. Whether that is slow "
+                          f"depends on compaction_interval, which is fixed at CREATE INDEX time "
+                          f"and is in neither sdb_settings nor sdb_metrics - the documented "
+                          f"default is {CONSOLIDATION_MS} ms, and this row does not know whether "
+                          f"this index uses it. Read the CREATE INDEX statement before treating "
+                          f"the ratio as real.",
                 "relation_id": rel, "avg_consolidation_time_ms": cons,
                 "num_segments": ix.get("num_segments"),
-                "threshold_ms": CONSOLIDATION_MS,
-                "threshold_source": "documented compaction_interval default (1000 ms)",
-                "verify": "compaction_active in sdb_metrics while this is high says it is running "
-                          "now; the CREATE INDEX statement says what the interval actually is",
+                "compaction_pending": pend, "compaction_active": act,
+                "num_failed_consolidations": ix.get("num_failed_consolidations") or 0,
+                "documented_interval_ms": CONSOLIDATION_MS,
+                "interval_readable_here": False,
+                "verify": "select metric, value from sdb_metrics where relation_id is null - "
+                          "compaction_pending and compaction_active are the backlog itself, and "
+                          "they beat any comparison against an interval this server will not name",
             })
     return out
 
@@ -407,6 +426,19 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
                       + proof,
             "bytes_reclaimable": orph_bytes,
             "server_temp_files_held": held[0] if held else None,
+            # Spelled out because a reader with the "never swept at startup" sentence in front of
+            # it still proposed restarting the server to clear them. The distinction the sentence
+            # turns on: a CLEAN shutdown runs the destructor and removes what that process was
+            # holding, so an orderly restart does not leak. What no restart does, clean or not, is
+            # sweep the directory - so files left by an earlier unclean exit survive every one of
+            # them, and these are those files.
+            "fix": "delete the files. A restart will not reclaim these: a clean shutdown removes "
+                   "only what the exiting process is holding, and nothing sweeps the directory at "
+                   "startup, so what an earlier kill left behind survives any number of restarts. "
+                   "Deleting is safe only while the server holds none of them open, which is the "
+                   "server_temp_files_held number beside this: re-read it immediately before "
+                   "deleting, because a query that starts spilling in between owns files in that "
+                   "directory.",
             "verify": "select count(*), sum(size) from duckdb_temporary_files() - the server's own "
                       "list of what it has open. Or, inside the container: ls -l /proc/1/fd | "
                       "grep -c tmp",
