@@ -35,7 +35,9 @@ from .views import (
     host_frame,
     legend_frame,
     logs_frame,
+    NAV_KEYS,
     mcp_frame,
+    mcp_nav,
     memory_frame,
     profile_frame,
     search_frame,
@@ -187,8 +189,26 @@ def mouse_event(code, fin):
 WEB_ROWS = 44
 
 
+# The views that answer to j/k on the page. Everything else redraws whole every tick and has
+# nothing to move, and a page that swallowed j on those would be taking a key to do nothing.
+NAVIGABLE = ("mcp",)
+
+
+def _web_nav(st, key, perf_dir):
+    """One key from a browser, applied to that tab's position. None leaves the view.
+
+    The reducer is `views.mcp_nav`, the same one the terminal drives, because "what does j do
+    here" is one question. The page used to answer none of them.
+    """
+    if st.get("view") != "mcp" or key not in NAV_KEYS:
+        return st
+    rows = _mcplog.tail(perf_dir)
+    out = mcp_nav(st, key, rows, _mcplog.live())
+    return {**st, **out} if out else {**st, "view": "main"}
+
+
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
-               full=None, logtail=None, needle=""):
+               full=None, logtail=None, needle="", nav=None):
     """One view by name, or the main frame. The single dispatch both the export and --serve use.
 
     The terminal has its own dispatch inside the loop because it also owns scroll, selection and the
@@ -216,7 +236,9 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         return legend_frame(col, w, 0)
     if name == "mcp":
         rows = _mcplog.tail(perf_dir or cfg.get("perf_dir", ""))
-        return mcp_frame(rows, _mcplog.live(), col, w, 0, len(rows) - 1, WEB_ROWS)
+        n = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False, **(nav or {})}
+        return mcp_frame(rows, _mcplog.live(), col, w, n["scroll"], n["sel"], WEB_ROWS,
+                         n["open"], n["call"], n["popup"])
     if name == "logs":
         # Tailed here when the caller has none, the same way `doctor` runs its own checks: a
         # consumer that just wants the panel should not have to know where this server keeps its
@@ -333,13 +355,11 @@ def main():
     # you were reading slide past - which is the thing that makes a tailer unusable for reading.
     lrows, lsrc, lwhy, lfollow, lscroll, lneedle = [], "", None, True, 0, ""
     lfind = None      # the filter being typed, or None when not typing. '' is a filter, not absence.
-    # -1 selects the newest call, and KEEPS selecting it as calls arrive. An absolute index would
-    # slide onto a different call every time an agent asked something.
-    mrows, mlive, msel = [], [], 0
-    # Three levels: sessions, one session's calls, one call in full. mopen is the pid of the open
-    # session, mcall the call inside it (-1 = the newest, and it stays the newest as calls arrive),
-    # mpop whether the full-call box is up. Esc unwinds them in that order.
-    mopen, mcall, mpop, mscroll = None, -1, False, 0
+    mrows, mlive = [], []
+    # Three levels: sessions, one session's calls, one call in full. `call` is -1 for the newest and
+    # KEEPS meaning the newest as calls arrive - an absolute index slides onto a different row every
+    # time an agent asks something. Esc unwinds box, then session, then the view.
+    mnav = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False}
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -360,7 +380,9 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(0))
     hub = wsrv = None
-    wstate = {}   # only the render closure now; which view a tab shows is that tab's business
+    # Only the render closure and the key reducer. Which view a tab shows, and where it is
+    # scrolled to, is that tab's business - see serve.Hub.
+    wstate = {"nav": lambda st, key: _web_nav(st, key, a.perf_dir)}
     wlock = threading.Lock()
     if a.serve:
         # 127.0.0.1 unless a host is given. This exposes storage sizes, statement text and settings
@@ -505,8 +527,9 @@ def main():
                     lrows, lsrc, lwhy = _logs.tail(cfg, 400)   # first entry, before any data tick
                 if view == "mcp" and (fresh or not mrows):
                     mrows, mlive = _mcplog.tail(a.perf_dir), _mcplog.live()
-                body = {"mcp": lambda: mcp_frame(mrows, mlive, col, w, scroll, msel, h - 1,
-                                                 mopen, mcall, mpop),
+                body = {"mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
+                                                 mnav["sel"], h - 1, mnav["open"], mnav["call"],
+                                                 mnav["popup"]),
                         "logs": lambda: logs_frame(
                             _logs.matching(lrows, lneedle), lsrc, lwhy, lneedle, col, w,
                             lscroll, h - 1, lfollow),
@@ -562,7 +585,7 @@ def main():
                     # data this tick already collected, instead of the browser waiting up to a whole
                     # interval for the next one. Rebound each tick, so it always closes over current
                     # data; the lock keeps a render off a half-updated tick.
-                    def _render(name, needle="",
+                    def _render(name, needle="", nav=None,
                                 _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww)):
                         wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w = _d
                         with wlock:
@@ -570,7 +593,8 @@ def main():
                                 name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
                                 True, _w,
                                 full=full_queries(cfg) if name == "activity" else None,
-                                needle=needle), cols=_w, keys=wkeys)
+                                needle=needle, nav=nav), cols=_w, keys=wkeys,
+                                sid=(nav or {}).get("id", ""), nav=name in NAVIGABLE)
                     wstate["render"] = _render
                     # One render per view someone is actually watching. Nothing is rendered when
                     # no browser is connected.
@@ -701,7 +725,7 @@ def main():
                     edit, msg = (row[1] if len(row) > 1 else ""), None
                     shown = [None] * len(shown)
                 continue
-            if k == "\x1b" and (tipon or detail or mpop or mopen is not None or view != "main"):
+            if k == "\x1b" and (tipon or detail or view != "main"):
                 # One level at a time. Escaping out of a setting's description dropped the config
                 # list as well and landed on the main frame, so getting back to where you were meant
                 # pressing c and scrolling to the row again.
@@ -713,10 +737,9 @@ def main():
                 # presses. It only counts as a level when there is nothing else to leave, which is
                 # what keeps the escape hatch for a terminal filling the screen: no cell outside the
                 # window means the edge rule never fires, and Esc is then the only way out.
-                if mpop:
-                    mpop, mscroll = False, 0       # the box, then the session, then the view
-                elif view == "mcp" and mopen is not None:
-                    mopen, mcall = None, -1
+                nxt = mcp_nav(mnav, "\x1b", mrows, mlive) if view == "mcp" else None
+                if nxt is not None:
+                    mnav = nxt                     # the box, then the session, then the view
                 elif detail:
                     detail, tipon = None, False
                 elif view != "main":
@@ -740,33 +763,11 @@ def main():
                 lscroll = 0
                 shown = [None] * len(shown)
                 continue
-            if view == "mcp" and k in ("j", "k", "down", "up", "pgup", "pgdn", "end", "\r", "\n"):
-                step = 1 if k in ("j", "k", "down", "up") else 10
-                up = k in ("k", "up", "pgup")
-                if mpop:
-                    # Inside the box, j/k scroll the reply. Enter does nothing: there is no level
-                    # below this one, and a key that looks like it should do something and does
-                    # not is worse than one that is simply not bound.
-                    mscroll = 0 if k == "end" else max(0, mscroll + (-step if up else step))
-                elif mopen is not None:
-                    mine = _mcplog.calls_of(mrows, mopen)
-                    if k in ("\r", "\n"):
-                        mpop, mscroll = bool(mine), 0
-                    elif k == "end":
-                        mcall = -1                 # back to following the newest
-                    else:
-                        cur = mcall if mcall >= 0 else len(mine) - 1
-                        mcall = max(0, min(len(mine) - 1, cur + (-step if up else step)))
-                        if mcall == len(mine) - 1:
-                            mcall = -1             # landing on the newest resumes following it
-                else:
-                    sess = _mcplog.sessions(mrows, mlive)
-                    if k in ("\r", "\n"):
-                        if sess:
-                            mopen, mcall, mscroll = sess[min(msel, len(sess) - 1)]["pid"], -1, 0
-                    else:
-                        msel = max(0, min(max(0, len(sess) - 1),
-                                          msel + (-step if up else step)))
+            if view == "mcp" and k in NAV_KEYS and k != "\x1b":
+                # The reducer is shared with the page, which has to ask the server for the same
+                # thing over HTTP. Two copies of "what does j do here" diverge on the first change
+                # to either, and the page's copy was an empty set - j did nothing there at all.
+                mnav = mcp_nav(mnav, k, mrows, mlive)
                 shown = [None] * len(shown)
                 continue
             if view == "logs" and k == "/":

@@ -9,6 +9,7 @@ from .fmt import C, COL_BAR, COL_LABEL, COL_VALUE, NOCOLOR, bar, clip, dur, huma
 from .hazards import HAZARDS, kernel_of
 from .logs import counts as log_counts
 from .mcplog import digest as mcp_digest
+from .mcplog import failed as mcp_failed
 from .mcplog import sessions as mcp_sessions
 from .mcplog import pretty as mcp_pretty
 
@@ -1535,7 +1536,7 @@ def _mcp_sessions(sess, rows, c, width, height, sel, scroll):
         head += (f"  {c['dim']}·{c['r']}  {c['grn']}{live_n} live{c['r']}"
                  f"  {c['dim']}·{c['r']}  {len(rows)} call{'s' if len(rows) != 1 else ''}")
         if errs:
-            head += f"  {c['dim']}·{c['r']}  {c['red']}{errs} refused{c['r']}"
+            head += f"  {c['dim']}·{c['r']}  {c['red']}{c['b']}{errs} failed{c['r']}"
     out = [head, ""]
     if not sess:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
@@ -1557,7 +1558,8 @@ def _mcp_sessions(sess, rows, c, width, height, sel, scroll):
                 else (f"up {dur(s['uptime_s'])}" if s["uptime_s"] is not None else ""))
         tools = " ".join(f"{t}{'×' + str(n) if n > 1 else ''}"
                          for t, n in sorted(s["tools"].items(), key=lambda kv: -kv[1])[:4])
-        err = f" {c['red']}{s['errors']} refused{c['r']}" if s["errors"] else ""
+        err = (f" {c['red']}{c['b']}{s['errors']} failed{c['r']}" if s["errors"]
+               else " " * (len(str(s["errors"])) + 8))
         out.append(f" {mark}{state} {c['dim']}pid{c['r']} {s['pid']:<8} "
                    f"{c['cyn']}{clip(s['client'] or '?', 30):<30}{c['r']} {what:<22}{err} "
                    f"{c['dim']}{when:<9} {clip(tools, max(6, W - 82))}{c['r']}")
@@ -1578,6 +1580,8 @@ def _mcp_calls(mine, who, c, width, height, call_sel, scroll):
                   f"{'s' if who['calls'] != 1 else ''}  {c['dim']}·{c['r']}  "
                   f"{human(who['bytes'])} returned  {c['dim']}·{c['r']}  "
                   f"{'live' if who['live'] else 'gone'}")
+        if who["errors"]:
+            title += f"  {c['dim']}·{c['r']}  {c['red']}{c['b']}{who['errors']} failed{c['r']}"
     out = [title, ""]
     if not mine:
         out.append(f"  {c['dim']}this session has not asked anything yet{c['r']}")
@@ -1590,11 +1594,21 @@ def _mcp_calls(mine, who, c, width, height, call_sel, scroll):
         mark = f"{c['b']}›{c['r']}" if i == sel else " "
         ms = r.get("ms") or 0
         mc = c["red"] if ms > 3000 else c["yel"] if ms > 800 else c["dim"]
-        okc = c["r"] if r.get("ok", True) else c["red"]
+        # Two marker columns, not one. A failure gets a glyph as well as a colour - colour alone
+        # is invisible to a reader scanning the left edge, and gone entirely with --no-color or in
+        # a pasted screenshot - but sharing one column with the cursor meant the mark disappeared
+        # exactly when you selected the failed row you were looking for.
+        bad = mcp_failed(r)
+        okc = c["red"] if bad else c["r"]
+        mark += f"{c['red']}{c['b']}✗{c['r']}" if bad else " "
         what = mcp_digest(r)
         if r.get("args"):
-            what = f"{r['args']} → {what}"
-        out.append(f" {mark}{c['dim']}{time.strftime('%H:%M:%S', time.localtime(r.get('t', 0)))}"
+            # On a FAILED call the reason comes first. Argument-then-result is the right order for
+            # a call that worked, but a 120-character SELECT pushed "Table with name
+            # pg_compression does not exist!" off the end of the line - which is the whole content
+            # of a failure, and the reader was left with "query failed".
+            what = f"{what} ← {r['args']}" if bad else f"{r['args']} → {what}"
+        out.append(f"{mark}{c['dim']}{time.strftime('%H:%M:%S', time.localtime(r.get('t', 0)))}"
                    f"{c['r']} {c['cyn']}{(r.get('tool') or '?'):<10}{c['r']} {mc}{ms:>6.0f}ms{c['r']}"
                    f" {c['dim']}{human(r.get('bytes') or 0):>7}{c['r']} "
                    f"{okc}{clip(what, max(10, W - 42))}{c['r']}")
@@ -1650,3 +1664,69 @@ def mcp_counts(rows):
         n, ms = out.get(r.get("tool", "?"), (0, 0.0))
         out[r.get("tool", "?")] = (n + 1, ms + (r.get("ms") or 0))
     return out
+
+
+# The keys that move something, as opposed to the ones that switch view. Named once so the terminal
+# and the page cannot end up answering to different sets - the page answered to none of them, which
+# is how j/k came to do nothing there while working in the terminal.
+# "enter" and "esc" are spelled out as well as sent raw: PAGE is an ordinary Python string, so
+# a carriage return written into the JS becomes a REAL one in the served text and breaks the
+# string literal it sits in - which is how the page came to throw on load. Names travel safely.
+NAV_KEYS = ("j", "k", "down", "up", "pgup", "pgdn", "end", "home", "enter", "esc",
+            "\r", "\n", "\x1b")
+
+
+def mcp_nav(nav, key, rows, live=()):
+    """Apply one key to the mcp view's position. Returns a NEW dict; never mutates.
+
+    One reducer for both front ends. The terminal owns its keyboard and the page has to ask the
+    server, but what a key MEANS is the same question in both, and two copies of an answer that
+    subtle diverge on the first change to either.
+
+    `nav` is {scroll, sel, open, call, popup}. Esc unwinds one level and returns None for `open`
+    only when there is nothing left to close, so the caller can tell "I handled it" from "this Esc
+    is yours" - which is what keeps Esc leaving the view when nothing is open.
+    """
+    n = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False, **(nav or {})}
+    key = {"enter": "\r", "esc": "\x1b"}.get(key, key)
+    step = 1 if key in ("j", "k", "down", "up") else 10
+    up = key in ("k", "up", "pgup")
+    if key == "\x1b":
+        # One level at a time: the box, then the session, then it is not ours.
+        if n["popup"]:
+            n["popup"], n["scroll"] = False, 0
+        elif n["open"] is not None:
+            n["open"], n["call"] = None, -1
+        else:
+            return None                     # nothing left to close - the caller leaves the view
+        return n
+    if n["popup"]:
+        # Inside the box, j/k scroll the reply. Enter is INERT: there is no level below this one.
+        # It was not inert - it fell through to the scroll arithmetic, where anything that is not
+        # j/k/up/down counts as a page and jumped the reply ten lines.
+        if key in ("end", "home"):
+            n["scroll"] = 0
+        elif key in ("j", "k", "down", "up", "pgup", "pgdn"):
+            n["scroll"] = max(0, n["scroll"] + (-step if up else step))
+        return n
+    if n["open"] is not None:
+        mine = [r for r in rows if (r.get("pid") or 0) == n["open"]]
+        if key in ("\r", "\n"):
+            n["popup"], n["scroll"] = bool(mine), 0
+        elif key in ("end", "home"):
+            n["call"] = -1                  # back to following the newest
+        elif mine:
+            cur = n["call"] if n["call"] >= 0 else len(mine) - 1
+            n["call"] = max(0, min(len(mine) - 1, cur + (-step if up else step)))
+            if n["call"] == len(mine) - 1:
+                n["call"] = -1              # landing on the newest resumes following it
+        return n
+    sess = mcp_sessions(rows, live)
+    if key in ("\r", "\n"):
+        if sess:
+            n["open"], n["call"], n["scroll"] = sess[min(n["sel"], len(sess) - 1)]["pid"], -1, 0
+    elif key in ("end", "home"):
+        n["sel"] = 0
+    else:
+        n["sel"] = max(0, min(max(0, len(sess) - 1), n["sel"] + (-step if up else step)))
+    return n

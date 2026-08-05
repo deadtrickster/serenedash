@@ -190,3 +190,67 @@ def test_the_page_says_so_when_the_dashboard_goes_away(dash, page):
     dash.stop()
     page.wait_for_function("() => document.getElementById('s').textContent.includes('disconnected')",
                            timeout=15000)
+
+
+def test_j_and_k_move_the_selection_in_the_browser(dash, page):
+    # The report: "in web version j k do not move anything anywhere". The page knew only how to
+    # switch views, so every navigation key was silently dropped on the one view built around
+    # moving through a list. SSE has no channel back, so they go as a GET and the server pushes the
+    # new frame to that subscriber alone.
+    page.goto(dash.url + "/?view=mcp")
+    wait_for_frame(page, "sessions")
+    first = frame(page)
+    page.keyboard.press("j")
+    page.wait_for_function(f"t => {TEXT} !== t", arg=first, timeout=8000)
+    assert frame(page) != first, "j moved nothing"
+    page.keyboard.press("k")
+    page.wait_for_function(f"t => {TEXT} === t", arg=first, timeout=8000)
+
+
+def test_enter_descends_and_escape_climbs_back_in_the_browser(dash, page):
+    page.goto(dash.url + "/?view=mcp")
+    wait_for_frame(page, "sessions")
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "enter shows the whole call")     # level 2, that session's calls
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "esc closes")                     # level 3, the call in full
+    page.keyboard.press("Escape")
+    wait_for_frame(page, "enter shows the whole call", without="esc closes")
+    page.keyboard.press("Escape")
+    wait_for_frame(page, "enter opens the session")        # back at level 1
+    assert "view=mcp" in page.url, "escape must unwind the levels before leaving the view"
+
+
+def test_escape_with_nothing_open_still_leaves_the_view(dash, page):
+    page.goto(dash.url + "/?view=mcp")
+    wait_for_frame(page, "enter opens the session")
+    page.keyboard.press("Escape")
+    wait_for_frame(page, "q quit")
+    page.wait_for_url(re.compile(r"view=main"), timeout=8000)
+
+
+def test_two_tabs_scroll_independently(dash, page, context):
+    # Position is per subscriber, like the view and the filter. One shared cursor would mean two
+    # people reading the same log move each other's screen.
+    page.goto(dash.url + "/?view=mcp")
+    wait_for_frame(page, "sessions")
+    other = context.new_page()
+    other.goto(dash.url + "/?view=mcp")
+    other.wait_for_selector("#f svg")
+    before = frame(other)
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "enter shows the whole call")
+    other.wait_for_timeout(800)                            # a few ticks with both connected
+    assert frame(other) == before, "one tab's keypress moved another tab"
+    other.close()
+
+
+def test_navigation_keys_are_left_alone_where_they_do_nothing(dash, page):
+    # `j` is not bound on the storage panel. A page that took it to do nothing would be worse than
+    # one that let it fall through to the browser.
+    page.goto(dash.url + "/?view=storage")
+    wait_for_frame(page)
+    before = frame(page)
+    page.keyboard.press("j")
+    page.wait_for_timeout(700)
+    assert frame(page) == before

@@ -89,14 +89,18 @@ function say(txt, cls){ lbl.innerHTML = txt;
 // right panel with no code at all - which is the whole point of doing it this way. Restarting the
 // dashboard used to leave the tab reconnected to a server that had forgotten which view it wanted,
 // and every frame it then sent was discarded by the check below.
-let es = null;
+let es = null, sid = '', navigable = false;
 function connect(){
   if (es) es.close();
   es = new EventSource('/stream?view=' + encodeURIComponent(view) +
                        '&q=' + encodeURIComponent(needle));
   es.onmessage = e => { const m = JSON.parse(e.data);
-      if (m.view !== view || !m.svg) return;                // a frame for the view we just left
+      // A frame for a DIFFERENT view is normally one we just left and is dropped - except when the
+      // server moved us, which is what Esc out of the last mcp level does.
+      if (!m.svg || (m.view !== view && !m.id)) return;
       fr.innerHTML = m.svg; fr.classList.remove('wait');
+      sid = m.id || sid; navigable = !!m.nav;
+      if (m.view !== view){ view = m.view; history.replaceState(0,'',url()); }
       overlay(m.hits || []);
       say('<b>' + m.view + '</b> ' + m.at + ' &middot; click a key below, or press it'); };
   es.onerror = () => say('disconnected - retrying', 'off');
@@ -139,10 +143,20 @@ function go(v){ if (!views.includes(v) || v === view) return;
   connect(); }      // the new stream's first frame IS the switch - nothing to race it, nothing
                     // for the server to remember, and the URL now describes what this tab shows
 box.value = needle;
+// Keys that move something rather than switch view. SSE has no channel back, so they go as an
+// ordinary GET naming this tab and the key; the server applies the same reducer the terminal uses
+// and pushes the new frame straight to this subscriber. They did nothing at all before - the page
+// knew only how to switch views, so j and k were silently dropped on a view built around them.
+const NAV = {j:'j', k:'k', ArrowDown:'down', ArrowUp:'up', PageDown:'pgdn', PageUp:'pgup',
+             Enter:'enter', End:'end', Home:'home'};
+function nav(key){ fetch('/nav?id=' + encodeURIComponent(sid) + '&key=' + encodeURIComponent(key)); }
+
 document.addEventListener('keydown', e => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;      // leave the browser's own shortcuts alone
   if (e.key === '/' && FILTERS.includes(view)){ e.preventDefault(); return box.focus(); }
+  if (navigable && e.key === 'Escape'){ e.preventDefault(); return nav('esc'); }
   if (e.key === 'Escape') return go('main');
+  if (navigable && NAV[e.key]){ e.preventDefault(); return nav(NAV[e.key]); }
   const v = keys[e.key.toLowerCase()];
   if (v) { e.preventDefault(); go(v); }
 });
@@ -186,12 +200,30 @@ class Hub:
     """
 
     def __init__(self):
-        self.subs, self.lock, self.latest = {}, threading.Lock(), {}
+        self.subs, self.lock, self.latest, self._n = {}, threading.Lock(), {}, 0
 
     def views(self):
-        """The distinct (view, needle) pairs someone is watching."""
+        """Every subscriber's (queue, state). Rendered per subscriber rather than per view: two
+        tabs on the same panel can be scrolled to different places, and that IS the feature."""
         with self.lock:
-            return set(self.subs.values())
+            return list(self.subs.items())
+
+    def nav(self, sid, apply):
+        """Move one subscriber. `apply` takes its state and returns the new one, or None to leave.
+
+        Addressed by id because SSE has no channel back: the page sends an ordinary GET saying
+        which tab it is and which key was pressed. Returns the queue so the caller can push a
+        frame immediately - waiting for the next tick would make j feel broken, which is exactly
+        how it felt when it did nothing at all.
+        """
+        with self.lock:
+            for q, st in self.subs.items():
+                if st.get("id") == sid:
+                    new = apply(st)
+                    if new is not None:
+                        self.subs[q] = new
+                    return q, self.subs[q]
+        return None, None
 
     def publish_tick(self, render):
         """Render once per view someone is actually watching, and send each to its watchers.
@@ -200,39 +232,36 @@ class Hub:
         the old code rendered whatever the single global variable last said, whether or not any
         browser wanted it.
         """
-        for key in self.views():
-            view, needle = key
+        for q, st in self.views():
             try:
-                payload = render(view, needle)
+                payload = render(st["view"], st.get("needle", ""), st)
             except Exception:                                    # noqa: BLE001, PERF203
                 continue        # one broken panel must not stop the others being published
-            self.latest[key] = payload
-            with self.lock:
-                for q, k in list(self.subs.items()):
-                    if k == key:
-                        try:
-                            q.put_nowait(payload)
-                        except queue.Full:
-                            pass
+            self.latest[st["view"]] = payload
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
 
-    def subscribe(self, view, render=None, needle=""):
+    def subscribe(self, view, render=None, needle="", nav=None):
         """A queue already carrying a frame, so a new tab draws now rather than after one tick.
 
         The filter travels with the view for the same reason the view does: a page that types into
         a search box and then reconnects should not come back to an unfiltered panel.
         """
         q = queue.Queue(maxsize=4)
-        key = (view, needle)
         with self.lock:
-            self.subs[q] = key
+            self._n += 1
+            st = {"id": f"s{self._n}", "view": view, "needle": needle,
+                  **(nav or {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False})}
+            self.subs[q] = st
         payload = None
         if render:
             try:
-                payload = render(view, needle)
-                self.latest[key] = payload
+                payload = render(view, needle, st)
             except Exception:                                    # noqa: BLE001
                 payload = None
-        payload = payload or self.latest.get(key)
+        payload = payload or self.latest.get(view)
         if payload:
             q.put_nowait(payload)
         # Nothing is sent when there is nothing to send. A tab that connects before the first tick
@@ -267,6 +296,20 @@ def handler_for(hub, views, state, keys):
                 page = (PAGE.replace("__VIEWS__", json.dumps(views))
                             .replace("__KEYS__", json.dumps(keys)))
                 return self._send(200, page.encode())
+            if path == "/nav":
+                # The one thing SSE cannot do. A GET carrying which tab and which key, answered by
+                # rendering that tab immediately rather than at the next tick.
+                qs = urllib.parse.parse_qs(self.path.partition("?")[2])
+                sid = (qs.get("id") or [""])[0]
+                key = (qs.get("key") or [""])[0]
+                render = state.get("render")
+                q, st = hub.nav(sid, lambda s2: state["nav"](s2, key) if state.get("nav") else s2)
+                if q is not None and render:
+                    try:
+                        q.put_nowait(render(st["view"], st.get("needle", ""), st))
+                    except (queue.Full, Exception):              # noqa: BLE001
+                        pass
+                return self._send(200, b"ok", "text/plain")
             if path != "/stream":
                 return self._send(404, b"no", "text/plain")
             want = self.path.partition("view=")[2].split("&")[0] or "main"
@@ -316,8 +359,13 @@ def start(host, port, views, state, keys):
     return hub, srv
 
 
-def frame_payload(view, lines, cols=None, keys=None):
-    """One frame for the wire. `cols` pins the grid so every view scales identically on the page."""
+def frame_payload(view, lines, cols=None, keys=None, sid="", nav=False):
+    """One frame for the wire. `cols` pins the grid so every view scales identically on the page.
+
+    `sid` is how the tab learns which subscriber it is, so it can send keys back to /nav. `nav`
+    says this view answers to j/k at all, which is what stops the page from swallowing them on a
+    view where they do nothing.
+    """
     return json.dumps({"view": view, "svg": export.svg(lines, cols=cols),
-                       "hits": hits(lines, keys or {}),
+                       "hits": hits(lines, keys or {}), "id": sid, "nav": bool(nav),
                        "at": time.strftime("%H:%M:%S")}).encode()

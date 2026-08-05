@@ -85,6 +85,11 @@ def record(perf_dir, tool, args, ms, reply, ok=True, err=""):
     try:
         os.makedirs(perf_dir, exist_ok=True)
         text = reply if isinstance(reply, str) else json.dumps(reply, default=str)
+        # A tool that cannot answer returns {"error": ...} rather than raising - the pipe worked,
+        # the call did not - so `ok` cannot come from "did this raise" alone. It said True on three
+        # failed queries in a row and the view believed it.
+        if ok and isinstance(reply, dict) and reply.get("error"):
+            ok = False
         row = {"t": round(time.time(), 2), "tool": tool, "ms": round(ms, 1), "ok": bool(ok),
                "client": client(), "pid": os.getpid(),
                # Summarised HERE, with the whole object in hand. Doing it in the view means parsing
@@ -199,7 +204,20 @@ def counts(rows):
 # tells you nothing; the count of findings and what they are is the whole content. Reading a log of
 # calls is pointless if every row says only how many bytes came back.
 def digest(row):
-    """One line describing the reply. Recorded with the call; parsed only for older rows."""
+    """One line describing the reply. Recorded with the call; parsed for older rows.
+
+    A FAILED row is re-summarised from its reply even when it carries a summary, because rows
+    written before `detail` was used say only "query failed" - the category, not the message - and
+    those are exactly the rows someone is scrolling the log to read. The reply of a failure is
+    small, so it parses and costs nothing.
+    """
+    if row.get("summary") and not failed(row):
+        return row["summary"]
+    if failed(row) and row.get("reply"):
+        try:
+            return _summarize(json.loads(row["reply"]), "")
+        except ValueError:
+            pass
     if row.get("summary"):
         return row["summary"]
     if row.get("error"):
@@ -219,7 +237,11 @@ def _summarize(r, err=""):
     if not isinstance(r, dict):
         return f"{len(r)} items" if isinstance(r, list) else str(r)[:60]
     if r.get("error"):
-        return str(r["error"])[:64]               # already reads as a refusal; do not prefix it
+        # `detail` is where the server's own message lands; `error` alone is a category. "query
+        # failed" told a reader nothing, while "Table with name pg_compression does not exist!" is
+        # the entire finding.
+        why = str(r.get("detail") or "").strip().splitlines()
+        return (f"{r['error']}: {why[0]}" if why else str(r["error"]))[:110]
     if isinstance(r.get("findings"), list):
         w = ", ".join(str(f.get("what", "?")) for f in r["findings"][:2] if isinstance(f, dict))
         return f"{len(r['findings'])} findings" + (f": {w}" if w else "")
@@ -308,7 +330,7 @@ def sessions(rows, live_procs=None):
         s["calls"] += 1
         s["ms"] += r.get("ms") or 0
         s["bytes"] += r.get("bytes") or 0
-        if not r.get("ok", True) or (r.get("summary") or "").startswith(("error:", "refused")):
+        if failed(r):
             s["errors"] += 1
         s["tools"][r.get("tool", "?")] = s["tools"].get(r.get("tool", "?"), 0) + 1
         t = r.get("t")
@@ -327,6 +349,20 @@ def sessions(rows, live_procs=None):
     # Live first, then most recently active. A session still holding a process is the one you can
     # still do something about; a dead one is history.
     return sorted(by.values(), key=lambda s: (not s["live"], -(s["last"] or 0)))
+
+
+def failed(row):
+    """Did this call fail? True for a raise, an error reply, or an older row that predates `ok`.
+
+    One predicate rather than three tests scattered over the views, because the answer moved twice
+    already: it used to be "did it raise", then "does the reply carry an error", and rows written
+    under the old rule are still in the file.
+    """
+    if not row.get("ok", True):
+        return True
+    if row.get("error"):
+        return True
+    return (row.get("reply") or "").lstrip().startswith('{"error"')
 
 
 def calls_of(rows, pid):

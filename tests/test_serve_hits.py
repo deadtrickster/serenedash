@@ -99,3 +99,35 @@ def test_every_view_the_page_offers_has_a_branch_in_the_dispatch():
             served[name] = ["raised"]                            # a branch exists; it just needs data
     fell_through = [n for n, out in served.items() if out is marker]
     assert not fell_through, f"no branch in view_lines for: {fell_through}"
+
+
+def test_the_served_javascript_carries_no_control_characters():
+    # PAGE is an ordinary Python string, so an escape written into the JS - `\r` for Enter, `\x1b`
+    # for Escape - becomes a REAL control byte in the served text, inside the string literal it
+    # sits in. The page then throws "Invalid or unexpected token" before drawing anything, and
+    # every browser test errors at the fixture with no hint of why. Keys travel by name instead.
+    bad = [(i, repr(ln)) for i, ln in enumerate(PAGE.splitlines(), 1)
+           if any(c in ln for c in ("\r", "\x1b", "\x00", "\b", "\f", "\v"))]
+    assert not bad, f"control characters in the served page: {bad}"
+
+
+def test_the_served_javascript_parses():
+    # A syntax error in the page is invisible from Python and fatal in a browser. node is in mise
+    # here and on the runner; where it is not, this skips rather than pretending to have checked.
+    import json
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("no node to parse the page with")
+    page = (PAGE.replace("__VIEWS__", json.dumps(["main", "mcp"]))
+                .replace("__KEYS__", json.dumps({"n": "mcp"})))
+    js = re.search(r"<script>(.*)</script>", page, re.S).group(1)
+    with tempfile.NamedTemporaryFile("w", suffix=".js") as f:
+        f.write(js)
+        f.flush()
+        out = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
+    assert out.returncode == 0, f"the served page does not parse:\n{out.stderr}"

@@ -13,7 +13,7 @@ import os
 
 from serenedash import mcplog
 from serenedash.fmt import strip
-from serenedash.views import DETAIL, KEYS, mcp_frame
+from serenedash.views import DETAIL, KEYS, mcp_frame, mcp_nav
 
 
 def call(perf, tool="status", **kw):
@@ -243,3 +243,170 @@ def test_nothing_is_recorded_unless_a_client_is_on_the_other_end():
     from serenedash import mcp_server
 
     assert mcp_server._SERVING is False, "importing this module must not turn recording on"
+
+
+# ---- the navigation reducer, which BOTH front ends drive ---------------------------------------
+# It exists because the page answered to none of these keys: j and k worked in the terminal and did
+# nothing in a browser, on the one view built around moving through a list.
+
+def nav_rows(pid=7, n=4):
+    return [{"t": 1785000000 + i, "tool": "status", "ms": 1, "ok": True, "pid": pid,
+             "client": "claude", "args": "", "bytes": 9, "reply": "{}"} for i in range(n)]
+
+
+def start():
+    return {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False}
+
+
+def test_j_and_k_move_the_session_cursor():
+    rows = nav_rows(7) + nav_rows(9)
+    n = mcp_nav(start(), "j", rows)
+    assert n["sel"] == 1
+    assert mcp_nav(n, "k", rows)["sel"] == 0
+
+
+def test_the_cursor_stops_at_both_ends_rather_than_wrapping():
+    rows = nav_rows(7) + nav_rows(9)
+    n = start()
+    for _ in range(10):
+        n = mcp_nav(n, "j", rows)
+    assert n["sel"] == 1, "two sessions, so 1 is the last one"
+    for _ in range(10):
+        n = mcp_nav(n, "k", rows)
+    assert n["sel"] == 0
+
+
+def test_enter_descends_and_escape_climbs_back():
+    rows = nav_rows(7)
+    opened = mcp_nav(start(), "\r", rows)
+    assert opened["open"] == 7
+    popped = mcp_nav(opened, "\r", rows)
+    assert popped["popup"] is True
+    assert mcp_nav(popped, "\x1b", rows)["popup"] is False
+    assert mcp_nav(opened, "\x1b", rows)["open"] is None
+
+
+def test_escape_with_nothing_open_is_not_ours():
+    # None is how the caller tells "I handled it" from "this Esc is yours", which is what keeps Esc
+    # leaving the view when nothing is open.
+    assert mcp_nav(start(), "\x1b", nav_rows()) is None
+
+
+def test_inside_the_box_j_scrolls_the_reply_and_enter_does_nothing():
+    # A key that looks like it should do something and does not is worse than one that is not bound.
+    rows = nav_rows(7)
+    box = mcp_nav(mcp_nav(start(), "\r", rows), "\r", rows)
+    scrolled = mcp_nav(box, "j", rows)
+    assert scrolled["scroll"] == 1 and scrolled["popup"] is True
+    assert mcp_nav(scrolled, "\r", rows)["scroll"] == 1, "enter must not descend or reset"
+    assert mcp_nav(scrolled, "k", rows)["scroll"] == 0
+    assert mcp_nav(start() | {"popup": True}, "k", rows)["scroll"] == 0, "no scrolling past the top"
+
+
+def test_the_call_cursor_follows_the_newest_until_you_move_it():
+    rows = nav_rows(7, 4)
+    opened = mcp_nav(start(), "\r", rows)
+    assert opened["call"] == -1, "-1 means the newest and keeps meaning it as calls arrive"
+    up = mcp_nav(opened, "k", rows)
+    assert up["call"] == 2
+    assert mcp_nav(up, "j", rows)["call"] == -1, "back on the newest resumes following it"
+    assert mcp_nav(up, "end", rows)["call"] == -1
+
+
+def test_the_reducer_never_mutates_what_it_was_given():
+    # Both front ends hold their own copy; a reducer that mutated would move a terminal's cursor
+    # when a browser pressed a key.
+    n = start()
+    mcp_nav(n, "j", nav_rows())
+    assert n == start()
+
+
+def test_a_page_key_goes_through_the_same_reducer_as_a_terminal_key(tmp_path):
+    # The actual bug: two front ends, one meaning per key. The page's copy was an empty set.
+    from serenedash.tui import NAV_KEYS as TUI_NAV, _web_nav
+
+    perf = str(tmp_path)
+    mcplog.record(perf, "status", {}, 1.0, {"findings": []})
+    st = {"view": "mcp", "id": "s1", **start()}
+    # Not asserting WHICH session opens: this machine has real serenedash-mcp processes running and
+    # they are sessions too. What must hold is that enter descends and esc climbs back.
+    opened = _web_nav(st, "\r", perf)
+    assert opened["open"] is not None
+    assert _web_nav(opened, "\x1b", perf)["open"] is None
+    assert _web_nav(opened, "j", perf)["open"] == opened["open"], "j inside a session stays in it"
+    # Esc with nothing left open leaves the view, which is what it does in the terminal too.
+    assert _web_nav(st, "\x1b", perf)["view"] == "main"
+    assert "j" in TUI_NAV and "\x1b" in TUI_NAV
+
+
+def test_a_view_with_nothing_to_move_does_not_swallow_the_keys(tmp_path):
+    # `j` is not bound on the storage panel, and a page that took it to do nothing would be worse
+    # than one that let it fall through.
+    from serenedash.tui import NAVIGABLE, _web_nav
+
+    st = {"view": "storage", "id": "s1", **start()}
+    assert _web_nav(st, "j", str(tmp_path)) == st
+    assert "storage" not in NAVIGABLE and "mcp" in NAVIGABLE
+
+
+# ---- failures have to be impossible to miss ----------------------------------------------------
+# Found on a real session: nine calls, three failed SQL, and nothing anywhere said so.
+
+FAILED_REPLY = {"error": "query failed",
+                "detail": 'Table with name pg_compression does not exist!\nDid you mean "pg_conversion"?'}
+
+
+def test_a_tool_that_returns_an_error_did_not_succeed(tmp_path):
+    # `ok` cannot come from "did this raise": a tool that cannot answer returns {"error": ...}, so
+    # the pipe worked and the call did not. It said True on three failed queries in a row.
+    perf = str(tmp_path)
+    mcplog.record(perf, "query", {"sql": "select bogus"}, 40.0, FAILED_REPLY)
+    r = mcplog.tail(perf)[0]
+    assert r["ok"] is False and mcplog.failed(r)
+
+
+def test_the_digest_carries_the_message_not_the_category(tmp_path):
+    # "query failed" told a reader nothing. The server's own message is in `detail`.
+    perf = str(tmp_path)
+    mcplog.record(perf, "query", {"sql": "select bogus"}, 40.0, FAILED_REPLY)
+    assert mcplog.digest(mcplog.tail(perf)[0]) == (
+        "query failed: Table with name pg_compression does not exist!")
+
+
+def test_a_row_written_before_ok_was_trustworthy_still_reads_as_failed(tmp_path):
+    # The log outlives the rule that wrote it: these rows are in the real file right now, marked
+    # ok=True with a summary of "query failed".
+    perf = str(tmp_path)
+    with open(mcplog.path(perf), "w") as f:
+        f.write(json.dumps({"t": 1785000000, "tool": "query", "ms": 40.0, "ok": True, "pid": 7,
+                            "client": "claude", "args": "sql=select bogus", "bytes": 240,
+                            "summary": "query failed",
+                            "reply": json.dumps(FAILED_REPLY)}) + "\n")
+    r = mcplog.tail(perf)[0]
+    assert mcplog.failed(r), "an older row must not read as a success"
+    assert "does not exist" in mcplog.digest(r), "and it must still say why"
+
+
+def test_a_failure_is_marked_in_the_list_and_counted_in_both_headers():
+    good = {"t": 1785000000, "tool": "query", "ms": 5, "ok": True, "pid": 7, "client": "c",
+            "args": "sql=select 1", "bytes": 9, "reply": '{"rows": [[1]]}', "summary": "1 rows"}
+    bad = {**good, "t": 1785000060, "ok": False, "reply": json.dumps(FAILED_REPLY),
+           "args": "sql=select bogus", "summary": "query failed"}
+    calls = [strip(x) for x in mcp_frame([good, bad], [], False, 150, 0, 0, 20, open_pid=7)]
+    marked = [ln for ln in calls if "✗" in ln]
+    assert len(marked) == 1, "a glyph, not only a colour - colour is gone in a screenshot"
+    assert "does not exist" in marked[0], "the reason has to be ON the row"
+    assert any("1 failed" in ln for ln in calls), "the session header has to carry the count"
+    sess = [strip(x) for x in mcp_frame([good, bad], [], False, 150, 0, 0, 20)]
+    assert any("1 failed" in ln for ln in sess), "and so does the level you look at first"
+
+
+def test_the_reason_comes_before_the_sql_on_a_failed_row():
+    # A 120-character SELECT pushed the message off the end of the line, which is the whole content
+    # of a failure. Argument-then-result is the right order only for a call that worked.
+    bad = {"t": 1785000000, "tool": "query", "ms": 5, "ok": False, "pid": 7, "client": "c",
+           "args": "sql=" + "SELECT table_name, column_name FROM information_schema.columns " * 3,
+           "bytes": 9, "reply": json.dumps(FAILED_REPLY), "summary": "query failed"}
+    row = next(strip(x) for x in mcp_frame([bad], [], False, 150, 0, 0, 20, open_pid=7)
+               if "✗" in strip(x))
+    assert row.index("does not exist") < row.index("SELECT")

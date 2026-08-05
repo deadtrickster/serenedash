@@ -19,7 +19,7 @@ from serenedash.serve import PAGE, Hub, frame_payload
 from serenedash.views import DETAIL
 
 
-def render(name, needle=""):
+def render(name, needle="", st=None):
     return frame_payload(name, [f"frame for {name}{' /' + needle if needle else ''}",
                                 "q quit  s storage"],
                          cols=40, keys={k: v for v, k in DETAIL.items()})
@@ -60,13 +60,13 @@ def test_nothing_is_rendered_for_a_view_nobody_is_watching():
     hub = Hub()
     hub.subscribe("logs", render)
     asked = []
-    hub.publish_tick(lambda name, q="": asked.append(name) or render(name, q))
+    hub.publish_tick(lambda name, q="", st=None: asked.append(name) or render(name, q))
     assert asked == ["logs"]
 
 
 def test_no_browser_connected_means_no_render_at_all():
     hub = Hub()
-    hub.publish_tick(lambda name, q="": pytest.fail(f"rendered {name} with nobody watching"))
+    hub.publish_tick(lambda name, q="", st=None: pytest.fail(f"rendered {name}, nobody watching"))
 
 
 def test_a_view_that_raises_does_not_stop_the_others():
@@ -74,7 +74,7 @@ def test_a_view_that_raises_does_not_stop_the_others():
     good = hub.subscribe("storage", render)
     hub.subscribe("logs", render)
     good.get_nowait()
-    def half_broken(name, needle=""):
+    def half_broken(name, needle="", st=None):
         if name == "logs":
             raise RuntimeError("the log source went away")
         return render(name)
@@ -96,7 +96,7 @@ def test_unsubscribing_stops_the_work():
     hub = Hub()
     q = hub.subscribe("logs", render)
     hub.unsubscribe(q)
-    hub.publish_tick(lambda name, q="": pytest.fail(f"rendered {name} after the tab closed"))
+    hub.publish_tick(lambda name, q="", st=None: pytest.fail(f"rendered {name} after close"))
 
 
 def test_the_filter_travels_with_the_view():
@@ -106,7 +106,7 @@ def test_the_filter_travels_with_the_view():
     a, b = hub.subscribe("logs", render, "ERROR"), hub.subscribe("logs", render)
     assert json.loads(a.get_nowait())["svg"] != json.loads(b.get_nowait())["svg"]
     seen = []
-    hub.publish_tick(lambda name, q="": seen.append((name, q)) or render(name, q))
+    hub.publish_tick(lambda name, q="", st=None: seen.append((name, q)) or render(name, q))
     assert sorted(seen) == [("logs", ""), ("logs", "ERROR")]
 
 
