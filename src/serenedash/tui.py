@@ -15,7 +15,9 @@ from .config import config_files, load_config
 from .fmt import C, HIST, NOCOLOR
 from .anomaly import index as anom_index
 from .hover import describe, panel_at, place, tip_box
+from . import export as exporter
 from . import history
+from . import serve as _serve
 from . import snapshot as snap
 from .db import apply_setting, full_queries, query, sample, search, sql_status, temp_files_held
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
@@ -165,6 +167,64 @@ def mouse_event(code, fin):
     return ("mouse", x - 1, y - 1, "press" if fin == "M" else "release")
 
 
+def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
+               full=None):
+    """One view by name, or the main frame. The single dispatch both the export and --serve use.
+
+    The terminal has its own dispatch inside the loop because it also owns scroll, selection and the
+    key bar. This one is for consumers that just want a panel: give it a name, get its lines.
+    """
+    if name == "main" or (name in NEEDS_SQL and s is None):
+        return lines
+    if name == "storage":
+        return storage_frame(s, sz, hinfo, col, w, 0)
+    if name == "memory":
+        return memory_frame(s, hist, hinfo, col, w, 0)
+    if name == "activity":
+        return activity_frame(s, col, w, 0, full=full)
+    if name == "search":
+        return search_frame(sea, col, w, 0) if sea else lines
+    if name == "threads":
+        return threads_frame(thr, tcpu, perf[2], hinfo, col, w, 0)
+    if name == "profile":
+        return profile_frame(perf, col, w, 0)
+    if name == "host":
+        return host_frame(hinfo, s, col, w, 0)
+    if name == "doctor":
+        return doctor_frame(*doctor(cfg, perf_dir), col, w, 0)
+    if name == "legend":
+        return legend_frame(col, w, 0)
+    return lines
+
+
+def export(a, cfg, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, held, w):
+    """The frames as SVG, or as one page carrying every panel.
+
+    Built from the SAME frame functions the terminal draws, so an export cannot say something the
+    dashboard does not - the rule that keeps `--format json` and the MCP server honest, applied to
+    a third consumer. `svg` is the main frame alone, for dropping into a document; `html` is the
+    whole dashboard, which is the one worth looking at.
+    """
+    if a.format == "svg":
+        return exporter.svg(lines).rstrip()
+    col = True
+    views = [("main", lines),
+             ("storage", storage_frame(s, sz, hinfo, col, w, 0) if s else []),
+             ("memory", memory_frame(s, hist, hinfo, col, w, 0) if s else []),
+             ("activity", activity_frame(s, col, w, 0, full=full_queries(cfg)) if s else []),
+             ("search", search_frame(sea, col, w, 0) if sea else []),
+             ("threads", threads_frame(thr, tcpu, perf[2], hinfo, col, w, 0)),
+             ("profile", profile_frame(perf, col, w, 0)),
+             ("host", host_frame(hinfo, s, col, w, 0)),
+             ("doctor", doctor_frame(*doctor(cfg, a.perf_dir), col, w, 0)),
+             ("legend", legend_frame(col, w, 0))]
+    when = time.strftime("%Y-%m-%d %H:%M:%S")
+    where = f"{cfg['container']}:{cfg['port']}"
+    return exporter.page(views, title=f"serenedash · {where}",
+                         subtitle=f"{when} · rendered at {w} columns · every panel as the terminal "
+                                  f"draws it")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -173,8 +233,18 @@ def main():
     # the config file would be unreachable for any value that happened to match a default.
     ap.add_argument("-n", "--interval", type=float, default=None)
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--format", choices=("text", "json"), default="text",
-                    help="--once only. json emits the same structure the MCP server returns.")
+    ap.add_argument("--format", choices=("text", "json", "html", "svg"), default="text",
+                    help="--once only. json emits the same structure the MCP server returns; "
+                         "html is every panel as one page; svg is the main frame alone, for "
+                         "embedding. Both keep colour regardless of where the output is going.")
+    ap.add_argument("--width", type=int, default=None,
+                    help="columns to render for --format html/svg, when the exporting terminal is "
+                         "not the size you want to look at")
+    ap.add_argument("--serve", metavar="[HOST:]PORT", default=None,
+                    help="also serve the dashboard as a live page. Frames are pushed over "
+                         "server-sent events, so a browser draws whatever the terminal draws, at "
+                         "the same interval. Read-only, and it binds 127.0.0.1 unless told "
+                         "otherwise.")
     ap.add_argument("--no-color", action="store_true")
     # Both directions, and neither defaults — otherwise the flag could not lose to the config file,
     # which is the layer someone who does not want tooltips will actually set.
@@ -218,7 +288,7 @@ def main():
         return 0
     a.container, a.port, a.password = cfg["container"], cfg["port"], cfg["password"]
     a.data, a.perf_dir, a.interval = cfg["data"], cfg["perf_dir"], cfg["interval"]
-    col = not a.no_color and sys.stdout.isatty()
+    col = (not a.no_color) and (sys.stdout.isatty() or a.format in ("html", "svg"))
 
     prev, sz, tick, shown, fresh, s = None, {}, 0, [], True, None
     sea, held = None, None
@@ -248,6 +318,17 @@ def main():
     # screen with no cursor — the same shape of bug as a destructor that never gets to clean up.
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(0))
+    hub = wsrv = None
+    wstate = {"view": "main"}
+    if a.serve:
+        # 127.0.0.1 unless a host is given. This exposes storage sizes, statement text and settings
+        # with no authentication, so the default must not be the whole network - binding wider is a
+        # decision someone makes deliberately by typing it.
+        host, _, port = a.serve.rpartition(":")
+        # DETAIL already carries doctor and legend; listing them again put doctor in the nav twice.
+        hub, wsrv = _serve.start(host or "127.0.0.1", int(port),
+                                 ["main", *sorted(DETAIL)], wstate)
+        print(f"serving http://{host or '127.0.0.1'}:{int(port)}/", file=sys.stderr)
     pidfile = write_pidfile(a.perf_dir)
     # Raw-ish mode for the whole session, not per keystroke. Restored in the finally below, in the
     # same breath as the cursor and the alternate screen.
@@ -319,6 +400,11 @@ def main():
                                                {k: v[-1] for k, v in hist.items() if v})
             tsz = shutil.get_terminal_size((100, 40))
             w, h = tsz.columns, tsz.lines
+            # An export is read in a browser, not in this terminal, so the exporting terminal's
+            # width is the wrong thing to inherit. 168 columns is where the paired panels and the
+            # widest tails all fit; --width overrides it.
+            if a.format in ("html", "svg"):
+                w, h = (a.width or 168), max(h, 44)
             # A resize invalidates every line on screen, but the redraw below only rewrites the
             # ones whose TEXT changed — so after growing the terminal the old frame sat there in
             # pieces until each line happened to differ. Clear once and repaint in full.
@@ -405,8 +491,28 @@ def main():
                               sea, held)
             prev = s
             tick += 1
+            if hub is not None and fresh:
+                # Only on the data tick. A keypress or a pointer move redraws the terminal; it does
+                # not change what the server measured, and pushing a frame per mouse cell would be
+                # the same mistake the activity view made by re-fetching per redraw.
+                try:
+                    wname, ww = wstate["view"], (a.width or 168)
+                    # The main frame has to be rebuilt at the export width. Handing the browser the
+                    # terminal's frame made the page follow whatever size this window happened to
+                    # be, so a 100-column terminal served a 100-column dashboard to a 4K display.
+                    wmain = (frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, True, ww, 44, why,
+                                   sea, held) if s is not None or wname == "main" else lines)
+                    wl = view_lines(wname, cfg, a.perf_dir, wmain, s, sz, hist, perf, thr, tcpu,
+                                    hinfo, sea, True, ww,
+                                    full=full_queries(cfg) if wname == "activity" else None)
+                    hub.publish(_serve.frame_payload(wname, wl))
+                except Exception:                                # noqa: BLE001
+                    pass          # a browser must never be able to take the terminal down with it
             if a.once:
-                print("\n".join(lines))
+                if a.format in ("html", "svg"):
+                    print(export(a, cfg, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, held, w))
+                else:
+                    print("\n".join(lines))
                 return 0
             for i, ln in enumerate(lines):
                 if i >= len(shown) or shown[i] != ln:

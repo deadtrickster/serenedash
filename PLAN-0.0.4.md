@@ -17,6 +17,14 @@ Feasible. Both hard dependencies exist and I checked them rather than assuming:
   `src/proto/SASLInitialResponse.zig`, connection pool, actively maintained (last commit
   2026-07-22). Two small dependencies of its own.
 
+- **The web dashboard, added in 0.0.3.** `--format html`, `--format svg` and `--serve` mean the Zig
+  port also needs an HTTP server that can hold a `text/event-stream` open. Two options, both
+  checked by building rather than by reading: **`std.http.Server`** exists in 0.16 and is enough for
+  SSE, since SSE is an ordinary response that never ends. **`karlseguin/http.zig`** is 12,934 lines,
+  last commit 2026-08-03, and carries a websocket module if that is ever wanted. The SVG export
+  itself is pure string building and ports directly - `export.py` is deliberately a pure function
+  from ANSI lines to a document, with no terminal in it.
+
 The standing rule holds: use a library for the wire protocol, do not implement pg proto.
 
 **MCP is the problem, and not for the reason I first assumed.** There *is* a Zig SDK -
@@ -125,6 +133,11 @@ Differential-test it against Python from the first commit.
 **pure** - a function from snapshot to `[][]const u8` - with zigzag only doing input, the event loop
 and the diffed write. That keeps the widget layer swappable, which matters (see the risk below) and
 also makes the layout testable without a pty, exactly as `test_views.py` does today.
+
+**2b. The export and the server.** Cheap, and worth doing early rather than late: `export.py` is a
+pure function from ANSI lines to SVG, so it ports with no terminal involved and gives you a way to
+LOOK at the Zig renderer's output in a browser, beside Python's, before any of it drives a real
+terminal. That is differential testing you can see rather than diff.
 
 **3. MCP.** Last, because it is the most protocol and the least shared logic. `@embedFile` for
 `instructions.md`; it is already a data file and should stay one.
