@@ -472,3 +472,106 @@ def test_findings_has_a_key_and_follow_moved_off_it():
     # `f` was the logs follow toggle. A letter that means one thing globally and another inside one
     # panel means two things; follow is on space now, which is what a pager uses anyway.
     assert DETAIL["findings"] == "f" and ("f", "findings") in KEYS
+
+
+def test_doctors_checks_are_findings_on_the_same_screen():
+    # They were two views because they answer different questions - "can this dashboard measure
+    # anything" and "what did it measure" - but that distinction is the tool's, not the reader's.
+    # Both are: a comparison ran, it came out a particular way, here is what to do.
+    from serenedash.snapshot import setup_findings
+    from serenedash.views import findings_frame
+
+    rows = [("ok", "server", "oracle-serenedb:7890", ""),
+            ("warn", "open files", "soft 65535 of a documented 131072", "raise LimitNOFILE"),
+            ("info", "kernel symbols", "kptr_restrict=1", "")]
+    got = setup_findings(rows, ("register", "/tmp/serened"))
+    assert [f["kind"] for f in got] == ["setup"] * 3
+    assert [f["severity"] for f in got] == [0, 1, 1], "ok is 0; info is NOT a pass"
+    out = [strip(x) for x in findings_frame(FOUND + got, False, 150, 0, 0, 30)]
+    assert "5 findings" in out[0] and "1 checks passed" in out[0]
+
+
+def test_a_passed_check_stays_on_the_list_but_below_everything_that_tripped():
+    # The half `doctor` existed for: silence about a passing check reads exactly like never having
+    # run it. It stays, dim, at the bottom - a screen that opens on twelve green rows makes you
+    # scroll to find the one red one.
+    from serenedash.snapshot import setup_findings
+    from serenedash.views import findings_frame
+
+    got = setup_findings([("ok", "perf", "installed", "")] * 3
+                         + [("fail", "server", "unreachable", "start it")])
+    body = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20)][2:-2]
+    assert "server" in body[0], "the failure has to be first"
+    assert all("passed" in ln for ln in body[1:4])
+
+
+def test_the_summary_line_is_the_same_count_as_the_screen():
+    # It is that header, shortened - not a second thing counting the same findings its own way.
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import findings_frame, summary_line
+
+    line = strip(summary_line(FOUND, NOCOLOR, 120))
+    head = strip(findings_frame(FOUND, False, 120, 0, 0, 20)[0])
+    for kind in ("storage", "memory", "setting"):
+        assert (f"1 {kind}" in line) == (f"1 {kind}" in head), kind
+    assert "3 finding" in line and "3 finding" in head
+
+
+def test_the_summary_says_so_when_nothing_tripped_rather_than_going_quiet():
+    from serenedash.fmt import NOCOLOR
+    from serenedash.snapshot import setup_findings
+    from serenedash.views import summary_line
+
+    ok = setup_findings([("ok", "perf", "installed", "")] * 4)
+    assert "nothing tripped" in strip(summary_line(ok, NOCOLOR, 120))
+    assert "4 passed" in strip(summary_line(ok, NOCOLOR, 120))
+    assert "nothing measured yet" in strip(summary_line([], NOCOLOR, 120))
+
+
+def test_the_summary_line_is_a_centred_rule_that_spans_the_frame():
+    # A bare sentence floating above the frame read as something that had leaked onto the screen.
+    # Drawn as a rule for the same reason the panels are drawn as boxes, and centred without a
+    # label: the counts say what it is, and the key bar already lists every key there is.
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import summary_line
+
+    top = strip(summary_line(FOUND, NOCOLOR, 120))
+    assert top.startswith("─") and top.endswith("─")
+    assert len(top) == 120 or len(top) == 119, f"{len(top)} of a 120-column frame"
+    assert "status" not in top and " f " not in top, "the label and the key hint are noise"
+    left = len(top) - len(top.lstrip("─"))
+    right = len(top) - len(top.rstrip("─"))
+    assert abs(left - right) <= 1, f"not centred: {left} vs {right}"
+
+
+def test_the_summary_rule_fits_every_width():
+    # It is one line and it has to stay one line: a rule that wraps puts a stray half-rule under
+    # the top of the frame on every redraw.
+    from serenedash.fmt import NOCOLOR
+    from serenedash.snapshot import setup_findings
+    from serenedash.views import summary_line
+
+    lots = FOUND + setup_findings([("warn", f"check {i}", "detail", "") for i in range(9)])
+    for w in (60, 80, 100, 168, 300):
+        line = strip(summary_line(lots, NOCOLOR, w))
+        assert "\n" not in line and len(line) <= w, f"{len(line)} at width {w}"
+
+
+def test_d_still_reaches_the_screen_it_used_to_open():
+    from serenedash.views import ALIAS, DETAIL
+
+    assert "doctor" not in DETAIL, "one screen now"
+    assert ALIAS["d"] == "findings", "the fingers do not know that"
+
+
+def test_a_finding_that_can_be_fixed_from_here_says_so():
+    from serenedash.snapshot import setup_findings
+    from serenedash.views import findings_frame
+
+    got = setup_findings([("warn", "symbols", "no build-ids registered", "extract the binary")],
+                         ("extract", "/tmp/serened"))
+    assert got[0]["action"] == ("extract", "/tmp/serened")
+    out = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20)]
+    assert any("r" in ln and "runs the fix" in ln for ln in out)
+    opened = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20, True)]
+    assert any("press r" in ln for ln in opened)

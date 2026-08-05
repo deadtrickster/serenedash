@@ -27,16 +27,17 @@ from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
 from .views import (
+    ALIAS,
     DETAIL,
     activity_frame,
     config_frame,
-    doctor_frame,
     frame,
     host_frame,
     legend_frame,
     logs_frame,
     NAV_KEYS,
     findings_frame,
+    summary_line,
     findings_nav,
     list_nav,
     mcp_frame,
@@ -255,7 +256,10 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
     if name == "host":
         return host_frame(hinfo, s, col, w, 0)
     if name == "doctor":
-        return doctor_frame(*doctor(cfg, perf_dir), col, w, 0)
+        # The name is kept as an ALIAS of findings, so an old link or a stored `?view=doctor`
+        # still resolves rather than falling through to the main frame.
+        return findings_frame([*hazards, *snap.setup_findings(*doctor(cfg, perf_dir))],
+                              col, w, 0, 0, WEB_ROWS)
     if name == "legend":
         return legend_frame(col, w, 0)
     if name == "findings":
@@ -295,7 +299,9 @@ def export(a, cfg, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, held, w):
              ("threads", threads_frame(thr, tcpu, perf[2], hinfo, col, w, 0)),
              ("profile", profile_frame(perf, col, w, 0)),
              ("host", host_frame(hinfo, s, col, w, 0)),
-             ("doctor", doctor_frame(*doctor(cfg, a.perf_dir), col, w, 0)),
+             ("findings", findings_frame(
+                 [*snap.findings(s, sz, hinfo, None, sr=snap.search(sea), held=held),
+                  *snap.setup_findings(*doctor(cfg, a.perf_dir))], col, w, 0, 0, 44)),
              ("legend", legend_frame(col, w, 0))]
     when = time.strftime("%Y-%m-%d %H:%M:%S")
     where = f"{cfg['container']}:{cfg['port']}"
@@ -376,7 +382,7 @@ def main():
     crows = []
     thr, tcpu, tprev, tlast = [], 0.0, {}, time.time()
     hinfo, wh = {}, (0, 0)
-    drows, dfix, dmsg, fullq = None, None, None, None
+    drows, dfix, fullq = None, None, None
     why, recording = None, True
     # Follow is the default and pausing FREEZES the buffer rather than just holding an offset. An
     # offset from the end drifts as lines arrive - you stay N lines from the newest while the lines
@@ -499,6 +505,11 @@ def main():
                                                {k: v[-1] for k, v in hist.items() if v})
             tsz = shutil.get_terminal_size((100, 40))
             w, h = tsz.columns, tsz.lines
+            # One row for the summary line, which is prepended after every branch below has built
+            # its frame. Taken here rather than subtracted in each branch: they all size themselves
+            # from `h`, and a height that is right in six places and wrong in the seventh is how
+            # the 80x24 terminal came to be handed 27 lines.
+            h = max(4, h - 3)
             # An export is read in a browser, not in this terminal, so the exporting terminal's
             # width is the wrong thing to inherit. 168 columns is where the paired panels and the
             # widest tails all fit; --width overrides it.
@@ -523,15 +534,6 @@ def main():
             # Every panel has a view behind it, keyed by its own name. They share one shape:
             # build the whole thing, slice to the window, and end with the status bar carrying
             # the key that goes back — so no view is a place you can get stuck.
-            elif view == "doctor":
-                if drows is None or fresh:
-                    drows, dfix = doctor(cfg, a.perf_dir)
-                keybar = status(cc, w, f"{cc['b']}d{cc['r']} {cc['dim']}back{cc['r']}"
-                                + (f"  {cc['dim']}·{cc['r']}  {cc['b']}r{cc['r']} "
-                                   f"{cc['dim']}register symbols{cc['r']}" if dfix else ""))
-                body = doctor_frame(drows, dfix, col, w, scroll, dmsg)
-                lines = body[:max(1, h - len(keybar))]
-                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
             elif view in DETAIL and s is None and view in NEEDS_SQL:
                 # Reachable: its key still works, and a view that refuses to open reads as a broken
                 # key rather than as a missing connection. It says which of the two it is.
@@ -557,8 +559,12 @@ def main():
                     lrows, lsrc, lwhy = _logs.tail(cfg, 400)   # first entry, before any data tick
                 if view == "mcp" and (fresh or not mrows):
                     mrows, mlive = _mcplog.tail(a.perf_dir), _mcplog.live()
+                # On demand, as it always was: each run shells out and samples the server, which is
+                # not something to do on a tick for a panel nobody has open.
+
                 body = {"findings": lambda: findings_frame(
-                            hazards, col, w, fnav["scroll"], fnav["sel"], h - 1, fnav["open"]),
+                            hazards + snap.setup_findings(drows, dfix), col, w, fnav["scroll"],
+                            fnav["sel"], h - 1, fnav["open"]),
                         "mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
                                                  mnav["sel"], h - 1, mnav["open"], mnav["call"],
                                                  mnav["popup"]),
@@ -602,6 +608,15 @@ def main():
             else:
                 lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why,
                               sea, held)
+            if drows is None:
+                # Once, at startup. These are preconditions - kernel settings, whether perf is
+                # installed, whether any build-id is registered - and they do not change on a 5s
+                # tick, but the summary line counts them, so collecting them only when the findings
+                # screen is opened made the top line say 4 findings and then jump to 8.
+                try:
+                    drows, dfix = doctor(cfg, a.perf_dir)
+                except Exception:                                # noqa: BLE001
+                    drows, dfix = [], None
             if fresh:
                 # The same list `status()` returns, from the data this tick already has. One
                 # producer, so the screen and the MCP tool cannot disagree about what tripped.
@@ -609,6 +624,10 @@ def main():
                     hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea), held=held)
                 except Exception:                                # noqa: BLE001
                     hazards = []      # a findings screen must not be able to take the frame down
+            # Pinned to the top of every view, the way the key bar is pinned to the bottom. What is
+            # wrong with the server is not a property of the panel you happen to be reading.
+            lines = ["", summary_line(hazards + snap.setup_findings(drows, dfix), cc, w),
+                     "", *lines]
             prev = s
             tick += 1
             if hub is not None and fresh:
@@ -749,16 +768,23 @@ def main():
                     edit += k
                 shown = [None] * len(shown)
                 continue
-            if k == "r" and view == "doctor" and dfix:
-                kind, arg = dfix
+            if k == "r" and view == "findings":
+                # The action belongs to a row now, not to a view. Only the row that carries one
+                # does anything, which is why the hint appears on that row and nowhere else.
+                _shown = sorted(hazards + snap.setup_findings(drows, dfix),
+                                key=lambda f: -f.get("severity", 1))
+                act = _shown[fnav["sel"]].get("action") if fnav["sel"] < len(_shown) else None
+                if not act:
+                    continue
+                kind, arg = act
                 if kind == "extract":
                     # docker cp first: the binary in the container is the one that produced the
                     # capture, so no build has to be found or matched.
                     dest, err = extract_container_binary(
                         cfg, arg, os.path.join(cfg["perf_dir"], "binaries"))
-                    dmsg = (False, err) if err else register_symbols(dest)
+                    _ = (False, err) if err else register_symbols(dest)
                 else:
-                    dmsg = register_symbols(arg)
+                    _ = register_symbols(arg)
                 drows, dfix = doctor(cfg, a.perf_dir)
                 perf_window.__defaults__[-1].clear()   # drop parses made before symbols resolved
                 shown = [None] * len(shown)
@@ -863,6 +889,9 @@ def main():
             # reached that its own key does not leave.
             bykey = {v: n for n, v in DETAIL.items()}
             bykey.update({"g": "graph", "c": "config"})
+            # `d` was doctor for as long as there was a doctor view. It is the same screen now, and
+            # the fingers do not know that - so the key still lands there rather than doing nothing.
+            bykey.update(ALIAS)
             if k in bykey:
                 view = "main" if view == bykey[k] else bykey[k]
                 scroll, shown = 0, [None] * len(shown)

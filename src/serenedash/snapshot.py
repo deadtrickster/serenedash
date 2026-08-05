@@ -535,3 +535,30 @@ def collect(cfg, thread_window=1.0, query_head=400, hist=None):
     out["activity"] = activity(s, query_head, prog)
     out["config"] = {n: s["settings"].get(n) for n in sorted(HAZARDS)}
     return out
+
+
+# Doctor's own status words, mapped onto the one thing a findings row needs to know: did this trip.
+# `info` is neither - it is "could not be checked", which AGENTS.md is emphatic about not reporting
+# as a pass.
+TRIPPED = {"fail": 2, "warn": 1, "info": 1, "ok": 0}
+
+
+def setup_findings(rows, fix=None):
+    """`symbols.doctor` rows as findings, so one screen carries both.
+
+    A doctor row is (status, name, detail, fix) and a finding is what/detail/kind plus its numbers -
+    the same claim in a different shape. The status becomes `severity`, which is the field the list
+    sorts on, and the runnable remedy travels as `action` so the screen can offer to do it rather
+    than only print a command.
+    """
+    out = []
+    for status, name, detail, remedy in rows or []:
+        f = {"kind": "setup", "what": name, "detail": detail or "",
+             "severity": TRIPPED.get(status, 1), "status": status}
+        if remedy:
+            f["fix"] = remedy
+        # Only the row the fix belongs to gets the action, and `doctor` only ever reports one.
+        if fix and status != "ok" and ("symbol" in name or "binary" in name or "perf" in name):
+            f["action"] = fix
+        out.append(f)
+    return out

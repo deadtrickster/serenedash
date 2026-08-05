@@ -190,8 +190,12 @@ LEGEND = (
 # `search` takes i, for index: s was storage before there was a search engine on screen at all, and
 # moving it would retrain the one key that is used most.
 DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
-          "logs": "o", "mcp": "n", "findings": "f",
-          "host": "h", "doctor": "d", "legend": "l", "search": "i"}
+          "logs": "o", "mcp": "n", "findings": "f",   # `d` is an alias; see ALIAS
+          "host": "h", "legend": "l", "search": "i"}
+
+# Keys that reach a view under another name. `d` was doctor for as long as there was a doctor view;
+# it is the same screen now and the fingers do not know that.
+ALIAS = {"d": "findings"}
 
 
 # No j/k here: nothing on the main frame scrolls, so it is carried by the views that do scroll and
@@ -199,16 +203,20 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 # on a 96-column terminal.
 KEYS = (("q", "quit"), ("f", "findings"), ("s", "storage"), ("m", "memory"),
         ("a", "activity"), ("t", "threads"), ("p", "profile"), ("i", "search"), ("o", "logs"),
-        ("n", "mcp"), ("g", "graph"), ("c", "config"), ("h", "host"), ("d", "doctor"),
+        ("n", "mcp"), ("g", "graph"), ("c", "config"), ("h", "host"),
         ("l", "legend"), ("x", "mouse"))
 
 
 
 # What each kind is called on screen, and its colour. Kept beside each other so a kind cannot get a
 # name in one place and a colour in another.
+# `setup` is what `doctor` used to be a whole view of: the dashboard's own preconditions. It is a
+# kind rather than a screen because the distinction between "the tool cannot measure this" and "the
+# server has a problem" is the tool's, not the reader's - both are a check that came out badly.
 KINDNAME = {"storage": "storage", "memory": "memory", "setting": "setting",
-            "search": "search", "trend": "trend", "other": "other"}
-KINDCOL = {"storage": "cyn", "memory": "mag", "setting": "yel", "search": "grn", "trend": "blu"}
+            "search": "search", "trend": "trend", "setup": "setup", "other": "other"}
+KINDCOL = {"storage": "cyn", "memory": "mag", "setting": "yel", "search": "grn", "trend": "blu",
+           "setup": "yel"}
 
 def qty(n):
     """A count, abbreviated base 1000. NOT human() — that is base 1024 and these are documents.
@@ -769,43 +777,6 @@ def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=
     if behind > 0:
         out.append(f"  {c['yel']}… {behind} newer below - space follows{c['r']}")
     return out
-
-
-def doctor_frame(rows, fix, col, width, scroll, msg=None):
-    c = C if col else NOCOLOR
-    W = max(70, width)
-    mark = {"ok": (c["grn"], "ok  "), "warn": (c["yel"], "warn"),
-            "fail": (c["red"], "fail"), "info": (c["dim"], "note")}
-    out = [f"{c['b']}doctor{c['r']}  {c['dim']}what is working, what is missing, and what it "
-           f"costs you{c['r']}", ""]
-    # `rowfix`, not `fix`: the loop used to rebind the parameter, so by the time the `r` hint below
-    # tested it, it held the LAST ROW's fix string rather than the caller's (kind, arg) tuple. The
-    # hint therefore never rendered, and would have raised on unpacking a string if the last row had
-    # ever carried one. Third time this shadowing has cost something here, after `bar` and `why`.
-    for st, name, detail, rowfix in rows:
-        col_, tag = mark[st]
-        # One list element per LINE. `textwrap.fill` returns a single string with newlines in it,
-        # and tui.py writes each element to an absolute row (\033[{i+1};1H) - so every line after
-        # the first was written to the same row and immediately overwritten by the next element.
-        # Only the opening line of a wrapped detail ever reached the screen, which is why the
-        # `kernel symbols` and `recording` rows have always looked truncated. It also made the
-        # frame's height accounting wrong, because element count was not line count.
-        wrapped = textwrap.wrap(detail, max(30, W - 26)) or [""]
-        out.append(f"  {col_}{tag}{c['r']}  {c['b']}{name:<15}{c['r']}{wrapped[0]}")
-        out += [f"{' ' * 24}{cont}" for cont in wrapped[1:]]
-        if rowfix:
-            out += [f"        {c['cyn']}{ln}{c['r']}" for ln in
-                    textwrap.wrap(rowfix, max(30, W - 10), initial_indent="→ ",
-                                  subsequent_indent="  ")]
-        out.append("")
-    if fix:
-        kind, arg = fix
-        what = (f"registers {arg}" if kind == "register"
-                else f"copies {arg} out of the container and registers it")
-        out.append(f"  {c['yel']}r{c['r']} {c['dim']}{what}{c['r']}")
-    if msg:
-        out += ["", f"  {c['grn'] if msg[0] else c['red']}{msg[1]}{c['r']}"]
-    return out[scroll:]
 
 
 NOSQL = {"db": "", "size": 0, "wal": 0, "mem": 0, "memlimit": 0, "blocks": (0, 0, 0, 0),
@@ -1779,6 +1750,48 @@ def mcp_nav(nav, key, rows, live=()):
     return n
 
 
+def summary_line(found, c, width, key="f"):
+    """What is wrong with the server, in one centred rule, for the top of every view.
+
+    The counterpart of the key bar: that says what you can press from anywhere, this says what
+    tripped from anywhere. Findings used to be readable only from the main frame, so answering "is
+    anything wrong" while reading the memory panel meant leaving the memory panel.
+
+    Centred and unlabelled. It carried the word `status` and the key that opens the screen, and
+    both were noise: the counts say what it is, and the key bar at the other end of the frame
+    already lists every key there is. Same counts as the findings screen's own header, from the
+    same list, rather than a second thing counting the same findings its own way.
+    """
+    W = max(20, width)
+    tripped = [f for f in found if f.get("severity", 1) > 0]
+    passed = len(found) - len(tripped)
+    if not found:
+        plain, body = "nothing measured yet", f"{c['dim']}nothing measured yet{c['r']}"
+    elif not tripped:
+        tail = f" · {passed} passed" if passed else ""
+        plain = f"nothing tripped{tail}"
+        body = f"{c['grn']}nothing tripped{c['r']}{c['dim']}{tail}{c['r']}"
+    else:
+        kinds = {}
+        for f in tripped:
+            kinds[f.get("kind", "other")] = kinds.get(f.get("kind", "other"), 0) + 1
+        counts = "  ".join(f"{n} {KINDNAME.get(k, k)}"
+                           for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
+        tail = f" · {passed} passed" if passed else ""
+        plain = f"{len(tripped)} finding{'s' if len(tripped) != 1 else ''} · {counts}{tail}"
+        body = (f"{c['yel']}{c['b']}{len(tripped)} finding"
+                f"{'s' if len(tripped) != 1 else ''}{c['r']}{c['dim']} · {counts}{tail}{c['r']}")
+    # Clipped before it is centred. A rule that only ever pads runs past the frame on a narrow
+    # terminal and wraps, which puts a stray half-rule under the top of every redraw.
+    if len(plain) > W - 6:
+        body, plain = clip(strip(body), W - 7), plain[:W - 7] + "…"
+    # Measured against the VISIBLE text, not the escaped string - the arithmetic every border in
+    # this renderer needs, and the one that goes wrong first.
+    left = max(1, (W - len(plain) - 3) // 2)
+    right = max(1, W - len(plain) - left - 3)
+    return f"{c['dim']}{'─' * left}{c['r']} {body} {c['dim']}{'─' * right}{c['r']}"
+
+
 def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
                    anchors=None):
     """The `f` view: every measured finding, countable at a glance and readable one at a time.
@@ -1790,16 +1803,26 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     """
     c = C if col else NOCOLOR
     W = max(70, width)
+    # Trouble first, passed checks last, insertion order kept inside each group. A screen that
+    # opens on twelve green rows makes you scroll to find the one red one.
+    found = sorted(found, key=lambda f: -f.get("severity", 1))
+    tripped = [f for f in found if f.get("severity", 1) > 0]
+    passed = len(found) - len(tripped)
     kinds = {}
-    for f in found:
+    for f in tripped:
         kinds[f.get("kind", "other")] = kinds.get(f.get("kind", "other"), 0) + 1
     head = f"{c['b']}Status summary{c['r']}  "
-    if found:
-        head += f"{c['yel']}{c['b']}{len(found)} finding{'s' if len(found) != 1 else ''}{c['r']}"
+    if tripped:
+        head += (f"{c['yel']}{c['b']}{len(tripped)} finding"
+                 f"{'s' if len(tripped) != 1 else ''}{c['r']}")
         head += "  " + "  ".join(f"{c['dim']}·{c['r']}  {n} {KINDNAME.get(k, k)}"
                                  for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
     else:
         head += f"{c['grn']}nothing tripped{c['r']}"
+    if passed:
+        # What was CHECKED and came out fine. This is the half `doctor` existed for: silence about
+        # a passing check reads the same as never having run it.
+        head += f"  {c['dim']}·{c['r']}  {c['grn']}{passed} checks passed{c['r']}"
     out = [head, ""]
     if not found:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
@@ -1818,6 +1841,7 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     for i, f in enumerate(found[start:start + room], start=start):
         mark = f"{c['b']}›{c['r']}" if i == sel else " "
         kc = KINDCOL.get(f.get("kind"), "cyn")
+        ok = f.get("severity", 1) == 0
         # Where this row landed, for whoever draws a clickable box over it. Reported by the frame
         # rather than found by a scanner: a row is whatever the data says, with no shape to match.
         if anchors is not None:
@@ -1826,13 +1850,18 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
         # left column and the reason has to survive being cut, so the numbers come first in every
         # detail string the collector writes.
         why = strip((f.get("detail") or "").split(". ")[0])
-        out.append(f" {mark}{c[kc]}{KINDNAME.get(f.get('kind'), '?'):<8}{c['r']} "
-                   f"{c['b']}{clip(f.get('what', '?'), 34):<34}{c['r']} "
+        label = "passed" if ok else KINDNAME.get(f.get("kind"), "?")
+        out.append(f" {mark}{(c['grn'] + c['dim']) if ok else c[kc]}{label:<8}{c['r']} "
+                   f"{'' if ok else c['b']}{c['dim'] if ok else ''}"
+                   f"{clip(f.get('what', '?'), 34):<34}{c['r']} "
                    f"{c['dim']}{clip(why, max(10, W - 50))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
     out.append("")
-    out.append(f"  {c['dim']}j/k moves · enter reads the whole finding{c['r']}")
+    hint = "j/k moves · enter reads the whole finding"
+    if found[sel].get("action"):
+        hint += f" · {c['yel']}r{c['dim']} runs the fix"
+    out.append(f"  {c['dim']}{hint}{c['r']}")
     return out
 
 
@@ -1855,6 +1884,10 @@ def _finding_detail(f, c, W, height, scroll):
         for k, v in nums.items():
             shown = human(v) if isinstance(v, int) and abs(v) > 9999 and "bytes" in k else v
             out.append(f"  {c['dim']}{k:<28}{c['r']}{shown}")
+    if f.get("action"):
+        out.append("")
+        out.append(f"  {c['yel']}press r{c['r']} {c['dim']}and the dashboard does this itself"
+                   f"{c['r']}")
     for label, key in (("fix", "fix"), ("check it", "verify"), ("note", "note")):
         if f.get(key):
             out.append("")
