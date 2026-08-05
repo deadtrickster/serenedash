@@ -170,8 +170,14 @@ def mouse_event(code, fin):
     return ("mouse", x - 1, y - 1, "press" if fin == "M" else "release")
 
 
+# How many log lines a served frame carries. The terminal sizes its log window from the window; a
+# browser has no rows to speak of, so the served frame is built at the same height as the main one
+# it sits beside on the page.
+WEB_ROWS = 44
+
+
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
-               full=None):
+               full=None, logtail=None):
     """One view by name, or the main frame. The single dispatch both the export and --serve use.
 
     The terminal has its own dispatch inside the loop because it also owns scroll, selection and the
@@ -197,6 +203,12 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         return doctor_frame(*doctor(cfg, perf_dir), col, w, 0)
     if name == "legend":
         return legend_frame(col, w, 0)
+    if name == "logs":
+        # Tailed here when the caller has none, the same way `doctor` runs its own checks: a
+        # consumer that just wants the panel should not have to know where this server keeps its
+        # log. Always following - a page with no scroll state has nothing to hold a position for.
+        rows, src, why = logtail or _logs.tail(cfg, 400)
+        return logs_frame(rows, src, why, "", col, w, 0, WEB_ROWS, True)
     return lines
 
 

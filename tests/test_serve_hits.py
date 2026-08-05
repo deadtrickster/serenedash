@@ -77,3 +77,25 @@ def test_the_export_palette_is_brighter_than_the_terminals():
     # brightness is, and the One Dark foreground read as muddy grey there.
     r, g, b = (int(PAL["37"][i:i + 2], 16) for i in (1, 3, 5))
     assert min(r, g, b) > 0xC0, f"foreground {PAL['37']} is too dim for a page"
+
+
+def test_every_view_the_page_offers_has_a_branch_in_the_dispatch():
+    # The bug this catches: `logs` was in DETAIL, so it appeared in the served view list and got a
+    # hit area on the bar, but `view_lines` had no branch for it and fell through to `return lines`
+    # - clicking it served the main frame back and looked like the view failing to load.
+    from serenedash.tui import view_lines
+
+    from .test_timing import _args  # noqa: TID252  - the same fixture data as the timing budgets
+
+    st, _prev, sz, hist, perf, thr, tcpu, hinfo, _c, _w, _h = _args(100, 44)
+    sea = {"server": {}, "indexes": {}}
+    marker = ["THE MAIN FRAME"]       # returned verbatim by the fall-through, so identity finds it
+    served = {}
+    for name in sorted(DETAIL):
+        try:
+            served[name] = view_lines(name, {}, None, marker, st, sz, hist, perf, thr, tcpu, hinfo,
+                                      sea, True, 100)
+        except Exception:                                        # noqa: BLE001, PERF203
+            served[name] = ["raised"]                            # a branch exists; it just needs data
+    fell_through = [n for n, out in served.items() if out is marker]
+    assert not fell_through, f"no branch in view_lines for: {fell_through}"
