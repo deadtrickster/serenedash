@@ -21,8 +21,8 @@ jobs:
         # nobody tests is a version that breaks quietly - it was missing from here for a while.
         python: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[mcp,dev]"
@@ -35,8 +35,8 @@ jobs:
   entrypoints:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[mcp]"
@@ -108,8 +108,8 @@ jobs:
   browser:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[browser]"
@@ -123,7 +123,7 @@ jobs:
             --tracing=retain-on-failure --output=browser-results
       # A failing browser test is close to unreadable from a log line. The trace opens in
       # playwright.dev/trace with the DOM at every step.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: browser-results
@@ -143,8 +143,8 @@ jobs:
         ports:
           - 7890:7890
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[mcp,dev]"
@@ -197,7 +197,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # A pinned shellcheck rather than the distro one. The runner's build raised an SC2015 that
       # 0.11 does not, so a clean local run said nothing about CI - which is the one thing a lint
       # job has to be good for. Pinned here and installed via mise locally, both at 0.11.0.
