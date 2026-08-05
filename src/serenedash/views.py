@@ -186,7 +186,7 @@ LEGEND = (
 # `search` takes i, for index: s was storage before there was a search engine on screen at all, and
 # moving it would retrain the one key that is used most.
 DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
-          "logs": "o",
+          "logs": "o", "mcp": "n",
           "host": "h", "doctor": "d", "legend": "l", "search": "i"}
 
 
@@ -194,8 +194,8 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 # the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
 # on a 96-column terminal.
 KEYS = (("q", "quit"), ("s", "storage"), ("m", "memory"), ("a", "activity"), ("t", "threads"),
-        ("p", "profile"), ("i", "search"), ("o", "logs"), ("g", "graph"), ("c", "config"),
-        ("h", "host"), ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
+        ("p", "profile"), ("i", "search"), ("o", "logs"), ("n", "mcp"), ("g", "graph"),
+        ("c", "config"), ("h", "host"), ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
 
 
 def qty(n):
@@ -1492,3 +1492,96 @@ def config_frame(rows, s, col, width, scroll, sel, detail, edit=None, msg=None):
     out.extend(status(c, W, f"{c['b']}e{c['r']} {c['dim']}edit{c['r']}  "
                             f"{c['dim']}·{c['r']}  {c['b']}enter{c['r']} {c['dim']}describe{c['r']}"))
     return out, scroll, sel
+
+
+def mcp_frame(rows, live, col, width, scroll, sel=0, height=40):
+    """The `n` view: what agents asked this deployment, and what they were told.
+
+    Both halves, because they answer different questions. The call list says what an agent looked
+    at; the reply below says what it was handed, and the interesting case is the gap between that
+    reply and whatever the agent then told its user. That gap is why this view exists - a model
+    read `status()` here and reported three conclusions the findings do not support, and the only
+    reason anyone noticed is that the answer was pasted into a chat by hand.
+
+    `live` is the processes, not the log. An agent that has connected and asked nothing appears
+    there and nowhere else, and it is also why several are usually running: each client session
+    spawns its own server, and a session left open yesterday still holds one.
+    """
+    c = C if col else NOCOLOR
+    W = max(70, width)
+    head = f"{c['b']}mcp{c['r']}  "
+    if rows:
+        tools = mcp_counts(rows)
+        busiest = sorted(tools.items(), key=lambda kv: -kv[1][0])[:4]
+        head += (f"{len(rows)} recorded call{'s' if len(rows) != 1 else ''}  {c['dim']}·{c['r']}  "
+                 + "  ".join(f"{c['cyn']}{t}{c['r']} {n}" for t, (n, _ms) in busiest))
+        failed = sum(1 for r in rows if not r.get("ok", True))
+        if failed:
+            head += f"  {c['red']}{failed} failed{c['r']}"
+    else:
+        head += f"{c['dim']}nothing has called this server{c['r']}"
+    out = [head]
+
+    # Who is connected, which is a different question from who has called.
+    if live:
+        for p in live[:3]:
+            out.append(f"  {c['dim']}pid{c['r']} {p['pid']:<8} {c['cyn']}{p['client'] or '?':<44}{c['r']}"
+                       f" {c['dim']}up {dur(p['uptime_s'])}{c['r']}")
+        if len(live) > 3:
+            out.append(f"  {c['dim']}… {len(live) - 3} more server process"
+                       f"{'es' if len(live) - 3 != 1 else ''} - one per client session{c['r']}")
+    elif not rows:
+        out.append(f"  {c['dim']}no serenedash-mcp process is running. Agents spawn one each; it "
+                   f"exits with the session{c['r']}")
+    out.append("")
+
+    if not rows:
+        out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
+            "Calls are recorded by the MCP server itself, so this fills in as soon as an agent "
+            "asks something. Both the arguments and the reply are kept - what a tool returned is "
+            "the only way to tell a model that read a finding wrong from one that was told wrong.",
+            max(40, W - 4))]
+        return out[scroll:]
+
+    # The reply pane is fixed, so the list does not resize under the selection as replies change
+    # length. A pane that grows and shrinks per row makes j/k feel like the whole view is moving.
+    pane = min(12, max(6, height // 3))
+    room = max(1, height - len(out) - pane - 3)
+    # -1 means "the newest", and stays meaning it as calls arrive. An absolute index would slide
+    # onto a different call every time an agent asked something - the same mistake the log tailer
+    # made by holding an offset from the end instead of freezing the buffer.
+    sel = len(rows) - 1 if sel < 0 else max(0, min(sel, len(rows) - 1))
+    start = max(0, min(sel - room // 2, len(rows) - room))
+    for i, r in enumerate(rows[start:start + room], start=start):
+        mark = f"{c['b']}›{c['r']}" if i == sel else " "
+        when = time.strftime("%H:%M:%S", time.localtime(r.get("t", 0)))
+        okc = c["r"] if r.get("ok", True) else c["red"]
+        ms = r.get("ms") or 0
+        # Slow is relative to what these do: status() samples the server and doctor() re-runs
+        # checks, so hundreds of ms is normal and seconds is not.
+        mc = c["red"] if ms > 3000 else c["yel"] if ms > 800 else c["dim"]
+        out.append(f" {mark}{c['dim']}{when}{c['r']} {c['cyn']}{(r.get('tool') or '?'):<11}{c['r']}"
+                   f" {mc}{ms:>7.0f}ms{c['r']} {c['dim']}{human(r.get('bytes') or 0):>7}{c['r']} "
+                   f"{okc}{clip(r.get('client') or '?', 26):<26}{c['r']} "
+                   f"{c['dim']}{clip(r.get('args') or '', max(10, W - 70))}{c['r']}")
+    if start > 0:
+        out.insert(len(out) - min(room, len(rows)), f"  {c['dim']}… {start} earlier{c['r']}")
+
+    r = rows[sel]
+    out.append("")
+    out.append(f"  {c['b']}reply{c['r']} {c['dim']}to {r.get('tool')}"
+               + (f"({r['args']})" if r.get("args") else "()")
+               + f" - {human(r.get('bytes') or 0)}, {r.get('ms', 0):.0f}ms{c['r']}")
+    body = r.get("error") or r.get("reply") or ""
+    for ln in textwrap.wrap(body, max(40, W - 4))[:pane - 2]:
+        out.append(f"  {c['red'] if r.get('error') else c['dim']}{ln}{c['r']}")
+    return out
+
+
+def mcp_counts(rows):
+    """{tool: (calls, total_ms)}. Here rather than imported so the view has one source for both."""
+    out = {}
+    for r in rows:
+        n, ms = out.get(r.get("tool", "?"), (0, 0.0))
+        out[r.get("tool", "?")] = (n + 1, ms + (r.get("ms") or 0))
+    return out

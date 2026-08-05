@@ -21,6 +21,7 @@ from . import history
 from . import serve as _serve
 from . import snapshot as snap
 from . import logs as _logs
+from . import mcplog as _mcplog
 from .db import apply_setting, full_queries, query, sample, search, sql_status, temp_files_held
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
@@ -34,6 +35,7 @@ from .views import (
     host_frame,
     legend_frame,
     logs_frame,
+    mcp_frame,
     memory_frame,
     profile_frame,
     search_frame,
@@ -212,6 +214,9 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         return doctor_frame(*doctor(cfg, perf_dir), col, w, 0)
     if name == "legend":
         return legend_frame(col, w, 0)
+    if name == "mcp":
+        rows = _mcplog.tail(perf_dir or cfg.get("perf_dir", ""))
+        return mcp_frame(rows, _mcplog.live(), col, w, 0, len(rows) - 1, WEB_ROWS)
     if name == "logs":
         # Tailed here when the caller has none, the same way `doctor` runs its own checks: a
         # consumer that just wants the panel should not have to know where this server keeps its
@@ -328,6 +333,9 @@ def main():
     # you were reading slide past - which is the thing that makes a tailer unusable for reading.
     lrows, lsrc, lwhy, lfollow, lscroll, lneedle = [], "", None, True, 0, ""
     lfind = None      # the filter being typed, or None when not typing. '' is a filter, not absence.
+    # -1 selects the newest call, and KEEPS selecting it as calls arrive. An absolute index would
+    # slide onto a different call every time an agent asked something.
+    mrows, mlive, msel = [], [], -1
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -491,7 +499,10 @@ def main():
                     fullq = full_queries(cfg)
                 if view == "logs" and not lrows and not lwhy:
                     lrows, lsrc, lwhy = _logs.tail(cfg, 400)   # first entry, before any data tick
-                body = {"logs": lambda: logs_frame(
+                if view == "mcp" and (fresh or not mrows):
+                    mrows, mlive = _mcplog.tail(a.perf_dir), _mcplog.live()
+                body = {"mcp": lambda: mcp_frame(mrows, mlive, col, w, scroll, msel, h - 1),
+                        "logs": lambda: logs_frame(
                             _logs.matching(lrows, lneedle), lsrc, lwhy, lneedle, col, w,
                             lscroll, h - 1, lfollow),
                         "storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
@@ -718,6 +729,19 @@ def main():
                 elif k and len(k) == 1 and k.isprintable():
                     lfind += k
                 lscroll = 0
+                shown = [None] * len(shown)
+                continue
+            if view == "mcp" and k in ("j", "k", "down", "up", "pgup", "pgdn", "end"):
+                n = len(mrows)
+                cur = msel if msel >= 0 else n - 1
+                step = 1 if k in ("j", "k", "down", "up") else 10
+                if k == "end":
+                    msel = -1                      # back to following the newest
+                else:
+                    up = k in ("k", "up", "pgup")
+                    msel = max(0, min(n - 1, cur + (-step if up else step)))
+                    if msel == n - 1:
+                        msel = -1                  # landing on the newest resumes following it
                 shown = [None] * len(shown)
                 continue
             if view == "logs" and k == "/":

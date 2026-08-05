@@ -36,7 +36,7 @@ import time
 from mcp.server import MCPServer
 
 from . import config as _config
-from . import anomaly, db, history, perf, system
+from . import anomaly, db, history, mcplog, perf, system
 from . import snapshot as snap
 from .hazards import HAZARDS
 
@@ -93,17 +93,33 @@ def _stamp():
 
 
 def stamped(fn):
-    """Add `server` to every dict a tool returns.
+    """Add `server` to every dict a tool returns, and record the call.
 
     On every tool rather than only on `status`, because an agent that goes straight to `memory()`
     is exactly the one whose context is oldest. `functools.wraps` keeps the signature and docstring
     the SDK builds the tool schema from.
+
+    Recording rides along here because this is the one place every tool already passes through - a
+    second decorator would eventually be left off a new tool, and a call log with a hole in it is
+    worse than none, since the hole is invisible. See `mcplog`: an MCP server has no window and no
+    log of its own, so without this there is no way to see what an agent asked or what it was told.
     """
     @functools.wraps(fn)
     def wrapped(*a, **kw):
-        out = fn(*a, **kw)
+        t0 = time.perf_counter()
+        named = dict(zip(fn.__code__.co_varnames[:fn.__code__.co_argcount], a, strict=False))
+        named.update(kw)
+        try:
+            out = fn(*a, **kw)
+        except Exception as e:                                   # noqa: BLE001
+            # Recorded and re-raised. A tool that failed is exactly the call worth seeing, and the
+            # agent must still get its error rather than a dashboard's idea of one.
+            mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000,
+                          "", ok=False, err=e)
+            raise
         if isinstance(out, dict):
             out.setdefault("server", _stamp())
+        mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000, out)
         return out
     return wrapped
 
