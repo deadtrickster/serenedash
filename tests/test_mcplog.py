@@ -97,41 +97,81 @@ def test_live_servers_are_read_from_proc_not_from_the_log():
 
 def rows(n=3):
     return [{"t": 1785000000 + i * 60, "tool": t, "ms": ms, "ok": ok, "client": "claude --continue",
-             "args": ar, "bytes": by, "reply": rp}
+             "pid": 7, "args": ar, "bytes": by, "reply": rp}
             for i, (t, ms, ok, ar, by, rp) in enumerate([
                 ("status", 812.0, True, "", 18422, '{"findings": []}'),
                 ("search", 120.0, True, "", 3011, '{"indexes": {}}'),
                 ("query", 41.0, True, "sql=select 1", 88, '{"rows": [[1]]}')][:n])]
 
 
-def test_the_view_shows_the_reply_of_the_selected_call():
-    out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, -1, 30)]
-    assert any("reply to query" in ln for ln in out)
-    # Indented, so the value is on its own line under its key rather than inside a wrapped blob.
-    assert any(ln.strip() == '"rows": [' for ln in out)
-    assert any(ln.strip() == "1" for ln in out)
+def test_the_view_opens_at_the_session_list():
+    # Level 1. Which agents are talking to this deployment is the question you have before you have
+    # any other question, and it is the only one that fits on a screen.
+    out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30)]
+    assert any("session" in ln for ln in out)
+    assert any("enter opens the session" in ln for ln in out)
+
+
+def test_a_session_expands_to_its_own_calls():
+    # Level 2. Grouped by pid, because four `claude` sessions look identical from /proc and are
+    # four different conversations.
+    out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30, open_pid=7)]
+    assert any("pid 7" in ln for ln in out)
+    assert any("enter shows the whole call" in ln for ln in out)
+    assert sum(1 for ln in out if "status" in ln or "search" in ln or "query" in ln) >= 3
+
+
+def test_a_call_opens_in_full_with_its_reply():
+    # Level 3. The reply is the point of the whole view and it is thousands of characters, so it
+    # gets a frame rather than a corner of one.
+    out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30, open_pid=7, call_sel=2,
+                                       popup=True)]
+    assert out[0].startswith("┌─ query"), out[0]
+    assert any('"rows"' in ln for ln in out)
+    assert any("esc closes" in ln for ln in out)
+
+
+def test_a_truncated_reply_is_still_readable():
+    # Every big reply is STORED truncated, so it does not parse - and the one that matters most,
+    # status(), rendered as a single 12000-character line. Indented structurally instead.
+    r = {"reply": '{"findings": [{"what": "orphaned temp files", "detail": "72.6G {not a brace}"'}
+    lines = mcplog.pretty(r, 100)
+    assert lines[0] == "{" and lines[1].strip() == '"findings": ['
+    assert any(ln.strip() == '"what": "orphaned temp files",' for ln in lines)
+    # A brace inside a message must not change the depth.
+    assert any('{not a brace}' in ln for ln in lines)
+
+
+def test_every_level_stays_inside_the_height_it_was_given():
+    many = [{"t": 1785000000 + i, "tool": "status", "ms": 10, "ok": True, "client": "c", "pid": 7,
+             "args": "", "bytes": 10, "reply": '{"a": ' + '"x",' * 900} for i in range(400)]
+    for h in (12, 24, 44):
+        for kw in ({}, {"open_pid": 7}, {"open_pid": 7, "popup": True}):
+            assert len(mcp_frame(many, [], False, 100, 0, 0, h, **kw)) <= h, (h, kw)
 
 
 def test_minus_one_keeps_selecting_the_newest_as_calls_arrive():
     # The same rule as the log tailer: an absolute index slides onto a different call every time an
-    # agent asks something.
-    a = [strip(x) for x in mcp_frame(rows(2), [], False, 120, 0, -1, 30)]
-    b = [strip(x) for x in mcp_frame(rows(3), [], False, 120, 0, -1, 30)]
-    assert any("reply to search" in ln for ln in a)
-    assert any("reply to query" in ln for ln in b)
+    # agent asks something, so the row under the cursor is not the one you were looking at.
+    a = [strip(x) for x in mcp_frame(rows(2), [], False, 120, 0, 0, 30, open_pid=7, call_sel=-1,
+                                     popup=True)]
+    b = [strip(x) for x in mcp_frame(rows(3), [], False, 120, 0, 0, 30, open_pid=7, call_sel=-1,
+                                     popup=True)]
+    assert a[0].startswith("┌─ search") and b[0].startswith("┌─ query")
+
+
+def test_a_session_that_asked_nothing_is_shown_as_such():
+    # An agent that connected and has asked nothing appears in /proc and nowhere in the log, and
+    # "asked nothing" is not "0 calls" - one is a state, the other reads like a measurement.
+    out = [strip(x) for x in mcp_frame([], [{"pid": 9, "client": "claude", "uptime_s": 90000}],
+                                       False, 120, 0, 0, 20)]
+    assert any("asked nothing" in ln and "pid 9" in ln for ln in out)
 
 
 def test_an_empty_log_explains_itself_instead_of_rendering_nothing():
-    out = [strip(x) for x in mcp_frame([], [], False, 100, 0, -1, 20)]
-    assert any("nothing has called" in ln for ln in out)
-    assert any("recorded by the MCP server itself" in ln for ln in out)
-
-
-def test_the_frame_never_exceeds_the_height_it_was_given():
-    many = [{"t": 1785000000 + i, "tool": "status", "ms": 10, "ok": True, "client": "c",
-             "args": "", "bytes": 10, "reply": "x" * 4000} for i in range(400)]
-    for h in (10, 24, 44):
-        assert len(mcp_frame(many, [], False, 100, 0, -1, h)) <= h
+    out = [strip(x) for x in mcp_frame([], [], False, 100, 0, 0, 20)]
+    assert any("No agent has connected" in ln for ln in out)
+    assert "exits with the session" in " ".join(ln.strip() for ln in out)
 
 
 def test_the_view_has_a_key_and_appears_in_the_bar():

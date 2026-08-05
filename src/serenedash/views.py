@@ -9,6 +9,7 @@ from .fmt import C, COL_BAR, COL_LABEL, COL_VALUE, NOCOLOR, bar, clip, dur, huma
 from .hazards import HAZARDS, kernel_of
 from .logs import counts as log_counts
 from .mcplog import digest as mcp_digest
+from .mcplog import sessions as mcp_sessions
 from .mcplog import pretty as mcp_pretty
 
 
@@ -1496,102 +1497,149 @@ def config_frame(rows, s, col, width, scroll, sel, detail, edit=None, msg=None):
     return out, scroll, sel
 
 
-def mcp_frame(rows, live, col, width, scroll, sel=0, height=40):
-    """The `n` view: what agents asked this deployment, and what they were told.
+def mcp_frame(rows, live, col, width, scroll, sel=0, height=40, open_pid=None, call_sel=-1,
+              popup=False):
+    """The `n` view, at whichever of its three depths is open.
 
-    Both halves, because they answer different questions. The call list says what an agent looked
-    at; the reply below says what it was handed, and the interesting case is the gap between that
-    reply and whatever the agent then told its user. That gap is why this view exists - a model
-    read `status()` here and reported three conclusions the findings do not support, and the only
-    reason anyone noticed is that the answer was pasted into a chat by hand.
-
-    `live` is the processes, not the log. An agent that has connected and asked nothing appears
-    there and nowhere else, and it is also why several are usually running: each client session
-    spawns its own server, and a session left open yesterday still holds one.
+    Sessions, then that session's calls, then one call in full. Three levels because they answer
+    three questions and only the first fits on a screen: which agents are talking to this
+    deployment, what one of them asked, and what exactly it was told. The last is the point of the
+    whole view - a model read `status()` here and reported three conclusions the findings do not
+    support - and a reply is thousands of characters, so it gets its own frame rather than a corner
+    of one.
     """
     c = C if col else NOCOLOR
+    if open_pid is not None:
+        mine = [r for r in rows if (r.get("pid") or 0) == open_pid]
+        who = next((s for s in mcp_sessions(rows, live) if s["pid"] == open_pid), None)
+        if popup and mine:
+            return _mcp_call(mine[max(0, min(call_sel if call_sel >= 0 else len(mine) - 1,
+                                             len(mine) - 1))], who, c, width, height, scroll)
+        return _mcp_calls(mine, who, c, width, height, call_sel, scroll)
+    return _mcp_sessions(mcp_sessions(rows, live), rows, c, width, height, sel, scroll)
+
+
+def _mcp_sessions(sess, rows, c, width, height, sel, scroll):
+    """One row per session, with enough beside it to tell them apart.
+
+    Which is the whole difficulty: MCP over stdio carries no client identity, four `claude`
+    sessions look identical from /proc, and they are four different conversations. So the row
+    carries what does distinguish them - pid, whether it is still live, how long it has been
+    connected, what it has actually asked and when.
+    """
     W = max(70, width)
-    head = f"{c['b']}mcp{c['r']}  "
-    if rows:
-        tools = mcp_counts(rows)
-        busiest = sorted(tools.items(), key=lambda kv: -kv[1][0])[:4]
-        head += (f"{len(rows)} recorded call{'s' if len(rows) != 1 else ''}  {c['dim']}·{c['r']}  "
-                 + "  ".join(f"{c['cyn']}{t}{c['r']} {n}" for t, (n, _ms) in busiest))
-        failed = sum(1 for r in rows if not r.get("ok", True))
-        if failed:
-            head += f"  {c['red']}{failed} failed{c['r']}"
-    else:
-        head += f"{c['dim']}nothing has called this server{c['r']}"
-    out = [head]
-
-    # Who is connected, which is a different question from who has called.
-    if live:
-        for p in live[:3]:
-            out.append(f"  {c['dim']}pid{c['r']} {p['pid']:<8} {c['cyn']}{p['client'] or '?':<44}{c['r']}"
-                       f" {c['dim']}up {dur(p['uptime_s'])}{c['r']}")
-        if len(live) > 3:
-            out.append(f"  {c['dim']}… {len(live) - 3} more server process"
-                       f"{'es' if len(live) - 3 != 1 else ''} - one per client session{c['r']}")
-    elif not rows:
-        out.append(f"  {c['dim']}no serenedash-mcp process is running. Agents spawn one each; it "
-                   f"exits with the session{c['r']}")
-    out.append("")
-
-    if not rows:
+    live_n = sum(1 for s in sess if s["live"])
+    errs = sum(s["errors"] for s in sess)
+    head = f"{c['b']}mcp{c['r']}  {len(sess)} session{'s' if len(sess) != 1 else ''}"
+    if sess:
+        head += (f"  {c['dim']}·{c['r']}  {c['grn']}{live_n} live{c['r']}"
+                 f"  {c['dim']}·{c['r']}  {len(rows)} call{'s' if len(rows) != 1 else ''}")
+        if errs:
+            head += f"  {c['dim']}·{c['r']}  {c['red']}{errs} refused{c['r']}"
+    out = [head, ""]
+    if not sess:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
-            "Calls are recorded by the MCP server itself, so this fills in as soon as an agent "
-            "asks something. Both the arguments and the reply are kept - what a tool returned is "
-            "the only way to tell a model that read a finding wrong from one that was told wrong.",
-            max(40, W - 4))]
+            "No agent has connected. Each client session spawns its own serenedash-mcp and it "
+            "exits with the session, so this fills in as soon as one starts - and a server that "
+            "connected without asking anything shows up here too.", max(40, W - 4))]
         return out[scroll:]
-
-    # The reply is the point of the view, so it gets the leftover rather than a fixed slice: with
-    # four calls recorded, a fixed third of the screen left two lines of JSON under a mostly empty
-    # list. The list takes what it needs up to half, the reply takes the rest.
-    listed = min(len(rows), max(1, (height - len(out) - 4) // 2))
-    room = max(1, min(len(rows), listed))
-    pane = max(3, height - len(out) - room - 4)
-    # -1 means "the newest", and stays meaning it as calls arrive. An absolute index would slide
-    # onto a different call every time an agent asked something - the same mistake the log tailer
-    # made by holding an offset from the end instead of freezing the buffer.
-    sel = len(rows) - 1 if sel < 0 else max(0, min(sel, len(rows) - 1))
-    start = max(0, min(sel - room // 2, len(rows) - room))
-    for i, r in enumerate(rows[start:start + room], start=start):
+    room = max(1, height - len(out) - 3)      # a possible "… above", then the blank and the hint
+    sel = max(0, min(sel, len(sess) - 1))
+    start = max(0, min(sel - room // 2, len(sess) - room))
+    for i, s in enumerate(sess[start:start + room], start=start):
         mark = f"{c['b']}›{c['r']}" if i == sel else " "
-        when = time.strftime("%H:%M:%S", time.localtime(r.get("t", 0)))
-        okc = c["r"] if r.get("ok", True) else c["red"]
+        state = f"{c['grn']}live{c['r']}" if s["live"] else f"{c['dim']}gone{c['r']}"
+        # "no calls" is not "0 calls": one is an agent that connected and asked nothing, which is
+        # a state worth seeing, and the other reads like a measurement of nothing.
+        what = (f"{s['calls']} call{'s' if s['calls'] != 1 else ''}" if s["calls"]
+                else f"{c['dim']}asked nothing{c['r']}")
+        when = (time.strftime("%H:%M:%S", time.localtime(s["last"])) if s["last"]
+                else (f"up {dur(s['uptime_s'])}" if s["uptime_s"] is not None else ""))
+        tools = " ".join(f"{t}{'×' + str(n) if n > 1 else ''}"
+                         for t, n in sorted(s["tools"].items(), key=lambda kv: -kv[1])[:4])
+        err = f" {c['red']}{s['errors']} refused{c['r']}" if s["errors"] else ""
+        out.append(f" {mark}{state} {c['dim']}pid{c['r']} {s['pid']:<8} "
+                   f"{c['cyn']}{clip(s['client'] or '?', 30):<30}{c['r']} {what:<22}{err} "
+                   f"{c['dim']}{when:<9} {clip(tools, max(6, W - 82))}{c['r']}")
+    if start:
+        out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
+    out.append("")
+    out.append(f"  {c['dim']}j/k moves · enter opens the session{c['r']}")
+    return out
+
+
+def _mcp_calls(mine, who, c, width, height, call_sel, scroll):
+    """Every call one session made. Truncated per line - enter opens the one under the cursor."""
+    W = max(70, width)
+    title = f"{c['b']}mcp{c['r']}  {c['dim']}pid{c['r']} {who['pid'] if who else '?'}  "
+    title += f"{c['cyn']}{(who or {}).get('client') or '?'}{c['r']}"
+    if who:
+        title += (f"  {c['dim']}·{c['r']}  {who['calls']} call"
+                  f"{'s' if who['calls'] != 1 else ''}  {c['dim']}·{c['r']}  "
+                  f"{human(who['bytes'])} returned  {c['dim']}·{c['r']}  "
+                  f"{'live' if who['live'] else 'gone'}")
+    out = [title, ""]
+    if not mine:
+        out.append(f"  {c['dim']}this session has not asked anything yet{c['r']}")
+        out += ["", f"  {c['dim']}esc goes back{c['r']}"]
+        return out
+    room = max(1, height - len(out) - 3)      # a possible "… earlier", then the blank and the hint
+    sel = len(mine) - 1 if call_sel < 0 else max(0, min(call_sel, len(mine) - 1))
+    start = max(0, min(sel - room // 2, len(mine) - room))
+    for i, r in enumerate(mine[start:start + room], start=start):
+        mark = f"{c['b']}›{c['r']}" if i == sel else " "
         ms = r.get("ms") or 0
-        # Slow is relative to what these do: status() samples the server and doctor() re-runs
-        # checks, so hundreds of ms is normal and seconds is not.
         mc = c["red"] if ms > 3000 else c["yel"] if ms > 800 else c["dim"]
-        # What came back, not how many bytes came back. A row saying "18.0K" tells you nothing an
-        # agent could have acted on; "5 findings: orphaned temp files, …" is the content.
+        okc = c["r"] if r.get("ok", True) else c["red"]
         what = mcp_digest(r)
         if r.get("args"):
             what = f"{r['args']} → {what}"
-        out.append(f" {mark}{c['dim']}{when}{c['r']} {c['cyn']}{(r.get('tool') or '?'):<10}{c['r']}"
-                   f" {mc}{ms:>6.0f}ms{c['r']} "
-                   f"{okc}{clip(r.get('client') or '?', 22):<22}{c['r']} "
-                   f"{c['dim']}{clip(what, max(10, W - 56))}{c['r']}")
-    if start > 0:
-        out.insert(len(out) - min(room, len(rows)), f"  {c['dim']}… {start} earlier{c['r']}")
-
-    r = rows[sel]
+        out.append(f" {mark}{c['dim']}{time.strftime('%H:%M:%S', time.localtime(r.get('t', 0)))}"
+                   f"{c['r']} {c['cyn']}{(r.get('tool') or '?'):<10}{c['r']} {mc}{ms:>6.0f}ms{c['r']}"
+                   f" {c['dim']}{human(r.get('bytes') or 0):>7}{c['r']} "
+                   f"{okc}{clip(what, max(10, W - 42))}{c['r']}")
+    if start:
+        out.insert(2, f"  {c['dim']}… {start} earlier{c['r']}")
     out.append("")
-    trunc = (r.get("reply") or "").endswith("…")
-    out.append(f"  {c['b']}reply{c['r']} {c['dim']}to {r.get('tool')}"
-               + (f"({r['args']})" if r.get("args") else "()")
-               + f" - {human(r.get('bytes') or 0)}, {r.get('ms', 0):.0f}ms"
-               + (f", showing the first {human(len(r['reply']))}" if trunc else "") + c["r"])
-    # Indented, not wrapped. Wrapped JSON is a wall of punctuation - the structure is the readable
-    # part and reflowing destroys exactly that. Long lines are cut instead, which keeps the keys.
-    body = mcp_pretty(r, max(40, W - 6))
-    for ln in body[:pane - 1]:
-        col_ = c["red"] if r.get("error") else (c["cyn"] if ln.strip().endswith(("{", "[")) else
-                                                c["r"])
-        out.append(f"  {col_}{ln}{c['r']}")
-    if len(body) > pane - 1:
-        out.append(f"  {c['dim']}… {len(body) - (pane - 1)} more lines of reply{c['r']}")
+    out.append(f"  {c['dim']}j/k moves · enter shows the whole call · esc goes back{c['r']}")
+    return out
+
+
+def _mcp_call(r, who, c, width, height, scroll):
+    """One call in full, in a box: what was asked, and every line of what came back.
+
+    Scrollable, because this is the only place the reply is not truncated for space - the stored
+    copy is capped at 4000 characters and that cap is stated when it bites, rather than the text
+    just stopping.
+    """
+    W = max(70, width)
+    inner = W - 4
+    body = [f"{c['dim']}when{c['r']}   {time.strftime('%H:%M:%S', time.localtime(r.get('t', 0)))}"
+            f"   {c['dim']}took{c['r']} {r.get('ms', 0):.0f}ms"
+            f"   {c['dim']}returned{c['r']} {human(r.get('bytes') or 0)}"
+            f"   {c['dim']}client{c['r']} {(who or {}).get('client') or r.get('client') or '?'}"]
+    if r.get("args"):
+        body += ["", f"{c['b']}arguments{c['r']}"]
+        body += [f"  {x}" for x in textwrap.wrap(r["args"], inner - 2)]
+    body += ["", f"{c['b']}reply{c['r']}"
+             + (f"   {c['dim']}stored copy, first {human(len(r.get('reply') or '')) }"
+                f" of {human(r.get('bytes') or 0)}{c['r']}"
+                if (r.get("reply") or "").endswith("…") else "")]
+    lines = mcp_pretty(r, inner - 2)
+    room = max(1, height - len(body) - 4)
+    scroll = max(0, min(scroll, max(0, len(lines) - room)))
+    body += [f"  {c['red'] if r.get('error') else c['r']}{x}{c['r']}"
+             for x in lines[scroll:scroll + room]]
+    if len(lines) > scroll + room:
+        body.append(f"  {c['dim']}… {len(lines) - scroll - room} more lines - j/k scrolls{c['r']}")
+    title = f" {r.get('tool') or '?'} "
+    out = [f"{c['dim']}┌─{c['r']}{c['yel']}{c['b']}{title}{c['r']}{c['dim']}"
+           + "─" * max(0, inner - len(title) - 1) + f"┐{c['r']}"]
+    for x in body:
+        pad = max(0, inner - len(strip(x)) - 1)
+        out.append(f"{c['dim']}│{c['r']} {x}{' ' * pad}{c['dim']}│{c['r']}")
+    out.append(f"{c['dim']}└{'─' * inner}┘{c['r']}")
+    out.append(f"  {c['dim']}esc closes{c['r']}")
     return out
 
 

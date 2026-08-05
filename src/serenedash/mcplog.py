@@ -36,7 +36,10 @@ NAME = "mcp.jsonl"
 # hundred bytes and a `status()` is tens of kilobytes. A count alone would let the file reach
 # hundreds of megabytes; a byte cap alone would keep four calls after one big one.
 KEEP = 400
-REPLY_CHARS = 4000
+# 4000 kept about a fifth of a status(), which is the reply people most want to read - the whole
+# point of the view is what an agent was actually told. 400 x 12000 is a 4.8 MB ceiling in a cache
+# directory that already holds perf captures.
+REPLY_CHARS = 12000
 ARG_CHARS = 600
 
 
@@ -242,5 +245,89 @@ def pretty(row, width=110):
     try:
         out = json.dumps(json.loads(body), indent=2, ensure_ascii=False).splitlines()
     except ValueError:
-        return body.splitlines() or [""]
+        # Every big reply is stored truncated, so it does NOT parse - and the one that matters
+        # most, status(), was rendering as a single 12000-character line. Indented structurally
+        # instead, which needs no valid document and reads the same as the parsed form.
+        out = _reflow(body)
     return [ln[:width] + ("…" if len(ln) > width else "") for ln in out]
+
+
+def _reflow(text, indent=2):
+    """Indent JSON-ish text that may be cut off mid-value. String-aware, so a brace inside a
+    message does not change the depth."""
+    out, cur, depth, in_str, esc = [], "", 0, False, False
+    for ch in text:
+        if in_str:
+            cur += ch
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str, cur = True, cur + ch
+        elif ch in "{[":
+            depth += 1
+            out.append(cur + ch)
+            cur = " " * (indent * depth)
+        elif ch in "}]":
+            out.append(cur)
+            depth = max(0, depth - 1)
+            cur = " " * (indent * depth) + ch
+        elif ch == ",":
+            out.append(cur + ch)
+            cur = " " * (indent * depth)
+        elif ch == "\n":
+            continue
+        elif ch == " " and not cur.strip():
+            continue                      # the source's own space after a comma, now a line break
+        else:
+            cur += ch
+    out.append(cur)
+    return [ln.rstrip() for ln in out if ln.strip()]
+
+
+def sessions(rows, live_procs=None):
+    """One row per MCP server process: [{pid, client, calls, errors, tools, first, last, live}].
+
+    Grouped by pid rather than by client name, because the client name is not unique - four
+    `claude` sessions look identical from /proc, and they are four different conversations asking
+    different things. The pid is the session: one process per client connection, for its lifetime.
+
+    Processes with no calls are included from `live_procs`. An agent that connected and has asked
+    nothing is a real state and the log cannot show it, which is exactly when you want to see it.
+    """
+    by = {}
+    for r in rows:
+        pid = r.get("pid") or 0
+        s = by.setdefault(pid, {"pid": pid, "client": r.get("client") or "", "calls": 0,
+                                "errors": 0, "tools": {}, "first": None, "last": None,
+                                "ms": 0.0, "bytes": 0, "live": False, "uptime_s": None})
+        s["calls"] += 1
+        s["ms"] += r.get("ms") or 0
+        s["bytes"] += r.get("bytes") or 0
+        if not r.get("ok", True) or (r.get("summary") or "").startswith(("error:", "refused")):
+            s["errors"] += 1
+        s["tools"][r.get("tool", "?")] = s["tools"].get(r.get("tool", "?"), 0) + 1
+        t = r.get("t")
+        if t:
+            s["first"] = t if s["first"] is None else min(s["first"], t)
+            s["last"] = t if s["last"] is None else max(s["last"], t)
+        if r.get("client"):
+            s["client"] = r["client"]
+    for p in live_procs or []:
+        s = by.setdefault(p["pid"], {"pid": p["pid"], "client": p.get("client") or "", "calls": 0,
+                                     "errors": 0, "tools": {}, "first": None, "last": None,
+                                     "ms": 0.0, "bytes": 0, "live": False, "uptime_s": None})
+        s["live"] = True
+        s["uptime_s"] = p.get("uptime_s")
+        s["client"] = s["client"] or p.get("client") or ""
+    # Live first, then most recently active. A session still holding a process is the one you can
+    # still do something about; a dead one is history.
+    return sorted(by.values(), key=lambda s: (not s["live"], -(s["last"] or 0)))
+
+
+def calls_of(rows, pid):
+    return [r for r in rows if (r.get("pid") or 0) == pid]
