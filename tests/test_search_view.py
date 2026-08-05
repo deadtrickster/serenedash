@@ -237,11 +237,35 @@ def test_a_bracketed_vector_counts_as_one_literal():
 def test_the_activity_view_measures_the_literal_against_the_whole_statement():
     # The finding this exists for: 68,209 characters, 21,684 of them (31.8%) a single 1024-dim
     # embedding sent as text. It took a vendor reading a screenshot to spot it.
+    #
+    # The collapsed row carries the size and the share, because those are what decide whether a
+    # statement is worth opening. The arithmetic behind them is inside.
     rows = [("active", STMT, len(STMT))]
-    flat = strip("\n".join(activity_frame(state(), False, 160, 0, full=rows)))
-    assert f"{len(STMT):,} chars" in flat
-    assert "in one literal" in flat and "over a quarter" in flat
-    assert "that literal starts" in flat
+    row = strip("\n".join(activity_frame(state(), False, 160, 0, full=rows)))
+    assert f"{len(STMT):,} chars" in row
+    assert "one literal" in row
+    opened = strip("\n".join(activity_frame(state(), False, 160, 0, full=rows, open_=True)))
+    assert "in one literal" in opened and "over a quarter" in opened
+    assert "that literal starts" in opened
+
+
+def test_activity_is_collapsed_until_you_open_a_statement():
+    # A 68 KB statement wrapped in full is a wall of float literals, and three of them buried the
+    # session list they belonged to. The list answers "what is running" without answering "what is
+    # in it" first.
+    rows = [("active", STMT, len(STMT))] * 3
+    collapsed = activity_frame(state(), False, 160, 0, full=rows, height=30)
+    flat = strip("\n".join(collapsed))
+    assert len(collapsed) < 12, f"{len(collapsed)} lines for three sessions is not a list"
+    # One clipped line per session, not 3 x 21,814 characters wrapped. The row DOES show the head
+    # of the statement - that is what makes the list readable - so the claim is about the whole.
+    # 569 characters for three 21,814-character statements. The row shows a clipped head - that is
+    # what makes the list readable - so the claim is about the whole frame, not about the preview.
+    assert len(flat) < 12 * 170, f"{len(flat)} characters is still a flood"
+    assert len(flat) < sum(len(q) for _, q, _ in rows) / 50
+    opened = strip("\n".join(activity_frame(state(), False, 160, 0, full=rows, open_=True,
+                                             height=30)))
+    assert "-0.011719927341571243" in opened, "opening it has to show the statement itself"
 
 
 def test_a_small_literal_is_reported_without_the_comparison_firing():

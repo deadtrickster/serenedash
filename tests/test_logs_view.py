@@ -95,9 +95,12 @@ def test_counts_summarise_the_buffer_that_is_actually_shown():
 
 def test_the_header_says_how_to_filter_rather_than_just_saying_search():
     # `i` is the search VIEW, and pressing it in the log switched away from the log - which is not
-    # what a header advertising "Search" led anyone to expect. It says the key now.
+    # what a header advertising "Search" led anyone to expect. It says the keys now.
+    #
+    # Follow is on SPACE, not f: f is the findings view, and a letter that means one thing globally
+    # and another inside one panel is a letter that means two things.
     head = strip(logs_frame(rows(5), "src", None, "", False, 120, 0, 20, True)[0])
-    assert "/ filter" in head and "f follow" in head
+    assert "/ filter" in head and "space follow" in head
 
 
 def test_a_filter_being_typed_is_shown_as_it_is_typed():

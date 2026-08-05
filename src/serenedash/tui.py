@@ -36,6 +36,9 @@ from .views import (
     legend_frame,
     logs_frame,
     NAV_KEYS,
+    findings_frame,
+    findings_nav,
+    list_nav,
     mcp_frame,
     mcp_nav,
     memory_frame,
@@ -191,24 +194,43 @@ WEB_ROWS = 44
 
 # The views that answer to j/k on the page. Everything else redraws whole every tick and has
 # nothing to move, and a page that swallowed j on those would be taking a key to do nothing.
-NAVIGABLE = ("mcp",)
+NAVIGABLE = ("mcp", "findings", "activity")
 
 
-def _web_nav(st, key, perf_dir):
+def _web_nav(st, key, perf_dir, cfg=None):
     """One key from a browser, applied to that tab's position. None leaves the view.
 
-    The reducer is `views.mcp_nav`, the same one the terminal drives, because "what does j do
-    here" is one question. The page used to answer none of them.
+    The reducers are the same ones the terminal drives - "what does j do here" is one question, and
+    the page used to answer none of them. A click arrives as `sel:N` because the hit area knows the
+    row index and nothing else; only the views that list something accept it.
     """
-    if st.get("view") != "mcp" or key not in NAV_KEYS:
+    view = st.get("view")
+    if view not in NAVIGABLE or not (key in NAV_KEYS or key.startswith("sel:")):
         return st
-    rows = _mcplog.tail(perf_dir)
-    out = mcp_nav(st, key, rows, _mcplog.live())
+    if view == "mcp":
+        out = mcp_nav(st, key, _mcplog.tail(perf_dir), _mcplog.live())
+    else:
+        # findings and activity are the same interaction - a list with one item open - so they
+        # share a reducer. The item count only bounds the cursor, and the frame clamps it again.
+        out = list_nav(st, key, range(st.get("_n") or 200))
     return {**st, **out} if out else {**st, "view": "main"}
 
 
+def _withbar(lines, width):
+    """A served panel plus the key bar, which on the page IS the navigation.
+
+    The terminal draws the bar under every view; view_lines returns the panel alone because the
+    exporter wants a panel. The page needs it: removing the row of buttons above the frame left the
+    detail views with no visible way to switch, since the boxes are computed from the bar's own
+    text and there was no bar to compute them from.
+    """
+    if lines and any("q quit" in ln for ln in lines[-4:]):
+        return lines                              # the main frame already carries it
+    return [*lines, "", *status(C, width)]
+
+
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
-               full=None, logtail=None, needle="", nav=None):
+               full=None, logtail=None, needle="", nav=None, hazards=(), anchors=None):
     """One view by name, or the main frame. The single dispatch both the export and --serve use.
 
     The terminal has its own dispatch inside the loop because it also owns scroll, selection and the
@@ -221,7 +243,9 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
     if name == "memory":
         return memory_frame(s, hist, hinfo, col, w, 0)
     if name == "activity":
-        return activity_frame(s, col, w, 0, full=full)
+        n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+        return activity_frame(s, col, w, n["scroll"], full=full, sel=n["sel"], open_=n["open"],
+                              height=WEB_ROWS, anchors=anchors)
     if name == "search":
         return search_frame(sea, col, w, 0) if sea else lines
     if name == "threads":
@@ -234,6 +258,10 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         return doctor_frame(*doctor(cfg, perf_dir), col, w, 0)
     if name == "legend":
         return legend_frame(col, w, 0)
+    if name == "findings":
+        n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+        return findings_frame(hazards, col, w, n["scroll"], n["sel"], WEB_ROWS, n["open"],
+                              anchors=anchors)
     if name == "mcp":
         rows = _mcplog.tail(perf_dir or cfg.get("perf_dir", ""))
         n = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False, **(nav or {})}
@@ -342,7 +370,7 @@ def main():
     col = (not a.no_color) and (sys.stdout.isatty() or a.format in ("html", "svg"))
 
     prev, sz, tick, shown, fresh, s = None, {}, 0, [], True, None
-    sea, held = None, None
+    sea, held, hazards = None, None, []
     hist = {"mem": []}
     perf = (None, [], {})
     crows = []
@@ -360,6 +388,8 @@ def main():
     # KEEPS meaning the newest as calls arrive - an absolute index slides onto a different row every
     # time an agent asks something. Esc unwinds box, then session, then the view.
     mnav = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False}
+    fnav = {"scroll": 0, "sel": 0, "open": False}
+    anav = {"scroll": 0, "sel": 0, "open": False}
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -382,7 +412,7 @@ def main():
     hub = wsrv = None
     # Only the render closure and the key reducer. Which view a tab shows, and where it is
     # scrolled to, is that tab's business - see serve.Hub.
-    wstate = {"nav": lambda st, key: _web_nav(st, key, a.perf_dir)}
+    wstate = {"nav": lambda st, key: _web_nav(st, key, a.perf_dir, cfg)}
     wlock = threading.Lock()
     if a.serve:
         # 127.0.0.1 unless a host is given. This exposes storage sizes, statement text and settings
@@ -527,7 +557,9 @@ def main():
                     lrows, lsrc, lwhy = _logs.tail(cfg, 400)   # first entry, before any data tick
                 if view == "mcp" and (fresh or not mrows):
                     mrows, mlive = _mcplog.tail(a.perf_dir), _mcplog.live()
-                body = {"mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
+                body = {"findings": lambda: findings_frame(
+                            hazards, col, w, fnav["scroll"], fnav["sel"], h - 1, fnav["open"]),
+                        "mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
                                                  mnav["sel"], h - 1, mnav["open"], mnav["call"],
                                                  mnav["popup"]),
                         "logs": lambda: logs_frame(
@@ -535,7 +567,9 @@ def main():
                             lscroll, h - 1, lfollow),
                         "storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
                         "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
-                        "activity": lambda: activity_frame(s, col, w, scroll, full=fullq),
+                        "activity": lambda: activity_frame(s, col, w, anav["scroll"],
+                                                          full=fullq, sel=anav["sel"],
+                                                          open_=anav["open"], height=h - 1),
                         "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                          scroll),
                         "profile": lambda: profile_frame(perf, col, w, scroll),
@@ -568,6 +602,13 @@ def main():
             else:
                 lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why,
                               sea, held)
+            if fresh:
+                # The same list `status()` returns, from the data this tick already has. One
+                # producer, so the screen and the MCP tool cannot disagree about what tripped.
+                try:
+                    hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea), held=held)
+                except Exception:                                # noqa: BLE001
+                    hazards = []      # a findings screen must not be able to take the frame down
             prev = s
             tick += 1
             if hub is not None and fresh:
@@ -586,15 +627,18 @@ def main():
                     # interval for the next one. Rebound each tick, so it always closes over current
                     # data; the lock keeps a render off a half-updated tick.
                     def _render(name, needle="", nav=None,
-                                _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww)):
-                        wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w = _d
+                                _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww, hazards)):
+                        wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w, _fnd = _d
+                        anchors = []          # filled by the frame, so a click lands on a row
                         with wlock:
-                            return _serve.frame_payload(name, view_lines(
+                            return _serve.frame_payload(name, _withbar(view_lines(
                                 name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
                                 True, _w,
                                 full=full_queries(cfg) if name == "activity" else None,
-                                needle=needle, nav=nav), cols=_w, keys=wkeys,
-                                sid=(nav or {}).get("id", ""), nav=name in NAVIGABLE)
+                                needle=needle, nav=nav, hazards=_fnd,
+                                anchors=anchors), _w), cols=_w, keys=wkeys,
+                                sid=(nav or {}).get("id", ""), nav=name in NAVIGABLE,
+                                anchors=anchors)
                     wstate["render"] = _render
                     # One render per view someone is actually watching. Nothing is rendered when
                     # no browser is connected.
@@ -737,9 +781,17 @@ def main():
                 # presses. It only counts as a level when there is nothing else to leave, which is
                 # what keeps the escape hatch for a terminal filling the screen: no cell outside the
                 # window means the edge rule never fires, and Esc is then the only way out.
-                nxt = mcp_nav(mnav, "\x1b", mrows, mlive) if view == "mcp" else None
+                nxt = (mcp_nav(mnav, "\x1b", mrows, mlive) if view == "mcp" else
+                       findings_nav(fnav, "\x1b", hazards) if view == "findings" else
+                       list_nav(anav, "\x1b", []) if view == "activity" else None)
                 if nxt is not None:
-                    mnav = nxt                     # the box, then the session, then the view
+                    # One level at a time inside the view, before the view itself is left.
+                    if view == "mcp":
+                        mnav = nxt
+                    elif view == "findings":
+                        fnav = nxt
+                    else:
+                        anav = nxt
                 elif detail:
                     detail, tipon = None, False
                 elif view != "main":
@@ -761,6 +813,14 @@ def main():
                 elif k and len(k) == 1 and k.isprintable():
                     lfind += k
                 lscroll = 0
+                shown = [None] * len(shown)
+                continue
+            if view == "findings" and k in NAV_KEYS and k != "\x1b":
+                fnav = findings_nav(fnav, k, hazards)
+                shown = [None] * len(shown)
+                continue
+            if view == "activity" and k in NAV_KEYS and k != "\x1b":
+                anav = list_nav(anav, k, (fullq or s["queries"]) if s else [])
                 shown = [None] * len(shown)
                 continue
             if view == "mcp" and k in NAV_KEYS and k != "\x1b":

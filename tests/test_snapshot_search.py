@@ -277,3 +277,21 @@ def test_no_pool_reporting_spill_does_not_mean_the_temp_directory_is_empty():
     m = snapshot.memory(state(), HOST)
     assert m["spilled_bytes_by_pool"] == {} and m["spilled_bytes_total"] == 0
     assert "spill_orphaned_bytes" in m["spill_note"]
+
+
+def test_every_finding_carries_a_kind_it_can_be_counted_by():
+    # The summary line on the findings screen counts by kind, and the kind is set at the source -
+    # a categoriser reading the wording of `what` would quietly re-file a finding the moment a
+    # measurement was corrected, which happens here regularly.
+    from serenedash import snapshot
+
+    sr = metrics(num_failed_commits=2, avg_consolidation_time_ms=15368)
+    s = {"size": 10**9, "wal": 10**11, "mem": 10**9, "memlimit": 10**9,
+         "settings": {"checkpoint_threshold": "16.0 MiB"}, "queries": [], "memtags": {},
+         "blocks": (0, 0, 0, 0)}
+    host = {"uptime": 100, "swap": 10**9, "rss": 10**9, "ram_total": 10**11}
+    sz = {"temp_files": [(0, 10**9)], "temp": 10**9}
+    found = snapshot.findings(s, sz, host, {}, sr=snapshot.search(sr), held=(0, 0))
+    assert found, "this fixture is meant to trip several"
+    assert all(f.get("kind") for f in found), [f["what"] for f in found if not f.get("kind")]
+    assert {"storage", "memory", "search"} <= {f["kind"] for f in found}

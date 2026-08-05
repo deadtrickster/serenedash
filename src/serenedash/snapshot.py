@@ -405,6 +405,10 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
     Not a severity list and not a verdict: an entry is here because a specific comparison came out a
     specific way, and it carries enough for the reader to disagree. An empty list means nothing
     tripped, not that nothing was looked at.
+
+    Each carries a `kind` - storage, memory, setting, search, trend - set HERE rather than worked
+    out later from the wording of `what`. The wording changes whenever a measurement is corrected,
+    and a categoriser reading it would quietly start filing the corrected finding under "other".
     """
     out = []
     _orph, orph_bytes, _live = temp_split(sz or {}, host)
@@ -419,6 +423,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
             proof = (f" duckdb_temporary_files() reports the server holding {held[0]} files "
                      f"({human(held[1])}) open, which are NOT these.")
         out.append({
+            "kind": "storage",
             "what": "orphaned temp files",
             "detail": f"{len(_orph)} files, {human(orph_bytes)}, all older than the running "
                       f"serened. DuckDB deletes temp files only in a destructor and never sweeps "
@@ -445,6 +450,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
         })
     if (host.get("swap") or 0) > 0:
         out.append({
+            "kind": "memory",
             "what": "process memory paged out",
             "detail": f"{human(host['swap'])} of serened is in swap"
                       + (f" while duckdb_memory() reports {human(s['mem'])} held" if s else "")
@@ -456,6 +462,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
         ratio = s["wal"] / s["size"] if s["size"] else 0
         if ratio > 1:
             out.append({
+                "kind": "storage",
                 "what": "checkpoints not completing",
                 "detail": f"WAL is {ratio:.1f}x the database. Look for write errors, not for tuning.",
                 "wal_bytes": s["wal"], "database_bytes": s["size"],
@@ -463,6 +470,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
         lim, ram = s["memlimit"] or 0, host.get("ram_total") or 0
         if ram and lim > ram * 0.75:
             out.append({
+                "kind": "memory",
                 "what": "memory_limit oversubscribed",
                 "detail": f"memory_limit is {lim / ram * 100:.0f}% of the machine's {human(ram)} "
                           f"of RAM, which anything else on the box has to fit around.",
@@ -472,13 +480,13 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
             why, pred = HAZARDS[name]
             warn = pred(str(s["settings"].get(name, "?")), s) if pred else None
             if warn:
-                out.append({"what": f"setting: {name}", "detail": warn,
-                            "value": s["settings"].get(name)})
-    out.extend(search_findings(sr))
+                out.append({"kind": "setting", "what": f"setting: {name}",
+                            "detail": warn, "value": s["settings"].get(name)})
+    out.extend({"kind": "search", **f} for f in search_findings(sr))
     # Everything above is a comparison against a threshold that someone chose. These are against
     # the series' own recent past, so they catch the shapes no threshold can: a pool that has been
     # climbing all afternoon is not over any limit until it is.
-    out.extend(a.as_finding() for a in scan(hist or {}))
+    out.extend({"kind": "trend", **a.as_finding()} for a in scan(hist or {}))
     return out
 
 

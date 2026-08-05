@@ -410,3 +410,65 @@ def test_the_reason_comes_before_the_sql_on_a_failed_row():
     row = next(strip(x) for x in mcp_frame([bad], [], False, 150, 0, 0, 20, open_pid=7)
                if "✗" in strip(x))
     assert row.index("does not exist") < row.index("SELECT")
+
+
+# ---- the findings screen ------------------------------------------------------------------------
+
+FOUND = [{"kind": "storage", "what": "orphaned temp files", "detail": "24 files, 72.6G. Older.",
+          "bytes_reclaimable": 77975027712, "fix": "delete the files",
+          "verify": "select count(*) from duckdb_temporary_files()"},
+         {"kind": "memory", "what": "process memory paged out", "detail": "70.9G in swap."},
+         {"kind": "setting", "what": "setting: checkpoint_threshold", "detail": "WAL is 27.7G."}]
+
+
+def test_the_summary_line_counts_by_kind():
+    from serenedash.views import findings_frame
+
+    head = strip(findings_frame(FOUND, False, 140, 0, 0, 20)[0])
+    assert "Status summary" in head and "3 findings" in head
+    assert "1 storage" in head and "1 memory" in head and "1 setting" in head
+
+
+def test_nothing_tripped_is_stated_rather_than_left_blank():
+    from serenedash.views import findings_frame
+
+    out = [strip(x) for x in findings_frame([], False, 100, 0, 0, 20)]
+    assert "nothing tripped" in out[0]
+    assert any("not an absence of one" in ln for ln in out)
+
+
+def test_opening_a_finding_shows_the_numbers_and_the_fix():
+    # A finding is an argument and the reader is meant to be able to disagree with it, which needs
+    # the operands rather than a summary of them.
+    from serenedash.views import findings_frame
+
+    out = [strip(x) for x in findings_frame(FOUND, False, 140, 0, 0, 30, True)]
+    assert any("orphaned temp files" in ln for ln in out)
+    assert any("bytes_reclaimable" in ln for ln in out)
+    assert any("delete the files" in ln for ln in out)
+    assert any("duckdb_temporary_files" in ln for ln in out)
+
+
+def test_the_findings_screen_reports_where_it_put_each_row():
+    # Clicking is not scanning: a row is whatever the data says, with no shape to match, so the
+    # frame reports the line it drew each item on and the server draws a box there.
+    from serenedash.views import findings_frame
+
+    anchors = []
+    lines = findings_frame(FOUND, False, 140, 0, 0, 20, anchors=anchors)
+    assert len(anchors) == 3
+    for row, item in anchors:
+        assert FOUND[item]["what"][:20] in strip(lines[row])
+
+
+def test_a_click_selects_and_opens_that_row():
+    from serenedash.views import findings_nav
+
+    n = findings_nav({"scroll": 0, "sel": 0, "open": False}, "sel:2", FOUND)
+    assert n["sel"] == 2 and n["open"] is True
+
+
+def test_findings_has_a_key_and_follow_moved_off_it():
+    # `f` was the logs follow toggle. A letter that means one thing globally and another inside one
+    # panel means two things; follow is on space now, which is what a pager uses anyway.
+    assert DETAIL["findings"] == "f" and ("f", "findings") in KEYS

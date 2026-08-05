@@ -36,6 +36,7 @@ import time
 import urllib.parse
 
 from . import export
+from .export import runs
 from .fmt import strip
 
 PAGE = """<!doctype html>
@@ -43,13 +44,19 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>serenedash</title><style>
 :root{color-scheme:dark light}
-body{margin:0;padding:1.2rem;background:#1a1d23;color:#e6eaf2;
+body{margin:0;padding:.8rem;background:#1a1d23;color:#e6eaf2;
  font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-#s{font-size:12px;color:#9aa3af;margin:0 0 .5rem;display:flex;gap:.6rem;align-items:center}
+/* The old top line carried the panel name and a clock, both of which the frame itself prints,
+   and a status that only matters when something is wrong. So it is a chip now: absent while the
+   stream is healthy, present the moment it is not. */
+#s{position:fixed;top:.6rem;right:.8rem;z-index:5;font-size:12px;color:#9aa3af;
+ background:#101318cc;border:1px solid #2b303b;border-radius:4px;padding:.2rem .5rem;
+ display:none;gap:.6rem;align-items:center;backdrop-filter:blur(3px)}
+#s.off,#s.wait,#s.find{display:flex}
 #s b{color:#f5d08a;font-weight:600}
 #s.off{color:#ff8b96}
 #s.wait b{color:#7cc4ff}
-#q{display:none;margin-left:auto;background:#101318;border:1px solid #2b303b;border-radius:4px;
+#q{display:none;background:#101318;border:1px solid #2b303b;border-radius:4px;
  color:#e6eaf2;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;padding:.25rem .5rem;
  width:14rem}
 #q:focus{outline:none;border-color:#f5d08a}
@@ -71,7 +78,7 @@ body{margin:0;padding:1.2rem;background:#1a1d23;color:#e6eaf2;
 </style></head><body>
 <div id=s><span id=lbl>connecting</span>
 <input id=q placeholder="filter logs  (/)" spellcheck=false></div>
-<div id=f></div>
+<div id=f>connecting…</div>
 <script>
 const views = __VIEWS__, keys = __KEYS__;
 let view = new URLSearchParams(location.search).get('view') || 'main';
@@ -83,6 +90,8 @@ let needle = new URLSearchParams(location.search).get('q') || '';
 const FILTERS = ['logs'];
 // Only the label is rewritten. Rebuilding the whole bar would replace the input element every
 // tick, which drops focus and the half-typed word with it.
+// An empty label with no class means the chip is not shown at all: a dashboard that is working
+// has nothing to say about itself, and the frame says the rest.
 function say(txt, cls){ lbl.innerHTML = txt;
   st.className = (cls || '') + (FILTERS.includes(view) ? ' find' : ''); }
 // The stream carries the view in its own URL, so EventSource's automatic reconnect asks for the
@@ -102,7 +111,7 @@ function connect(){
       sid = m.id || sid; navigable = !!m.nav;
       if (m.view !== view){ view = m.view; history.replaceState(0,'',url()); }
       overlay(m.hits || []);
-      say('<b>' + m.view + '</b> ' + m.at + ' &middot; click a key below, or press it'); };
+      say(''); };
   es.onerror = () => say('disconnected - retrying', 'off');
 }
 connect();
@@ -116,9 +125,12 @@ function overlay(hits){
     r.setAttribute('x', h.x); r.setAttribute('y', h.y);
     r.setAttribute('width', h.w); r.setAttribute('height', h.h);
     r.setAttribute('class', 'hit'); r.setAttribute('rx', '2');
-    const t = document.createElementNS(NS, 'title'); t.textContent = 'key: ' + h.key;
+    const t = document.createElementNS(NS, 'title');
+    t.textContent = h.action ? 'open' : 'key: ' + h.key;
     r.appendChild(t);
-    r.onclick = () => go(h.view);
+    // Two kinds of box over one frame: a key-bar box switches view, a row box opens that row. The
+    // row's index travels as the "key", because /nav takes keys and a click is one.
+    r.onclick = () => (h.action ? nav(h.action) : go(h.view));
     svg.appendChild(r); });
 }
 
@@ -359,13 +371,25 @@ def start(host, port, views, state, keys):
     return hub, srv
 
 
-def frame_payload(view, lines, cols=None, keys=None, sid="", nav=False):
+def row_hits(anchors, cols, pad=8):
+    """Full-width boxes over the rows a frame reported, each carrying the item it stands for."""
+    return [{"key": f"sel:{item}", "view": "", "action": f"sel:{item}",
+             "x": round(pad, 2), "y": round(pad + row * export.LH, 2),
+             "w": round(cols * export.CW, 2), "h": round(export.LH, 2)}
+            for row, item in anchors or []]
+
+
+def frame_payload(view, lines, cols=None, keys=None, sid="", nav=False, anchors=None):
     """One frame for the wire. `cols` pins the grid so every view scales identically on the page.
 
     `sid` is how the tab learns which subscriber it is, so it can send keys back to /nav. `nav`
     says this view answers to j/k at all, which is what stops the page from swallowing them on a
     view where they do nothing.
     """
+    grid = cols or max((sum(len(t) for _, t, *_ in runs(ln)) for ln in lines), default=80)
     return json.dumps({"view": view, "svg": export.svg(lines, cols=cols),
-                       "hits": hits(lines, keys or {}), "id": sid, "nav": bool(nav),
+                       # Row boxes FIRST, so a key-bar box drawn later wins where they overlap -
+                       # the bar is at the foot of the frame and a list can reach it.
+                       "hits": row_hits(anchors, grid) + hits(lines, keys or {}),
+                       "id": sid, "nav": bool(nav),
                        "at": time.strftime("%H:%M:%S")}).encode()

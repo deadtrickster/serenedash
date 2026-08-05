@@ -190,17 +190,25 @@ LEGEND = (
 # `search` takes i, for index: s was storage before there was a search engine on screen at all, and
 # moving it would retrain the one key that is used most.
 DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
-          "logs": "o", "mcp": "n",
+          "logs": "o", "mcp": "n", "findings": "f",
           "host": "h", "doctor": "d", "legend": "l", "search": "i"}
 
 
 # No j/k here: nothing on the main frame scrolls, so it is carried by the views that do scroll and
 # the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
 # on a 96-column terminal.
-KEYS = (("q", "quit"), ("s", "storage"), ("m", "memory"), ("a", "activity"), ("t", "threads"),
-        ("p", "profile"), ("i", "search"), ("o", "logs"), ("n", "mcp"), ("g", "graph"),
-        ("c", "config"), ("h", "host"), ("d", "doctor"), ("l", "legend"), ("x", "mouse"))
+KEYS = (("q", "quit"), ("f", "findings"), ("s", "storage"), ("m", "memory"),
+        ("a", "activity"), ("t", "threads"), ("p", "profile"), ("i", "search"), ("o", "logs"),
+        ("n", "mcp"), ("g", "graph"), ("c", "config"), ("h", "host"), ("d", "doctor"),
+        ("l", "legend"), ("x", "mouse"))
 
+
+
+# What each kind is called on screen, and its colour. Kept beside each other so a kind cannot get a
+# name in one place and a colour in another.
+KINDNAME = {"storage": "storage", "memory": "memory", "setting": "setting",
+            "search": "search", "trend": "trend", "other": "other"}
+KINDCOL = {"storage": "cyn", "memory": "mag", "setting": "yel", "search": "grn", "trend": "blu"}
 
 def qty(n):
     """A count, abbreviated base 1000. NOT human() — that is base 1024 and these are documents.
@@ -447,13 +455,18 @@ def biggest_literal(q):
     return hi - lo, q[lo:lo + 48]
 
 
-def activity_frame(s, col, width, scroll, full=None):
-    """The `a` view: every session and its whole statement, not the first 90 characters.
+def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=40,
+                   anchors=None):
+    """The `a` view: every session, collapsed, and the whole statement of the one you open.
 
-    `full` is a separately-fetched, untruncated copy of the statements — this is the one screen that
-    wants them, so it is the one screen that pays for them. The per-tick sample carries only what
-    the main panel can display (see `sample`), which on this deployment is the difference between
-    40 KB and 1.84 MB every five seconds.
+    Collapsed by DEFAULT. This view used to wrap every statement in full on the theory that the
+    main panel already truncates them - and on this deployment a hybrid-search statement is 68 KB,
+    31% of it one float literal, so three of them buried the session list they belonged to. A list
+    you can walk answers "what is running" without answering "what is in it" first.
+
+    `full` is a separately-fetched, untruncated copy - this is the one screen that wants it, so it
+    is the one screen that pays for it. The per-tick sample carries only what the main panel can
+    display (see `sample`), which here is the difference between 40 KB and 1.84 MB every 5 seconds.
     """
     c = C if col else NOCOLOR
     W = max(70, width)
@@ -465,35 +478,69 @@ def activity_frame(s, col, width, scroll, full=None):
            + "  ".join(f"{k} {v}" for k, v in sorted(st.items())) + f"{c['r']}", ""]
     if not rows:
         out.append(f"{c['dim']}no sessions{c['r']}")
-    for stt, q, n in rows:
+        return out[scroll:]
+    sel = max(0, min(sel, len(rows) - 1))
+    if open_:
+        return out[:1] + _statement(rows[sel], c, W, height, scroll)
+
+    room = max(1, height - len(out) - 3)
+    start = max(0, min(sel - room // 2, len(rows) - room))
+    for i, (stt, q, n) in enumerate(rows[start:start + room], start=start):
         run = stt == "active"
-        head = f"{(c['grn'] + '▸') if run else (c['dim'] + '·')} {stt}{c['r']}"
-        # Only measured against a statement held in full. Against the 200-character head the share
-        # would be a share of the head, which is a different question wearing the same words.
-        lit, preview = biggest_literal(q) if n > 2000 and len(q) >= n else (0, "")
-        if n > 2000:
-            # Characters, not bytes — human() is base 1024 and this is text the server measured with
-            # length(). One denominator for the row: every figure on it divides by these characters.
-            head += f"  {c['dim']}{n:,} chars{c['r']}"
-            if lit:
-                # A quarter is the comparison, and it is named rather than left as a colour: the
-                # figure goes yellow when one literal is more than a quarter of the statement.
-                lc = c["yel"] if lit > n / 4 else c["dim"]
-                head += (f"  {lc}{lit:,} ({lit / n * 100:.0f}%) of them in one literal"
-                         f"{', over a quarter' if lit > n / 4 else ''}{c['r']}")
-        out.append(head)
-        if lit > n / 4:
-            # Only for the case the row above flagged, and the ellipsis says the literal runs on
-            # rather than that this line was cut - the two are different claims about the same row.
-            txt = "that literal starts " + preview + ("…" if lit > len(preview) else "")
-            out.append(f"    {c['dim']}{clip(txt, max(30, W - 8))}{c['r']}")
-        # Wrapped, not truncated: the interesting part of a statement is rarely in its first line,
-        # and the main panel already shows the head of it.
-        shown = q if len(q) >= n else q + f"  … {human(n - len(q))} more not fetched"
-        for chunk in (textwrap.wrap(shown, max(30, W - 4)) or ["(no statement)"]):
-            out.append(f"    {'' if run else c['dim']}{chunk}{c['r']}")
+        mark = f"{c['b']}›{c['r']}" if i == sel else " "
+        if anchors is not None:
+            anchors.append((len(out), i))
+        state = f"{c['grn']}▸ active{c['r']}" if run else f"{c['dim']}· {stt:<6}{c['r']}"
+        lit, _preview = biggest_literal(q) if n > 2000 and len(q) >= n else (0, "")
+        # The size and the literal share are the two things that decide whether a statement is
+        # worth opening, so they go on the collapsed row rather than inside it.
+        size = f"{c['dim']}{n:,} chars{c['r']}" if n > 2000 else f"{c['dim']}{n:,}{c['r']}"
+        share = ""
+        if lit:
+            lc = c["yel"] if lit > n / 4 else c["dim"]
+            share = f"{lc}{lit / n * 100:.0f}% one literal{c['r']}"
+        head = " ".join(str(q).split())
+        out.append(f" {mark}{state} {size:<24} {share:<26} "
+                   f"{'' if run else c['dim']}{clip(head, max(20, W - 60))}{c['r']}")
+    if start:
+        out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
+    out.append("")
+    out.append(f"  {c['dim']}j/k moves · enter opens the whole statement{c['r']}")
+    return out
+
+
+def _statement(row, c, W, height, scroll):
+    """One statement, whole. Wrapped rather than truncated - the interesting part of a statement is
+    rarely in its first line, which is why the main panel's head is not enough."""
+    stt, q, n = row
+    run = stt == "active"
+    head = f"  {(c['grn'] + '▸ active') if run else (c['dim'] + '· ' + stt)}{c['r']}"
+    lit, preview = biggest_literal(q) if n > 2000 and len(q) >= n else (0, "")
+    if n > 2000:
+        # Characters, not bytes - human() is base 1024 and this is text the server measured with
+        # length(). One denominator for the row: every figure on it divides by these characters.
+        head += f"  {c['dim']}{n:,} chars{c['r']}"
+        if lit:
+            # A quarter is the comparison, and it is named rather than left as a colour.
+            lc = c["yel"] if lit > n / 4 else c["dim"]
+            head += (f"  {lc}{lit:,} ({lit / n * 100:.0f}%) of them in one literal"
+                     f"{', over a quarter' if lit > n / 4 else ''}{c['r']}")
+    out = ["", head, ""]
+    if lit > n / 4:
+        # Only for the case the line above flagged, and the ellipsis says the literal runs on
+        # rather than that this line was cut - two different claims about the same row.
+        txt = "that literal starts " + preview + ("…" if lit > len(preview) else "")
+        out.append(f"  {c['dim']}{clip(txt, max(30, W - 6))}{c['r']}")
         out.append("")
-    return out[scroll:]
+    shown = q if len(q) >= n else q + f"  … {human(n - len(q))} more not fetched"
+    body = textwrap.wrap(shown, max(30, W - 6)) or ["(no statement)"]
+    room = max(3, height - len(out) - 3)
+    scroll = max(0, min(scroll, max(0, len(body) - room)))
+    out += [f"  {'' if run else c['dim']}{chunk}{c['r']}" for chunk in body[scroll:scroll + room]]
+    if len(body) > scroll + room:
+        out.append(f"  {c['dim']}… {len(body) - scroll - room} more lines - j/k scrolls{c['r']}")
+    out.append(f"  {c['dim']}esc goes back{c['r']}")
+    return out
 
 
 def threads_frame(thr, tcpu, by_tid, host, col, width, scroll):
@@ -670,7 +717,7 @@ def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=
     lv, ty = log_counts(rows)
     head = f"{c['b']}log{c['r']}  {c['grn'] if follow else c['yel']}"
     head += f"{'following' if follow else 'paused'}{c['r']}  "
-    head += f"{c['dim']}f follow  / filter{c['r']}  "
+    head += f"{c['dim']}space follow  / filter{c['r']}  "
     if source:
         head += f"{c['dim']}{source}{c['r']}  {c['dim']}·{c['r']}  {len(rows)} lines"
         if lv:
@@ -720,7 +767,7 @@ def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=
                    f"{clip(msg, max(20, W - 36))}")
     behind = len(rows) - (start + len(shown))
     if behind > 0:
-        out.append(f"  {c['yel']}… {behind} newer below - press f to follow{c['r']}")
+        out.append(f"  {c['yel']}… {behind} newer below - space follows{c['r']}")
     return out
 
 
@@ -1729,4 +1776,137 @@ def mcp_nav(nav, key, rows, live=()):
         n["sel"] = 0
     else:
         n["sel"] = max(0, min(max(0, len(sess) - 1), n["sel"] + (-step if up else step)))
+    return n
+
+
+def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
+                   anchors=None):
+    """The `f` view: every measured finding, countable at a glance and readable one at a time.
+
+    The summary line first, because "5 findings" is the answer to the question you had before you
+    opened this - and it counts by KIND, which each finding carries from the collector rather than
+    from a categoriser reading its wording. An empty list is not silence: nothing tripped is a
+    result, and it says so in as many words.
+    """
+    c = C if col else NOCOLOR
+    W = max(70, width)
+    kinds = {}
+    for f in found:
+        kinds[f.get("kind", "other")] = kinds.get(f.get("kind", "other"), 0) + 1
+    head = f"{c['b']}Status summary{c['r']}  "
+    if found:
+        head += f"{c['yel']}{c['b']}{len(found)} finding{'s' if len(found) != 1 else ''}{c['r']}"
+        head += "  " + "  ".join(f"{c['dim']}·{c['r']}  {n} {KINDNAME.get(k, k)}"
+                                 for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
+    else:
+        head += f"{c['grn']}nothing tripped{c['r']}"
+    out = [head, ""]
+    if not found:
+        out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
+            "Nothing tripped is a result, not an absence of one: every comparison ran and none of "
+            "them came out the wrong way. What was checked is in the legend (l); a panel that "
+            "could not be read at all says so on its own screen rather than by staying quiet here.",
+            max(40, W - 4))]
+        return out[scroll:]
+
+    sel = max(0, min(sel, len(found) - 1))
+    if open_:
+        return out[:1] + _finding_detail(found[sel], c, W, height, scroll)
+
+    room = max(1, height - len(out) - 3)
+    start = max(0, min(sel - room // 2, len(found) - room))
+    for i, f in enumerate(found[start:start + room], start=start):
+        mark = f"{c['b']}›{c['r']}" if i == sel else " "
+        kc = KINDCOL.get(f.get("kind"), "cyn")
+        # Where this row landed, for whoever draws a clickable box over it. Reported by the frame
+        # rather than found by a scanner: a row is whatever the data says, with no shape to match.
+        if anchors is not None:
+            anchors.append((len(out), i))
+        # The first sentence of the detail, not the whole of it: what the finding IS goes in the
+        # left column and the reason has to survive being cut, so the numbers come first in every
+        # detail string the collector writes.
+        why = strip((f.get("detail") or "").split(". ")[0])
+        out.append(f" {mark}{c[kc]}{KINDNAME.get(f.get('kind'), '?'):<8}{c['r']} "
+                   f"{c['b']}{clip(f.get('what', '?'), 34):<34}{c['r']} "
+                   f"{c['dim']}{clip(why, max(10, W - 50))}{c['r']}")
+    if start:
+        out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
+    out.append("")
+    out.append(f"  {c['dim']}j/k moves · enter reads the whole finding{c['r']}")
+    return out
+
+
+def _finding_detail(f, c, W, height, scroll):
+    """One finding, whole: what was measured, the numbers behind it, and how to check it.
+
+    The numbers are printed as themselves rather than summarised. A finding is an argument, and the
+    reader is meant to be able to disagree with it - which needs the operands.
+    """
+    kc = KINDCOL.get(f.get("kind"), "cyn")
+    out = ["", f"  {c[kc]}{c['b']}{f.get('what', '?')}{c['r']}"
+              f"   {c['dim']}{KINDNAME.get(f.get('kind'), '')}{c['r']}", ""]
+    for ln in textwrap.wrap(f.get("detail") or "", max(40, W - 6)):
+        out.append(f"  {ln}")
+    # Every key that is not prose: the operands the sentence above was computed from.
+    nums = {k: v for k, v in f.items()
+            if k not in ("what", "detail", "kind", "fix", "verify", "note") and v is not None}
+    if nums:
+        out.append("")
+        for k, v in nums.items():
+            shown = human(v) if isinstance(v, int) and abs(v) > 9999 and "bytes" in k else v
+            out.append(f"  {c['dim']}{k:<28}{c['r']}{shown}")
+    for label, key in (("fix", "fix"), ("check it", "verify"), ("note", "note")):
+        if f.get(key):
+            out.append("")
+            out.append(f"  {c['yel']}{label}{c['r']}")
+            out += [f"  {c['dim']}{ln}{c['r']}"
+                    for ln in textwrap.wrap(str(f[key]), max(40, W - 6))]
+    out.append("")
+    out.append(f"  {c['dim']}esc goes back{c['r']}")
+    room = max(3, height - 2)
+    if len(out) > room:
+        scroll = max(0, min(scroll, len(out) - room))
+        out = out[scroll:scroll + room - 1] + [f"  {c['dim']}… j/k scrolls{c['r']}"]
+    return out
+
+
+def list_nav(nav, key, items):
+    """A list you walk, with one item open. Shared by the findings and activity screens because
+    they are the same interaction, and two copies would drift on the first change to either."""
+    return findings_nav(nav, key, items)
+
+
+def findings_nav(nav, key, found):
+    """One key, applied to the findings screen. Same contract as `mcp_nav`, same reasons.
+
+    None means "not mine": there is nothing left to close, so the caller leaves the view. Shared by
+    the terminal and the page so a key cannot come to mean two things.
+    """
+    n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+    key = {"enter": "\r", "esc": "\x1b"}.get(key, key)
+    step = 1 if key in ("j", "k", "down", "up") else 10
+    up = key in ("k", "up", "pgup")
+    if key == "\x1b":
+        if n["open"]:
+            n["open"], n["scroll"] = False, 0
+            return n
+        return None
+    if key.startswith("sel:"):
+        # A click, from the page. The row is addressed by index because that is what the hit area
+        # knows - it was computed from the frame that is on screen.
+        try:
+            n["sel"], n["open"], n["scroll"] = int(key[4:]), True, 0
+        except ValueError:
+            pass
+        return n
+    if key in ("\r", "\n"):
+        n["open"], n["scroll"] = not n["open"], 0
+        return n
+    if n["open"]:
+        n["scroll"] = 0 if key in ("end", "home") else max(0, n["scroll"] + (-step if up else step))
+        return n
+    if key in ("end", "home"):
+        n["sel"] = 0
+    elif found:
+        n["sel"] = max(0, min(len(found) - 1, n["sel"] + (-step if up else step)))
     return n
