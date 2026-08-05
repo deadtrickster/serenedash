@@ -27,7 +27,14 @@ dependencies = ["psycopg[binary]>=3.1"]
 # The dashboard does not import mcp; only the server entry point does. Someone who just wants the
 # TUI should not have to install an agent protocol.
 mcp = ["mcp>=2.0.0"]
-dev = ["pytest>=8", "ruff>=0.6"]
+# ruff is PINNED, for the reason shellcheck is pinned in ci.yml: a linter that picks its own
+# version turns "someone released a new rule" into "the build is red and nothing changed here", and
+# a clean local run stops saying anything about CI. Bump it deliberately.
+dev = ["pytest>=8", "ruff==0.16.1"]
+# The page is the half that keeps breaking, and none of it is reachable from Python. Separate
+# because a browser and its deps are a few hundred MB, and someone who wants the TUI should not
+# pay for them: `pip install -e ".[browser]" && playwright install chromium`.
+browser = ["pytest>=8", "pytest-playwright>=0.5", "playwright>=1.45"]
 
 [project.scripts]
 serenedash = "serenedash.tui:main"
@@ -63,4 +70,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Browser tests are opt-in: `pytest -m browser`. They need a chromium, so they must not be the
+# reason a plain `pytest` fails on a machine that only wants to check the renderer.
+addopts = "-q -m 'not browser'"
+markers = ["browser: drives the served page in a real browser (needs playwright)"]

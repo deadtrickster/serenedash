@@ -17,8 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         # 3.12 is the floor (backslashes in f-strings). Ubuntu 24.04 ships it, which is the
-        # deployment this is most likely to land on.
-        python: ["3.12", "3.13"]
+        # deployment this is most likely to land on. 3.14 is what this is written on, and a version
+        # nobody tests is a version that breaks quietly - it was missing from here for a while.
+        python: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -98,6 +99,37 @@ jobs:
           asyncio.run(main())
           PY
 
+  # The served page, in a real browser. Everything else in this file is Python asserting on Python,
+  # and the last several bugs were in the half that only exists in a browser: an EventSource that
+  # reconnected to a server which had forgotten what the tab was showing, a key bar that is only
+  # navigation if it can be clicked, a filter box whose keystrokes must not reach the view
+  # shortcuts. No SereneDB here - the dashboard runs against canned frames (tests/browser/harness.py)
+  # so the job is hermetic and the browser is the only moving part.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[browser]"
+      # Chromium only. Firefox and WebKit would triple the download to test a page whose whole
+      # surface is an <svg>, an EventSource and one <input>.
+      - run: playwright install --with-deps chromium
+      - name: browser tests
+        run: |
+          pytest -m browser -v \
+            --screenshot=only-on-failure --video=retain-on-failure \
+            --tracing=retain-on-failure --output=browser-results
+      # A failing browser test is close to unreadable from a log line. The trace opens in
+      # playwright.dev/trace with the DOM at every step.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-results
+          path: browser-results/
+          retention-days: 7
+
   # Against a real serened. The hermetic suite proves the rendering rules; this proves the
   # statements parse against the server's dialect and the panels hold on live data - which is the
   # half that has actually been wrong.
@@ -176,3 +208,12 @@ jobs:
           shellcheck --version
           shellcheck perf-snap.sh install.sh
           bash -n perf-snap.sh install.sh
+      # Formatting too, and for the same reason it is linted: these are installed and run under
+      # sudo. -d is diff mode, so an unformatted script fails the job and prints what it wanted.
+      - name: and formatted, so a diff is a change rather than a reflow
+        run: |
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64 \
+            -o /usr/local/bin/shfmt
+          chmod +x /usr/local/bin/shfmt
+          shfmt --version
+          shfmt -d perf-snap.sh install.sh

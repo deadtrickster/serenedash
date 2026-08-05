@@ -185,6 +185,32 @@ graph taking 81 seconds per tick.
 
 Check widths and heights against several terminal sizes, not just yours.
 
+## The page needs a browser to be verified
+
+`--serve` renders through the same frame functions as the terminal, so the panels cannot disagree.
+Everything ABOVE the frame is different code that only runs in a browser, and it is where the last
+several bugs were: an `EventSource` reconnecting to a server that had forgotten which view the tab
+wanted, so every frame it sent was discarded and the tab sat empty; a `?view=` link that only ever
+loaded main; a key bar that is only navigation if it can be clicked; a filter box whose keystrokes
+reached the view shortcuts. Every one of those was green in the Python suite.
+
+    pip install -e ".[browser]" && playwright install chromium
+    pytest -m browser                      # opt-in; a plain `pytest` deselects them
+
+`tests/browser/harness.py` is a dashboard with canned frames, run as its own PROCESS. A process
+because half of what these tests check is what the page does when the dashboard dies, and
+`srv.shutdown()` leaves every open stream held by its thread - the tab sees no drop and the test
+proves nothing about the case it was written for.
+
+Write the assertion against what a person reads off the screen. SVG text is not `innerText`, and
+the exporter emits one `<text>` per styled run, so `q quit` concatenates to `qquit`; join the runs
+with a space. And when a test waits for something to APPEAR, ask whether it was already there - the
+unfiltered log already contains the line the filter selects, so waiting for it alone passes before
+the filter has done anything. Wait for the absence too.
+
+Prove the test would have caught the bug. Reverting the fix and watching it go red takes a minute
+and is the only evidence that a new browser test is worth its runtime.
+
 ## Comments
 
 Explain the finding, not the syntax. A comment here should say what was measured and what it ruled
