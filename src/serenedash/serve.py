@@ -44,30 +44,53 @@ a:hover{color:#e6e9ef;border-color:#4b5263}
 a.on{color:#1a1d23;background:#e5c07b;border-color:#e5c07b;font-weight:600}
 #s{margin-left:auto;font-size:12px;color:#7d8590}
 #s.off{color:#e06c75}
-#f{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.6rem;overflow-x:auto}
-#f svg{display:block;max-width:none}
+#f{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.6rem;overflow-x:auto;
+ transition:opacity .12s}
+#f.wait{opacity:.35}
+#s.wait{color:#e5c07b}
+/* The SVG carries width/height so a standalone .svg opens at a sane size, but on the page the
+   viewBox should do the work: scale to the container rather than sit at 1229px with the rest of a
+   wide window empty beside it. Aspect ratio is preserved by the viewBox. */
+#f svg{display:block;width:100%;height:auto}
 @media(prefers-color-scheme:light){body{background:#fbfbfd;color:#2b303b}}
 </style></head><body>
 <nav id=n></nav><div id=f>connecting…</div>
 <script>
-const views = __VIEWS__;
+const views = __VIEWS__, keys = __KEYS__;
 let view = new URLSearchParams(location.search).get('view') || 'main';
 const nav = document.getElementById('n'), fr = document.getElementById('f'),
       st = document.getElementById('s') || Object.assign(document.createElement('span'),{id:'s'});
 views.forEach(v => {
   const a = document.createElement('a');
+  const k = Object.keys(keys).find(x => keys[x] === v);
   a.textContent = v; a.href = '?view=' + v;
+  if (k) a.title = 'key: ' + k;
   if (v === view) a.className = 'on';
-  a.onclick = e => { e.preventDefault(); view = v; history.replaceState(0,'','?view='+v);
-                     [...nav.querySelectorAll('a')].forEach(x=>x.className = x.textContent===v?'on':'');
-                     fetch('/view?name=' + v); };
+  // Say so immediately on switch. Most views re-render from data already in memory and land in
+  // milliseconds, but `activity` re-fetches whole statements and `doctor` re-runs its checks, and
+  // a page that looks frozen for a second is indistinguishable from one that has broken.
+  a.onclick = e => { e.preventDefault(); go(v); };
   nav.appendChild(a);
 });
 nav.appendChild(st); st.textContent = 'connecting';
 const es = new EventSource('/stream');
-es.onmessage = e => { const m = JSON.parse(e.data); if (m.view === view) fr.innerHTML = m.svg;
+es.onmessage = e => { const m = JSON.parse(e.data);
+                      if (m.view !== view) return;          // a frame for the view we just left
+                      fr.innerHTML = m.svg; fr.classList.remove('wait');
                       st.textContent = m.at; st.className = ''; };
 es.onerror = () => { st.textContent = 'disconnected - retrying'; st.className = 'off'; };
+
+function go(v){ if (!views.includes(v) || v === view) return;
+  view = v; history.replaceState(0,'','?view='+v);
+  [...nav.querySelectorAll('a')].forEach(x=>x.className = x.textContent===v?'on':'');
+  fr.classList.add('wait'); st.classList.add('wait'); st.textContent = 'loading ' + v;
+  fetch('/view?name=' + v); }
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;      // leave the browser's own shortcuts alone
+  if (e.key === 'Escape') return go('main');
+  const v = keys[e.key.toLowerCase()];
+  if (v) { e.preventDefault(); go(v); }
+});
 </script></body></html>
 """
 
@@ -105,7 +128,7 @@ class Hub:
             self.subs.discard(q)
 
 
-def handler_for(hub, views, state):
+def handler_for(hub, views, state, keys):
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -124,13 +147,24 @@ def handler_for(hub, views, state):
         def do_GET(self):
             path = self.path.split("?")[0]
             if path == "/":
-                page = PAGE.replace("__VIEWS__", json.dumps(views))
+                page = (PAGE.replace("__VIEWS__", json.dumps(views))
+                            .replace("__KEYS__", json.dumps(keys)))
                 return self._send(200, page.encode())
             if path == "/view":
                 name = self.path.partition("name=")[2].split("&")[0]
                 if name in views:
                     state["view"] = name
-                return self._send(204 if False else 200, b"ok", "text/plain")
+                    # Render NOW from the data the loop already has, rather than leaving the browser
+                    # to wait for the next tick. Switching a view is pure formatting - the terminal
+                    # does it on a keypress without re-querying anything - so making the page wait
+                    # up to a whole refresh interval was the dashboard being slower than the data.
+                    render = state.get("render")
+                    if render:
+                        try:
+                            hub.publish(render(name))
+                        except Exception:                    # noqa: BLE001
+                            pass
+                return self._send(200, b"ok", "text/plain")
             if path != "/stream":
                 return self._send(404, b"no", "text/plain")
 
@@ -164,10 +198,10 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
-def start(host, port, views, state):
+def start(host, port, views, state, keys):
     """Serve in a background thread. Returns (hub, server) - the caller publishes frames."""
     hub = Hub()
-    srv = Server((host, port), handler_for(hub, views, state))
+    srv = Server((host, port), handler_for(hub, views, state, keys))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return hub, srv
 

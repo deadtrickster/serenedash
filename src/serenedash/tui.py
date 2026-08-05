@@ -8,6 +8,7 @@ import signal
 import sys
 import termios
 import textwrap
+import threading
 import time
 import tty
 
@@ -320,14 +321,18 @@ def main():
         signal.signal(sig, lambda *_: sys.exit(0))
     hub = wsrv = None
     wstate = {"view": "main"}
+    wlock = threading.Lock()
     if a.serve:
         # 127.0.0.1 unless a host is given. This exposes storage sizes, statement text and settings
         # with no authentication, so the default must not be the whole network - binding wider is a
         # decision someone makes deliberately by typing it.
         host, _, port = a.serve.rpartition(":")
         # DETAIL already carries doctor and legend; listing them again put doctor in the nav twice.
+        # DETAIL is {view: key}; the page wants {key: view}, and the same keys as the terminal so
+        # the two are one tool rather than two.
         hub, wsrv = _serve.start(host or "127.0.0.1", int(port),
-                                 ["main", *sorted(DETAIL)], wstate)
+                                 ["main", *sorted(DETAIL)], wstate,
+                                 {k: v for v, k in DETAIL.items()})
         print(f"serving http://{host or '127.0.0.1'}:{int(port)}/", file=sys.stderr)
     pidfile = write_pidfile(a.perf_dir)
     # Raw-ish mode for the whole session, not per keystroke. Restored in the finally below, in the
@@ -502,10 +507,19 @@ def main():
                     # be, so a 100-column terminal served a 100-column dashboard to a 4K display.
                     wmain = (frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, True, ww, 44, why,
                                    sea, held) if s is not None or wname == "main" else lines)
-                    wl = view_lines(wname, cfg, a.perf_dir, wmain, s, sz, hist, perf, thr, tcpu,
-                                    hinfo, sea, True, ww,
-                                    full=full_queries(cfg) if wname == "activity" else None)
-                    hub.publish(_serve.frame_payload(wname, wl))
+                    # Published as a closure so the HTTP thread can re-render any view from the
+                    # data this tick already collected, instead of the browser waiting up to a whole
+                    # interval for the next one. Rebound each tick, so it always closes over current
+                    # data; the lock keeps a render off a half-updated tick.
+                    def _render(name, _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww)):
+                        wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w = _d
+                        with wlock:
+                            return _serve.frame_payload(name, view_lines(
+                                name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
+                                True, _w,
+                                full=full_queries(cfg) if name == "activity" else None))
+                    wstate["render"] = _render
+                    hub.publish(_render(wname))
                 except Exception:                                # noqa: BLE001
                     pass          # a browser must never be able to take the terminal down with it
             if a.once:
