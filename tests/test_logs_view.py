@@ -91,3 +91,26 @@ def test_an_unparseable_line_is_kept_rather_than_dropped():
 def test_counts_summarise_the_buffer_that_is_actually_shown():
     lv, ty = counts(rows(3) + [("t", "Search", "WARN", "slow")])
     assert lv == {"INFO": 3, "WARN": 1} and ty == {"Storage": 3, "Search": 1}
+
+
+def test_the_header_says_how_to_filter_rather_than_just_saying_search():
+    # `i` is the search VIEW, and pressing it in the log switched away from the log - which is not
+    # what a header advertising "Search" led anyone to expect. It says the key now.
+    head = strip(logs_frame(rows(5), "src", None, "", False, 120, 0, 20, True)[0])
+    assert "/ filter" in head and "f follow" in head
+
+
+def test_a_filter_being_typed_is_shown_as_it_is_typed():
+    # Including the empty one: `/` with nothing after it has to look different from no filter at
+    # all, or the first keystroke goes into what looks like a dead terminal.
+    mid = [strip(ln) for ln in logs_frame(rows(5), "src", None, "err", False, 120, 0, 20, True,
+                                          typing=True)]
+    assert any("/err" in ln and "esc drops it" in ln for ln in mid)
+    empty = [strip(ln) for ln in logs_frame(rows(5), "src", None, "", False, 120, 0, 20, True,
+                                            typing=True)]
+    assert any(ln.strip().startswith("/") for ln in empty)
+
+
+def test_a_filter_that_matches_nothing_says_which_filter():
+    out = [strip(ln) for ln in logs_frame([], "src", None, "zzz", False, 120, 0, 20, True)]
+    assert any("nothing matched /zzz" in ln for ln in out)

@@ -99,7 +99,16 @@ def wait_key(timeout):
     # exited the view — while the rest of the sequence sat in the buffer waiting to be returned as
     # separate keystrokes.
     if not sys.stdin.isatty():
-        return ""
+        # No keyboard to wait on, so SLEEP the interval - do not return instantly. Returning made
+        # the caller treat every spin as an elapsed tick, and the loop ran the whole collection path
+        # flat out: a `--serve` run under systemd, nohup or a container pinned a core and hammered
+        # the server it is supposed to be watching. Still woken by the perf-snap signal.
+        select.select([_WAKE_R], [], [], timeout)
+        try:
+            os.read(_WAKE_R, 4096)
+        except OSError:
+            return ""
+        return "wake"
     fd = sys.stdin.fileno()
 
     def rd(n=1):
@@ -177,7 +186,7 @@ WEB_ROWS = 44
 
 
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
-               full=None, logtail=None):
+               full=None, logtail=None, needle=""):
     """One view by name, or the main frame. The single dispatch both the export and --serve use.
 
     The terminal has its own dispatch inside the loop because it also owns scroll, selection and the
@@ -208,7 +217,7 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         # consumer that just wants the panel should not have to know where this server keeps its
         # log. Always following - a page with no scroll state has nothing to hold a position for.
         rows, src, why = logtail or _logs.tail(cfg, 400)
-        return logs_frame(rows, src, why, "", col, w, 0, WEB_ROWS, True)
+        return logs_frame(_logs.matching(rows, needle), src, why, needle, col, w, 0, WEB_ROWS, True)
     return lines
 
 
@@ -318,6 +327,7 @@ def main():
     # offset from the end drifts as lines arrive - you stay N lines from the newest while the lines
     # you were reading slide past - which is the thing that makes a tailer unusable for reading.
     lrows, lsrc, lwhy, lfollow, lscroll, lneedle = [], "", None, True, 0, ""
+    lfind = None      # the filter being typed, or None when not typing. '' is a filter, not absence.
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -338,7 +348,7 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(0))
     hub = wsrv = None
-    wstate = {"view": "main"}
+    wstate = {}   # only the render closure now; which view a tab shows is that tab's business
     wlock = threading.Lock()
     if a.serve:
         # 127.0.0.1 unless a host is given. This exposes storage sizes, statement text and settings
@@ -526,26 +536,29 @@ def main():
                 # not change what the server measured, and pushing a frame per mouse cell would be
                 # the same mistake the activity view made by re-fetching per redraw.
                 try:
-                    wname, ww = wstate["view"], (a.width or 168)
+                    ww = a.width or 168
                     # The main frame has to be rebuilt at the export width. Handing the browser the
                     # terminal's frame made the page follow whatever size this window happened to
                     # be, so a 100-column terminal served a 100-column dashboard to a 4K display.
-                    wmain = (frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, True, ww, 44, why,
-                                   sea, held) if s is not None or wname == "main" else lines)
+                    wmain = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, True, ww, 44, why,
+                                  sea, held)
                     # Published as a closure so the HTTP thread can re-render any view from the
                     # data this tick already collected, instead of the browser waiting up to a whole
                     # interval for the next one. Rebound each tick, so it always closes over current
                     # data; the lock keeps a render off a half-updated tick.
-                    def _render(name, _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww)):
+                    def _render(name, needle="",
+                                _d=(wmain, s, sz, hist, perf, thr, tcpu, hinfo, sea, ww)):
                         wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea, _w = _d
                         with wlock:
                             return _serve.frame_payload(name, view_lines(
                                 name, cfg, a.perf_dir, wm, _s, _sz, _h, _p, _t, _tc, _hi, _sea,
                                 True, _w,
-                                full=full_queries(cfg) if name == "activity" else None),
-                                cols=_w, keys=wkeys)
+                                full=full_queries(cfg) if name == "activity" else None,
+                                needle=needle), cols=_w, keys=wkeys)
                     wstate["render"] = _render
-                    hub.publish(_render(wname))
+                    # One render per view someone is actually watching. Nothing is rendered when
+                    # no browser is connected.
+                    hub.publish_tick(_render)
                 except Exception:                                # noqa: BLE001
                     pass          # a browser must never be able to take the terminal down with it
             if a.once:
@@ -690,6 +703,25 @@ def main():
                     view, scroll, tipon = "main", 0, False
                 elif tipon:
                     tipon, tipkey = False, None
+                shown = [None] * len(shown)
+                continue
+            if lfind is not None:
+                # The same tiny line editor as the config one, on the log filter. Enter keeps it and
+                # gets out of the way, Esc drops it - matching the box on the web page, which is the
+                # same filter arriving down the stream URL.
+                if k in ("\r", "\n"):
+                    lneedle, lfind = lfind, None
+                elif k == "\x1b":
+                    lneedle, lfind = "", None
+                elif k in ("\x7f", "\b"):
+                    lfind = lfind[:-1]
+                elif k and len(k) == 1 and k.isprintable():
+                    lfind += k
+                lscroll = 0
+                shown = [None] * len(shown)
+                continue
+            if view == "logs" and k == "/":
+                lfind = lneedle
                 shown = [None] * len(shown)
                 continue
             if view == "logs" and k in ("f", "j", "k", "down", "up", "pgup", "pgdn"):

@@ -650,7 +650,8 @@ def memory_frame(s, hist, host, col, width, scroll):
     return out[scroll:]
 
 
-def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=True):
+def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=True,
+               typing=False):
     """The `o` view: the server's own log, newest last, filtered.
 
     Newest LAST, like `tail -f` and unlike most log UIs. You read a log to find out what happened
@@ -665,6 +666,7 @@ def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=
     lv, ty = log_counts(rows)
     head = f"{c['b']}log{c['r']}  {c['grn'] if follow else c['yel']}"
     head += f"{'following' if follow else 'paused'}{c['r']}  "
+    head += f"{c['dim']}f follow  / filter{c['r']}  "
     if source:
         head += f"{c['dim']}{source}{c['r']}  {c['dim']}·{c['r']}  {len(rows)} lines"
         if lv:
@@ -678,15 +680,20 @@ def logs_frame(rows, source, why, needle, col, width, scroll, height=40, follow=
     else:
         head += f"{c['yel']}no source answered{c['r']}"
     out = [head]
-    if needle:
-        out.append(f"  {c['yel']}filter{c['r']} {c['b']}{needle}{c['r']}  "
+    if typing:
+        # A block for a cursor, because the terminal's real one is parked wherever the last write
+        # left it and this editor does not move it.
+        out.append(f"  {c['yel']}/{c['r']}{c['b']}{needle}{c['r']}\u2588  "
+                   f"{c['dim']}{len(rows)} matching · enter keeps it, esc drops it{c['r']}")
+    elif needle:
+        out.append(f"  {c['yel']}/{c['r']}{c['b']}{needle}{c['r']}  "
                    f"{c['dim']}{len(rows)} matching{c['r']}")
     out.append("")
     if why:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(why, max(40, W - 4))]
         return out[scroll:]
     if not rows:
-        out.append(f"  {c['dim']}nothing matched{c['r']}" if needle else
+        out.append(f"  {c['dim']}nothing matched /{needle}{c['r']}" if needle else
                    f"  {c['dim']}the log is empty. That is a fact about the log, not about the "
                    f"server - serened logs at info by default{c['r']}")
         return out[scroll:]

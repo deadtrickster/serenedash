@@ -13,7 +13,12 @@ matters more than it sounds: the server this watches is one you restart, and a d
 quietly stops updating is worse than one that says it is disconnected.
 
 The one thing SSE cannot do is client-to-server, and the page needs exactly one of those - which
-view to draw. That is a GET, which is what a GET is for.
+view to draw. That is in the stream's own URL: `/stream?view=logs`. It used to be a separate GET
+that set one variable shared by every browser, and that variable was the bug. The page discards any
+frame that is not for the view it is showing, so a tab whose choice the server had forgotten - after
+a restart, or on a fresh load of a `?view=` link, or because another tab had just switched - threw
+every frame away and sat empty forever. Per subscriber instead of global: a reconnect carries the
+view with it, two tabs can watch different panels, and there is no state to get out of step.
 
 ## What it serves
 
@@ -23,11 +28,12 @@ do not.
 """
 import http.server
 import json
-import re
 import queue
+import re
 import socketserver
 import threading
 import time
+import urllib.parse
 
 from . import export
 from .fmt import strip
@@ -43,6 +49,11 @@ body{margin:0;padding:1.2rem;background:#1a1d23;color:#e6eaf2;
 #s b{color:#f5d08a;font-weight:600}
 #s.off{color:#ff8b96}
 #s.wait b{color:#7cc4ff}
+#q{display:none;margin-left:auto;background:#101318;border:1px solid #2b303b;border-radius:4px;
+ color:#e6eaf2;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;padding:.25rem .5rem;
+ width:14rem}
+#q:focus{outline:none;border-color:#f5d08a}
+#s.find #q{display:block}
 #f{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.6rem;overflow-x:auto;
  transition:opacity .12s}
 #f.wait{opacity:.35}
@@ -58,19 +69,39 @@ body{margin:0;padding:1.2rem;background:#1a1d23;color:#e6eaf2;
 .hit:hover{opacity:.14}
 @media(prefers-color-scheme:light){body{background:#fbfbfd;color:#2b303b}}
 </style></head><body>
-<div id=s>connecting</div><div id=f></div>
+<div id=s><span id=lbl>connecting</span>
+<input id=q placeholder="filter logs  (/)" spellcheck=false></div>
+<div id=f></div>
 <script>
 const views = __VIEWS__, keys = __KEYS__;
 let view = new URLSearchParams(location.search).get('view') || 'main';
-const fr = document.getElementById('f'), st = document.getElementById('s');
-function say(txt, cls){ st.innerHTML = txt; st.className = cls || ''; }
-const es = new EventSource('/stream');
-es.onmessage = e => { const m = JSON.parse(e.data);
-                      if (m.view !== view) return;          // a frame for the view we just left
-                      fr.innerHTML = m.svg; fr.classList.remove('wait');
-                      overlay(m.hits || []);
-                      say('<b>' + m.view + '</b> ' + m.at + ' &middot; click a key below, or press it'); };
-es.onerror = () => say('disconnected - retrying', 'off');
+const fr = document.getElementById('f'), st = document.getElementById('s'),
+      box = document.getElementById('q'), lbl = document.getElementById('lbl');
+let needle = new URLSearchParams(location.search).get('q') || '';
+// The search box lives outside the frame, because the frame is an image of a terminal and you
+// cannot type into an image. Only the views that filter get one.
+const FILTERS = ['logs'];
+// Only the label is rewritten. Rebuilding the whole bar would replace the input element every
+// tick, which drops focus and the half-typed word with it.
+function say(txt, cls){ lbl.innerHTML = txt;
+  st.className = (cls || '') + (FILTERS.includes(view) ? ' find' : ''); }
+// The stream carries the view in its own URL, so EventSource's automatic reconnect asks for the
+// right panel with no code at all - which is the whole point of doing it this way. Restarting the
+// dashboard used to leave the tab reconnected to a server that had forgotten which view it wanted,
+// and every frame it then sent was discarded by the check below.
+let es = null;
+function connect(){
+  if (es) es.close();
+  es = new EventSource('/stream?view=' + encodeURIComponent(view) +
+                       '&q=' + encodeURIComponent(needle));
+  es.onmessage = e => { const m = JSON.parse(e.data);
+      if (m.view !== view || !m.svg) return;                // a frame for the view we just left
+      fr.innerHTML = m.svg; fr.classList.remove('wait');
+      overlay(m.hits || []);
+      say('<b>' + m.view + '</b> ' + m.at + ' &middot; click a key below, or press it'); };
+  es.onerror = () => say('disconnected - retrying', 'off');
+}
+connect();
 
 // Hit areas come from the server, computed from the bar it actually rendered, so they cannot drift
 // from the text under them the way hand-placed coordinates would.
@@ -87,15 +118,30 @@ function overlay(hits){
     svg.appendChild(r); });
 }
 
+function url(){ return '?view=' + view + (needle ? '&q=' + encodeURIComponent(needle) : ''); }
+
+// Typing is not a tick. Reconnecting on every keystroke would open and drop a stream per character,
+// so the wait is short enough to feel live and long enough to be one connection per word.
+let typing = null;
+box.oninput = () => { clearTimeout(typing); typing = setTimeout(() => {
+  needle = box.value.trim(); history.replaceState(0,'',url()); connect(); }, 250); };
+box.onkeydown = e => { e.stopPropagation();          // the view keys must not fire while typing
+  if (e.key === 'Escape'){ box.value = ''; box.blur(); needle = '';
+                           history.replaceState(0,'',url()); connect(); } };
+
 function go(v){ if (!views.includes(v) || v === view) return;
-  view = v; history.replaceState(0,'','?view='+v);
+  view = v; needle = ''; box.value = '';
+  history.replaceState(0,'',url());
   // Say so immediately on switch. Most views re-render from data already in memory and land in
   // milliseconds, but `activity` re-fetches whole statements and `doctor` re-runs its checks, and
   // a page that looks frozen for a second is indistinguishable from one that has broken.
   fr.classList.add('wait'); say('loading <b>' + v + '</b>', 'wait');
-  fetch('/view?name=' + v); }
+  connect(); }      // the new stream's first frame IS the switch - nothing to race it, nothing
+                    // for the server to remember, and the URL now describes what this tab shows
+box.value = needle;
 document.addEventListener('keydown', e => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;      // leave the browser's own shortcuts alone
+  if (e.key === '/' && FILTERS.includes(view)){ e.preventDefault(); return box.focus(); }
   if (e.key === 'Escape') return go('main');
   const v = keys[e.key.toLowerCase()];
   if (v) { e.preventDefault(); go(v); }
@@ -129,36 +175,74 @@ def hits(lines, keys, cols=None, pad=8):
 
 
 class Hub:
-    """Fan-out to every connected browser. One bounded queue each.
+    """Fan-out to every connected browser. One bounded queue each, and each one names its own view.
 
     Bounded on purpose: a browser that stops reading must not grow a queue until the dashboard runs
     out of memory. Its frames are dropped instead, and it catches up on the next tick - which for a
     dashboard is the correct loss, since only the newest frame was ever interesting.
+
+    The view is a property of the subscriber, not of the server. See the module docstring: as
+    server state it left reconnecting tabs discarding every frame.
     """
 
     def __init__(self):
-        self.subs, self.lock, self.latest = set(), threading.Lock(), None
+        self.subs, self.lock, self.latest = {}, threading.Lock(), {}
 
-    def publish(self, payload):
-        self.latest = payload
+    def views(self):
+        """The distinct (view, needle) pairs someone is watching."""
         with self.lock:
-            for q in list(self.subs):
-                try:
-                    q.put_nowait(payload)
-                except queue.Full:
-                    pass
+            return set(self.subs.values())
 
-    def subscribe(self):
+    def publish_tick(self, render):
+        """Render once per view someone is actually watching, and send each to its watchers.
+
+        Nothing is rendered when nobody is connected, and a view nobody has open costs nothing -
+        the old code rendered whatever the single global variable last said, whether or not any
+        browser wanted it.
+        """
+        for key in self.views():
+            view, needle = key
+            try:
+                payload = render(view, needle)
+            except Exception:                                    # noqa: BLE001, PERF203
+                continue        # one broken panel must not stop the others being published
+            self.latest[key] = payload
+            with self.lock:
+                for q, k in list(self.subs.items()):
+                    if k == key:
+                        try:
+                            q.put_nowait(payload)
+                        except queue.Full:
+                            pass
+
+    def subscribe(self, view, render=None, needle=""):
+        """A queue already carrying a frame, so a new tab draws now rather than after one tick.
+
+        The filter travels with the view for the same reason the view does: a page that types into
+        a search box and then reconnects should not come back to an unfiltered panel.
+        """
         q = queue.Queue(maxsize=4)
+        key = (view, needle)
         with self.lock:
-            self.subs.add(q)
-        if self.latest:
-            q.put_nowait(self.latest)     # draw immediately rather than after one whole interval
+            self.subs[q] = key
+        payload = None
+        if render:
+            try:
+                payload = render(view, needle)
+                self.latest[key] = payload
+            except Exception:                                    # noqa: BLE001
+                payload = None
+        payload = payload or self.latest.get(key)
+        if payload:
+            q.put_nowait(payload)
+        # Nothing is sent when there is nothing to send. A tab that connects before the first tick
+        # used to get an empty frame, which blanked whatever it was showing and left it looking
+        # broken rather than looking like it was still connecting.
         return q
 
     def unsubscribe(self, q):
         with self.lock:
-            self.subs.discard(q)
+            self.subs.pop(q, None)
 
 
 def handler_for(hub, views, state, keys):
@@ -183,30 +267,23 @@ def handler_for(hub, views, state, keys):
                 page = (PAGE.replace("__VIEWS__", json.dumps(views))
                             .replace("__KEYS__", json.dumps(keys)))
                 return self._send(200, page.encode())
-            if path == "/view":
-                name = self.path.partition("name=")[2].split("&")[0]
-                if name in views:
-                    state["view"] = name
-                    # Render NOW from the data the loop already has, rather than leaving the browser
-                    # to wait for the next tick. Switching a view is pure formatting - the terminal
-                    # does it on a keypress without re-querying anything - so making the page wait
-                    # up to a whole refresh interval was the dashboard being slower than the data.
-                    render = state.get("render")
-                    if render:
-                        try:
-                            hub.publish(render(name))
-                        except Exception:                    # noqa: BLE001
-                            pass
-                return self._send(200, b"ok", "text/plain")
             if path != "/stream":
                 return self._send(404, b"no", "text/plain")
+            want = self.path.partition("view=")[2].split("&")[0] or "main"
+            if want not in views:
+                want = "main"
+            needle = urllib.parse.unquote_plus(
+                self.path.partition("q=")[2].split("&")[0])[:80]
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            q = hub.subscribe()
+            # Rendered on subscribe from the data the loop already has, rather than leaving the
+            # browser to wait for the next tick. Switching a view is pure formatting - the terminal
+            # does it on a keypress without re-querying anything.
+            q = hub.subscribe(want, state.get("render"), needle)
             try:
                 while True:
                     try:
