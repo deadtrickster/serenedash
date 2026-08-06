@@ -108,13 +108,18 @@ def test_credentials_are_checked_before_a_connection_is_attempted():
 class _Cur:
     def __init__(self, rows):
         self.rows, self.description = rows, [("plan",)]
-        self.executed = ""
+        self.executed, self.args = "", None
 
-    def execute(self, sql):
-        self.executed = sql
+    def execute(self, sql, args=None):
+        # args, because terminate BINDS the pid rather than interpolating it and a fake that cannot
+        # accept a parameter would quietly force the interpolated form back.
+        self.executed, self.args = sql, args
 
     def fetchall(self):
         return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
 
     def __enter__(self):
         return self
@@ -268,3 +273,59 @@ def test_e_is_ignored_on_views_that_cannot_plan(monkeypatch):
     for view in ("mcp", "findings", "logs"):
         st = {"view": view, "sel": 0, "open": True}
         assert tui._web_nav(st, "e", "", {}) == st, f"e did something on {view}"
+
+
+# ── terminate ────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_terminate_does_not_open_a_read_only_connection():
+    """It did, for its whole life, so every call was refused by the server.
+
+    `query()` sets `cn.read_only = not cfg.get("_write")` and only `apply_setting` ever passed
+    `_write`. Terminating is a write. The failure was invisible because `query()` returns None for
+    everything and the caller turned that into "could not reach the server" - a reason that sent
+    whoever read it to check the network.
+    """
+    import inspect
+    src = inspect.getsource(db.terminate)
+    assert "read_only = False" in src, "terminating must not go out on a read-only connection"
+    assert "query(cfg" not in src, "query() forces read-only and swallows the reason"
+
+
+def test_terminate_reports_the_servers_own_reason(monkeypatch):
+    class D:
+        @staticmethod
+        def connect(**kw):
+            raise RuntimeError("cannot execute pg_terminate_backend in a read-only transaction")
+    monkeypatch.setattr(db, "pg_driver", lambda: D)
+    ok, msg = db.terminate({"port": 7890, "password": "x"}, 42)
+    assert ok is False
+    assert "read-only transaction" in msg, "the server's message has to survive"
+    assert "could not reach the server" not in msg, "and must not be replaced by a wrong one"
+
+
+def test_terminate_says_accepted_rather_than_stopped(monkeypatch):
+    # The distinction that mattered against the real thing: pg_terminate_backend returned True for
+    # two statements that were still running 30 s later, because the loop they are in checks for
+    # cancellation exactly never. Reporting that as "terminated" is a false claim about the server.
+    monkeypatch.setattr(db, "pg_driver", lambda: _driver([(True,)], []))
+    ok, msg = db.terminate({"port": 7890, "password": "x"}, 42)
+    assert ok is True
+    assert "accepted" in msg and "REQUEST" in msg
+    assert "check pg_stat_activity" in msg
+    assert not msg.startswith("terminated"), "that would claim more than the server said"
+
+
+def test_a_bad_pid_is_refused_before_connecting(monkeypatch):
+    monkeypatch.setattr(db, "pg_driver", lambda: (_ for _ in ()).throw(AssertionError("connected")))
+    ok, msg = db.terminate({"port": 7890, "password": "x"}, "not-a-pid")
+    assert ok is False and "not a pid" in msg
+
+
+def test_the_pid_is_bound_not_interpolated(monkeypatch):
+    seen = []
+    monkeypatch.setattr(db, "pg_driver", lambda: _driver([(True,)], seen))
+    db.terminate({"port": 7890, "password": "x"}, 42)
+    cur = [x for x in seen if isinstance(x, _Conn)][0].cur
+    assert cur.args == (42,), "the pid must travel as a parameter"
+    assert "42" not in cur.executed, "and must not be interpolated into the statement"

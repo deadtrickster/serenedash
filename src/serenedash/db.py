@@ -248,17 +248,46 @@ def terminate(cfg, pid):
     The pid is bound rather than interpolated. It comes from pg_stat_activity - the server's own
     number, not a user's - but "it came from a trusted place" is exactly the reasoning that makes
     the next one interpolated too, and this string is one edit away from carrying something else.
+
+    Two things this got wrong for its whole life, both found the first time it was pointed at a real
+    stuck statement:
+
+    - it went through `query()`, which opens the connection READ-ONLY unless `_write` is set, and
+      only `apply_setting` ever set it. So the server refused every call. Terminating is a write;
+      it says so now.
+    - `query()` returns None for any failure, so the caller reported "could not reach the server"
+      for a refusal that had nothing to do with reachability. It has its own connection here so the
+      server's own message survives, because a wrong reason is worse than no reason.
+
+    And a caveat that belongs with the function rather than in a comment somewhere: a True return
+    means the server ACCEPTED the request, not that the statement stopped. Cancellation is
+    cooperative - the backend has to reach a point where it checks - and a statement spinning in a
+    loop that checks nothing will keep running with this returning True. Confirm with
+    pg_stat_activity rather than believing the return value.
     """
     try:
         pid = int(str(pid).strip())
     except (TypeError, ValueError):
         return False, f"not a pid: {pid!r}"
-    b = query(cfg, ["select pg_terminate_backend($1)"], params=[(pid,)])
-    if b is None:
-        return False, "could not reach the server"
-    got = (b[0] or [[""]])[0]
-    ok = str(got[0]).lower() in ("t", "true", "1")
-    return ok, (f"terminated pid {pid}" if ok else
+    drv = pg_driver()
+    if drv is None:
+        return False, "no driver - pip install 'psycopg[binary]'"
+    if not cfg.get("password"):
+        return False, "no credentials"
+    try:
+        with drv.connect(host=cfg.get("host") or "127.0.0.1", port=int(cfg["port"]),
+                         user=cfg.get("user") or "postgres", password=cfg["password"],
+                         dbname=cfg.get("database") or "postgres", connect_timeout=10) as cn:
+            cn.read_only = False                     # terminating is a write, and was refused as one
+            with cn.cursor() as cur:
+                cur.execute("select pg_terminate_backend(%s)", (pid,))
+                got = cur.fetchone()
+    except Exception as e:                                       # noqa: BLE001
+        return False, f"could not terminate pid {pid}: {str(e).strip()[:200]}"
+    ok = str((got or [""])[0]).lower() in ("t", "true", "1")
+    return ok, (f"asked the server to terminate pid {pid} - it accepted. This is a REQUEST: check "
+                f"pg_stat_activity, a statement that never checks for cancellation keeps running"
+                if ok else
                 f"pid {pid} did not terminate - it may have already finished")
 
 
