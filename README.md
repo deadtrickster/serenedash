@@ -24,11 +24,12 @@ runs in a container here, as a process here, or on another host (`target = docke
 
 Every panel has a view behind it, keyed by its own name, and every view is a toggle:
 
-`q` quit · `s` storage · `m` memory · `a` activity · `t` threads · `p` profile · `g` call graph ·
-`c` config · `h` host · `i` search · `d` doctor · `l` legend · `x` mouse · `j`/`k` scroll
+`q` quit · `f` findings · `s` storage · `m` memory · `a` activity · `t` threads · `p` profile ·
+`i` search · `o` logs · `n` mcp · `g` graph · `c` config · `h` host · `l` legend · `x` mouse ·
+`j`/`k` scroll
 
-`l` documents every label and number on the screen; `d` checks every precondition for a full
-picture and tells you what each missing one costs you. Those two are the place to look first.
+`l` documents every label and number on the screen; `f` collects everything that tripped, and
+that is the place to look first.
 
 Point at anything and it says what it is — the same text `l` carries, looked up by where the
 pointer is instead of read top to bottom, so a bar answers for its own row and a word in a tail
@@ -77,6 +78,29 @@ the right heading.
 Every bar and its history share one denominator, and each panel says what that denominator is. A
 thread bar is a share of one core; storage shares add to 100 against the on-disk total; a memory
 sparkline is its own bar over time.
+
+## Findings
+
+`f` is the whole server's answer to "what is wrong", in one list: what tripped, what the setup is
+missing, and what passed. The checks that used to live on a separate doctor screen are here too -
+a server condition and a missing precondition are both things that stop you getting an answer, and
+splitting them meant looking in two places to find out why a panel was empty.
+
+![the findings list](serenedash-findings.png)
+
+Three rows in that shot are worth pointing at. `activity` has seven statements over nine hours, two
+of them past two days. `setup symbols` has worked out that the capture's build is not registered and
+found a binary that matches it, so pressing `r` fixes the profile. And `cpu` reads
+"5.0 of 24 cores busy" - which is the point of naming denominators, because 21% of the machine is
+also one core pinned flat and six more statements piling up behind it.
+
+`enter` reads one in full: what was measured, what it means, what to do about it, and the SQL to
+confirm it independently.
+
+![one finding, read in full](serenedash-finding.png)
+
+Nothing there is a verdict you have to take on trust. `blocked_by_pid 1265771991` and
+`blocked_by_age_s 187222` are the evidence, `check it` is how you disagree with me.
 
 ## Anomalies
 
