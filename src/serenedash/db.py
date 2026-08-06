@@ -192,8 +192,24 @@ def sample(cfg, query_head=200):
         #
         # Truncated in SQL, not on arrival — see the docstring. length() comes back alongside the
         # head so a truncated statement is never mistaken for a short one.
+        # AGE is on this row for a reason: a statement's text says what it is doing and its length
+        # says how expensive it is to parse, and neither distinguishes a query that started a
+        # second ago from one that has been running for 42 hours with nobody waiting for it. The
+        # second kind blocks every checkpoint on this engine, which is why the WAL reached 42 GB on
+        # a 110 GB database while the panel read `active 2`.
+        #
+        # conn_age beside it because conn_age > query_age means a POOLED connection that ran other
+        # statements first - a pool, not a person, is holding it.
         f"select coalesce(state,'?'), replace(replace(left(coalesce(query,''),{int(query_head)}),"
-        "chr(10),' '),chr(13),' '), length(coalesce(query,'')) "
+        "chr(10),' '),chr(13),' '), length(coalesce(query,'')), "
+        "coalesce(round(extract(epoch from (now()-query_start))), -1), "
+        "coalesce(round(extract(epoch from (now()-backend_start))), -1), "
+        "coalesce(pid::VARCHAR,''), "
+        # Who is on the other end. Empty is a real answer and is reported as such rather than as
+        # "unknown": on the deployment this was written for, client_addr came back empty for a
+        # pooled connection that was very much alive, and reading that as "no client" is how you
+        # end up blaming the server for not noticing a dead peer.
+        "coalesce(client_addr::VARCHAR,''), coalesce(application_name,'') "
         "from pg_stat_activity where pid <> pg_backend_pid() order by state",
         # Every setting the HAZARDS table has an opinion about, in one go. The panel used to hard-code
         # three of them in the query and show two, so a table built from measured incidents was
@@ -214,12 +230,44 @@ def sample(cfg, query_head=200):
         "memspill": {x[0]: int(x[2]) for x in b[1]
                      if len(x) >= 3 and x[2].isdigit() and int(x[2]) > 0},
         "states": {x[0]: int(x[1]) for x in b[2] if len(x) == 2 and x[1].isdigit()},
-        # (state, statement head, full statement length). The length is carried so a truncated
-        # statement is never mistaken for a short one.
-        "queries": [(x[0], x[1], int(x[2] or 0)) for x in b[3] if len(x) == 3],
+        # (state, statement head, full length, query age s, connection age s, pid). The length is
+        # carried so a truncated statement is never mistaken for a short one; the age so an
+        # abandoned statement is never mistaken for a busy one. -1 for an age the server did not
+        # give, which is NOT zero: zero would read as "just started".
+        # (state, head, full length, query age s, connection age s, pid, client addr, app name).
+        "queries": [(x[0], x[1], int(x[2] or 0), _num(x[3]), _num(x[4]), x[5], x[6], x[7])
+                    for x in b[3] if len(x) >= 8],
         "settings": {x[0]: x[1] for x in b[4] if len(x) == 2},
         "t": time.time(),
     }
+
+
+def terminate(cfg, pid):
+    """`pg_terminate_backend(pid)`. (True, message) or (False, why).
+
+    The pid is bound rather than interpolated. It comes from pg_stat_activity - the server's own
+    number, not a user's - but "it came from a trusted place" is exactly the reasoning that makes
+    the next one interpolated too, and this string is one edit away from carrying something else.
+    """
+    try:
+        pid = int(str(pid).strip())
+    except (TypeError, ValueError):
+        return False, f"not a pid: {pid!r}"
+    b = query(cfg, ["select pg_terminate_backend($1)"], params=[(pid,)])
+    if b is None:
+        return False, "could not reach the server"
+    got = (b[0] or [[""]])[0]
+    ok = str(got[0]).lower() in ("t", "true", "1")
+    return ok, (f"terminated pid {pid}" if ok else
+                f"pid {pid} did not terminate - it may have already finished")
+
+
+def _num(v):
+    """A number the server may not have given. -1 means unknown, which is not the same as 0."""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return -1
 
 
 def search(cfg):
@@ -288,13 +336,25 @@ def temp_files_held(cfg):
 
 
 def full_queries(cfg):
-    """Untruncated statement text, for the one view that shows it. See `sample`."""
+    """Untruncated statement text, for the one view that shows it. See `sample`.
+
+    Same SHAPE as `sample`'s queries, not just the same first three fields. It returned 3-tuples
+    while the sample grew to carry age, pid, client and application, and the activity view prefers
+    this one whenever it has it - so on the one screen built to show how old a statement is, the age
+    was always absent, the colour never fired and the sort by age did nothing. A statement running
+    46 hours sat at the bottom of the list looking like a 158-character count(*).
+    """
     b = query(cfg,
               ["select coalesce(state,'?'), "
               "replace(replace(coalesce(query,''),chr(10),' '),chr(13),' '), "
-              "length(coalesce(query,'')) from pg_stat_activity "
+              "length(coalesce(query,'')), "
+              "coalesce(round(extract(epoch from (now()-query_start))), -1), "
+              "coalesce(round(extract(epoch from (now()-backend_start))), -1), "
+              "coalesce(pid::VARCHAR,''), coalesce(client_addr::VARCHAR,''), "
+              "coalesce(application_name,'') from pg_stat_activity "
               "where pid <> pg_backend_pid() order by state"])
-    return [(x[0], x[1], int(x[2] or 0)) for x in (b[0] if b else []) if len(x) == 3]
+    return [(x[0], x[1], int(x[2] or 0), _num(x[3]), _num(x[4]), x[5], x[6], x[7])
+            for x in (b[0] if b else []) if len(x) >= 8]
 
 
 def apply_setting(cfg, name, value):

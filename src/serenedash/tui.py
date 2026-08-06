@@ -20,9 +20,19 @@ from . import export as exporter
 from . import history
 from . import serve as _serve
 from . import snapshot as snap
+from . import statements as stmts
 from . import logs as _logs
 from . import mcplog as _mcplog
-from .db import apply_setting, full_queries, query, sample, search, sql_status, temp_files_held
+from .db import (
+    apply_setting,
+    full_queries,
+    query,
+    sample,
+    search,
+    sql_status,
+    temp_files_held,
+    terminate,
+)
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
@@ -267,8 +277,10 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
         return memory_frame(s, hist, hinfo, col, w, 0)
     if name == "activity":
         n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+        pd = perf_dir or cfg.get("perf_dir", "")
+        ended = stmts.running(stmts.recent(pd))[1] if pd else []
         return activity_frame(s, col, w, n["scroll"], full=full, sel=n["sel"], open_=n["open"],
-                              height=WEB_ROWS, anchors=anchors)
+                              height=WEB_ROWS, anchors=anchors, ended=ended)
     if name == "search":
         return search_frame(sea, col, w, 0) if sea else lines
     if name == "threads":
@@ -426,8 +438,11 @@ def main():
     # KEEPS meaning the newest as calls arrive - an absolute index slides onto a different row every
     # time an agent asks something. Esc unwinds box, then session, then the view.
     mnav = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False}
+    armed = None      # the pid `r` is one press away from terminating, or None
+    fmsg = None       # what the last fix did, shown until the next one
     fnav = {"scroll": 0, "sel": 0, "open": False}
     anav = {"scroll": 0, "sel": 0, "open": False}
+    aended = []       # statements the dashboard saw run and no longer sees
     view, scroll, sel, detail = "main", 0, 0, None
     edit, msg = None, None
     # Pointer state. `tip` is what is drawn, `tipat` where, and `tipkey` the (row, tooltip) that
@@ -583,6 +598,10 @@ def main():
                 # and only while it is open — but on the data tick, not on every redraw. Inline
                 # in the lambda below it ran per keypress, and with the pointer reporting every
                 # cell it crosses that became a round trip for 185 KB statements per mouse move.
+                if view == "activity" and (fresh or not aended):
+                    # Only while the view is open, and only on the data tick - reading the record
+                    # is a file read, and this view already learned that lesson with full_queries.
+                    aended = stmts.running(stmts.recent(a.perf_dir), interval=a.interval)[1]
                 if view != "activity":
                     fullq = None
                 elif fresh or fullq is None:
@@ -596,7 +615,7 @@ def main():
 
                 body = {"findings": lambda: findings_frame(
                             allfound, col, w, fnav["scroll"], fnav["sel"], h - 1,
-                            fnav["open"]),
+                            fnav["open"], msg=fmsg),
                         "mcp": lambda: mcp_frame(mrows, mlive, col, w, mnav["scroll"],
                                                  mnav["sel"], h - 1, mnav["open"], mnav["call"],
                                                  mnav["popup"]),
@@ -605,16 +624,22 @@ def main():
                             lscroll, h - 1, lfollow),
                         "storage": lambda: storage_frame(s, sz, hinfo, col, w, scroll, held),
                         "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
-                        "activity": lambda: activity_frame(s, col, w, anav["scroll"],
-                                                          full=fullq, sel=anav["sel"],
-                                                          open_=anav["open"], height=h - 1),
+                        "activity": lambda: activity_frame(
+                            s, col, w, anav["scroll"], full=fullq, sel=anav["sel"],
+                            open_=anav["open"], height=h - 1, ended=aended),
                         "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                          scroll),
                         "profile": lambda: profile_frame(perf, col, w, scroll),
                         "host": lambda: host_frame(hinfo, s, col, w, scroll),
                         "search": lambda: search_frame(sea, col, w, scroll),
                         "legend": lambda: legend_frame(col, w, scroll)}[view]()
-                vnav = {"findings": {**fnav, "fixable": bool(
+                _sel = (sorted(allfound, key=lambda f: -f.get("severity", 1))
+                        [min(fnav["sel"], len(allfound) - 1)] if allfound else {})
+                vnav = {"findings": {**fnav, "armed": armed if _sel.get("action") else None,
+                                     "fix_label": ("terminates pid " + str(_sel.get("pid"))
+                                                   if (_sel.get("action") or ("",))[0] ==
+                                                   "terminate" else None),
+                                     "fixable": bool(
                             allfound and sorted(allfound, key=lambda f: -f.get("severity", 1))
                             [min(fnav["sel"], len(allfound) - 1)].get("action"))},
                         "activity": anav, "mcp": mnav}.get(view)
@@ -644,6 +669,12 @@ def main():
             else:
                 lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why,
                               sea, held)
+            if fresh and s is not None:
+                # What ran, kept from what was running. pg_stat_activity forgets, this server has
+                # no pg_stat_statements, and the tick already has the rows - so recording them
+                # costs the server nothing and answers the question the live view cannot: how long
+                # did the statement that has since ended actually run.
+                stmts.observe(a.perf_dir, s, a.interval)
             if drows is None:
                 # Once, at startup. These are preconditions - kernel settings, whether perf is
                 # installed, whether any build-id is registered - and they do not change on a 5s
@@ -657,7 +688,8 @@ def main():
                 # The same list `status()` returns, from the data this tick already has. One
                 # producer, so the screen and the MCP tool cannot disagree about what tripped.
                 try:
-                    hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea), held=held)
+                    hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea),
+                                            held=held, tcpu=tcpu)
                 except Exception:                                # noqa: BLE001
                     hazards = []      # a findings screen must not be able to take the frame down
             allfound = hazards + snap.setup_findings(drows, dfix)
@@ -816,6 +848,18 @@ def main():
                 if not act:
                     continue
                 kind, arg = act
+                if kind == "terminate":
+                    # Arm, then fire. A single keystroke that aborts a backend, on a row the cursor
+                    # might have landed on by accident, is the wrong shape - and the armed state
+                    # names the pid, so what gets killed is what was read.
+                    if armed != arg:
+                        armed = arg
+                        shown = [None] * len(shown)
+                        continue
+                    ok, msg = terminate(cfg, arg)
+                    armed, fmsg = None, (ok, msg)
+                    shown = [None] * len(shown)
+                    continue
                 if kind == "extract":
                     # docker cp first: the binary in the container is the one that produced the
                     # capture, so no build has to be found or matched.

@@ -295,3 +295,109 @@ def test_every_finding_carries_a_kind_it_can_be_counted_by():
     assert found, "this fixture is meant to trip several"
     assert all(f.get("kind") for f in found), [f["what"] for f in found if not f.get("kind")]
     assert {"storage", "memory", "search"} <= {f["kind"] for f in found}
+
+
+# ---- the one the dashboard missed entirely ------------------------------------------------------
+# Two abandoned BM25 queries held read transactions open for 42.3 hours, no checkpoint could
+# complete, the WAL went 16 MB -> 42 GB on a 110 GB database, and every panel read `active 2`. The
+# dashboard collected what was running and how big the statement was, and nothing about WHEN it
+# started - so a 42-hour query and a one-second query drew the same row.
+
+def session(state="active", head="select 1", n=8, age=10, conn=10, pid="7", addr="", app=""):
+    return (state, head, n, age, conn, pid, addr, app)
+
+
+def test_a_statement_older_than_an_hour_is_a_finding():
+    from serenedash import snapshot
+
+    got = snapshot.long_running({"queries": [session(age=155068, conn=246277, pid="1265771991")]})
+    assert len(got) == 1
+    f = got[0]
+    assert f["kind"] == "activity" and "43h" in f["what"]
+    assert f["running_for_s"] == 155068 and f["pid"] == "1265771991"
+    # The engine's own rule, said out loud, because a reader coming from PostgreSQL rules reads out.
+    assert "checkpoint" in f["detail"] and "PostgreSQL" in f["detail"]
+
+
+def test_a_pooled_connection_is_named_as_one():
+    # conn_age > query_age is a connection that ran other statements first: a pool, not a person,
+    # is holding it - the shape an abandoned HTTP request leaves behind.
+    from serenedash import snapshot
+
+    pooled = snapshot.long_running({"queries": [session(age=100_000, conn=200_000)]})[0]
+    plain = snapshot.long_running({"queries": [session(age=100_000, conn=100_000)]})[0]
+    assert "pool rather than a person" in pooled["detail"]
+    assert "pool rather than a person" not in plain["detail"]
+
+
+def test_a_busy_server_is_not_a_finding():
+    from serenedash import snapshot
+
+    assert snapshot.long_running({"queries": [session(age=59), session(age=3599)]}) == []
+    assert snapshot.long_running({"queries": [session(state="idle", age=99999)]}) == []
+
+
+def test_the_finding_carries_who_holds_it_and_what_it_is_running():
+    from serenedash import snapshot
+
+    f = snapshot.long_running({"queries": [
+        session(age=99999, pid="42", addr="172.20.0.7", app="ragflow", head="WITH lex AS (…",
+                n=68209)]})[0]
+    assert "pid 42" in f["holder"] and "172.20.0.7" in f["holder"] and "ragflow" in f["holder"]
+    assert f["statement_chars"] == 68209 and f["statement"].startswith("WITH lex")
+    assert f["action"] == ("terminate", "42"), "the row already knows the pid"
+    assert "pg_terminate_backend" in f["fix"] and "FORCE CHECKPOINT" in f["fix"]
+
+
+def test_the_checkpoint_finding_names_the_blocker():
+    # It was right and unactionable: it said a checkpoint could not get a window and left the
+    # operator to find out which transaction was holding it shut.
+    from serenedash.hazards import HAZARDS
+
+    why, pred = HAZARDS["checkpoint_threshold"]
+    s = {"wal": 42 * 10**9, "queries": [session(age=155068, pid="1265771991")]}
+    out = pred("16.0 MiB", s)
+    assert "42h" in out or "43h" in out
+    assert "1265771991" in out and "reads included" in out
+
+
+def test_an_age_the_server_did_not_give_is_not_zero():
+    # -1 means unknown. Zero would read as "just started", which is the opposite claim.
+    from serenedash.db import _num
+
+    assert _num(None) == -1 and _num("") == -1 and _num("0") == 0
+
+
+def test_a_checkpoint_that_is_itself_running_long_is_a_finding():
+    # It looks like ordinary activity - `active 25m` beside six other statements - and the remedy
+    # printed in the server's own error message is what put it there.
+    from serenedash import snapshot
+
+    got = snapshot.checkpoint_waiting({"queries": [
+        ("active", "FORCE CHECKPOINT", 16, 1500, 1500, "491336051", "", ""),
+        ("active", "WITH lex AS (SELECT", 68209, 155068, 155068, "1265771991", "", ""),
+    ]})
+    assert len(got) == 1
+    f = got[0]
+    assert f["forced"] is True and "waiting" in f["what"]
+    assert f["blocked_by_pid"] == "1265771991", "it names what is in front of it"
+    assert "no timeout" in f["detail"] and "re-pinned" in f["detail"]
+    assert "nothing to wait for" in f["fix"]
+
+
+def test_a_checkpoint_doing_real_work_is_not_reported_as_stuck():
+    from serenedash import snapshot
+
+    assert snapshot.checkpoint_waiting(
+        {"queries": [("active", "CHECKPOINT", 10, 30, 30, "9", "", "")]}) == []
+
+
+def test_a_plain_checkpoint_is_described_differently_from_a_forced_one():
+    # A plain CHECKPOINT errors rather than waiting, so one that is still active is doing the work.
+    from serenedash import snapshot
+
+    plain = snapshot.checkpoint_waiting(
+        {"queries": [("active", "checkpoint", 10, 900, 900, "9", "", "")]})[0]
+    assert plain["forced"] is False
+    assert "errors rather than waiting" in plain["detail"]
+    assert "compression of the embeddings" in plain["detail"]

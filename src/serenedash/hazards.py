@@ -48,11 +48,24 @@ def _ckpt(v, s):
         # looks identical from here to a failing write. Both are worth checking and neither is
         # measured by this row - what IS measured is the ratio, and that raising the threshold is
         # the wrong direction whichever it turns out to be.
+        # Name the blocker. The finding was right and unactionable: it said a checkpoint could not
+        # get a window and left the operator to find out which transaction was holding it shut.
+        # The oldest active statement usually IS the answer, and it is already on the sample.
+        old = max((q for q in s.get("queries", [])
+                   if len(q) > 3 and q[0] == "active" and "pg_stat_activity" not in q[1]),
+                  key=lambda q: q[3], default=None)
+        who = ""
+        if old and old[3] > 600:
+            mins = old[3] // 60
+            who = (f" The oldest active statement has been running {mins // 60}h {mins % 60}m"
+                   + (f" (pid {old[5]})" if len(old) > 5 and old[5] else "")
+                   + " and a checkpoint needs every transaction finished, reads included — start "
+                     "there.")
         return (f"WAL is {human(wal)} against a threshold of {human(thr)} — {wal / thr:.0f}x. "
                 "Checkpoints are not landing. Either one cannot get a window with no other "
                 "transaction open, or writes are failing; the database file's mtime tells you "
                 "which — if it has not moved, nothing has been folded in since. Not a tuning "
-                "case: raising the threshold lets the WAL grow further.")
+                "case: raising the threshold lets the WAL grow further." + who)
     # The other end of the same setting, and the one that is easy to read backwards. Compression
     # runs AT CHECKPOINT: a 103-second checkpoint on this deployment was roughly half compression
     # or the analysis deciding how to compress (FSST ~22%, float analyse+ALP ~14%). So how OFTEN it

@@ -87,15 +87,32 @@ jobs:
                                  "profile", "host", "config", "query", "anomalies"} - set(tools)
                       if missing:
                           sys.exit(f"missing tools: {sorted(missing)}")
-                      # The instructions are the context an agent reasons from, and the
-                      # revision is how it tells that context from the running server.
+                      # What connect carries has to SURVIVE the client, not merely exist.
+                      # Claude Code truncates server instructions at about 2 KB, so the 57 KB
+                      # guide this used to send arrived as its first 3.6% - the persona and the
+                      # setup section, and none of the rules. This asserted 5000 chars and passed
+                      # the whole time. Measure bytes, and measure the delivery path.
                       text = init.instructions or ""
-                      if len(text) < 5000 or "{{" in text:
-                          sys.exit(f"instructions look wrong: {len(text)} chars")
+                      if len(text.encode()) > 2048 or "{{" in text:
+                          sys.exit(f"connect payload is {len(text.encode())} bytes; "
+                                   f"clients cut at ~2048 and the tail is discarded")
+                      for rule in ("first tool result", "serenedash://instructions"):
+                          if rule not in text.encode()[:600].decode("utf-8", "ignore"):
+                              sys.exit(f"{rule!r} must be near the front, before any cut")
                       res = [str(r.uri) for r in (await s.list_resources()).resources]
                       if "serenedash://instructions" not in res:
                           sys.exit(f"no instructions resource to re-read: {res}")
-                      print("instructions:", len(text), "chars, resources:", res)
+                      # The guide itself, on the path that actually delivers it whole.
+                      got = await s.read_resource("serenedash://instructions")
+                      full = str(got.contents[0].text)
+                      if len(full) < 20000 or "{{" in full:
+                          sys.exit(f"the guide looks wrong: {len(full)} chars")
+                      first = await s.call_tool("host", {})
+                      body = str(first.content[0].text if first.content else "")
+                      if "instructions_note" not in body:
+                          sys.exit("the first tool result did not carry the guide")
+                      print(f"connect {len(text.encode())} bytes, guide {len(full)} chars "
+                            f"delivered on first call, resources: {res}")
           asyncio.run(main())
           PY
 

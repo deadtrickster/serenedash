@@ -183,6 +183,8 @@ This is the direct test for orphaned spill, and better than any filesystem check
 
 ### `duckdb_memory()` — pools, and per-pool spill
 
+**`duckdb_memory()` cannot see the search indexes, and neither can `memory_limit`.** It sums the buffer manager's tagged pools and nothing else, so any allocation that never reserved a tag is structurally invisible to it - and iresearch's resource managers are left unset in this build, which covers segment readers, cached decompressed columns and merge buffers for every search and vector index. So on a deployment with 69 GB of inverted index, `duckdb_memory()` is an undercount of the process by an unknown amount, and it is also not the thing being throttled: `memory_limit` cannot evict what it does not account for. When `resident_bytes + swapped_bytes` is far above `duckdb_memory_bytes`, do not report the gap as swap alone. Say that the search engine's memory is outside the accounting, and use `host.resident_bytes` and `host.swapped_bytes` as the figures that describe the machine.
+
 ```sql
 SELECT tag, memory_usage_bytes, temporary_storage_bytes FROM duckdb_memory();
 ```
@@ -343,6 +345,23 @@ Three consequences that come up constantly:
 
 Writes go to a write-ahead log and are folded into the database file by a checkpoint. `checkpoint_threshold` (alias `wal_autocheckpoint`) triggers on WAL size, `wal_autocheckpoint_entries` on entry count (0 = off). `default_block_size` is 262144 here — the unit `blocks` is counted in, constrained to a power of two between 16 KiB and 256 KiB. `max_vacuum_tasks` (100) bounds the vacuum work scheduled during a checkpoint.
 
+**A long-running read blocks checkpointing, and that is not the PostgreSQL model.** A checkpoint needs every transaction finished before it can rewrite the file, so an ordinary `SELECT` holds it off - where in PostgreSQL a long read holds back vacuum cleanup via the xmin horizon and never touches a checkpoint. Anyone reasoning from that experience eliminates reads as a cause immediately, which is exactly how this goes unfound. Measured on this deployment: two abandoned BM25 queries ran **42.3 hours** with nobody waiting for them, and the WAL went from 16 MB right after a successful checkpoint to **42 GB** on a 110 GB database. Every panel read `active 2`, which is what a busy server says.
+
+In that state the WAL is not bounded by `checkpoint_threshold` at all - it is bounded by free disk.
+
+**The mechanism, because it decides what to tell the user to do.** `CHECKPOINT` does not scan transactions; it tries to take an exclusive lock and throws a fixed string if it cannot. A committed transaction that did updates or DDL is *parked* rather than destroyed, and keeps holding a shared checkpoint lock until it can be retired - which requires the read horizon to move past it. One open read pins that horizon, so every write that commits after it parks forever and the exclusive lock can never be taken. **A single committed UPDATE after the read starts is enough to wedge it permanently.** So the message is true and misleading at once: the blockers are write transactions, and the read is what stops them dying. Terminating the READ is what releases them.
+
+**A `CHECKPOINT` or `FORCE CHECKPOINT` that is itself in `pg_stat_activity` for minutes is not working, it is waiting** - `status()` reports it as its own finding, with the pid and age of the statement in front of it. `FORCE` retries in a loop with no timeout and no backoff, and while it spins it holds the lock new WRITERS need and not the one new READERS need, so the horizon it waits on keeps being re-pinned. Do not advise waiting for it and do not advise running another one.
+
+**Read `status()` findings for it rather than inferring it.** Three of them fire together and they mean one thing: `setting: checkpoint_threshold` gives the WAL against its threshold as a ratio AND names the oldest active statement holding the window shut, and a `statement running for …` finding per long statement carries the pid, how old the connection is against how old the statement is, and the statement itself. `activity` is the panel; the age is the diagnosis. **A 42-hour query is not slow, it is abandoned.**
+
+- `connection_age_s` > `running_for_s` means a POOLED connection that ran other statements first - a pool, not a person, is holding it, which is the shape an abandoned HTTP request leaves behind.
+- An empty `client_addr` is not a dead client. On the deployment above it was empty for a connection that was very much `ESTABLISHED`; check `/proc/net/tcp` in the container before blaming the server for not noticing a dead peer. `ESTABLISHED` means the peer is alive and the server is right to keep going, and the bug is upstream of it; `CLOSE_WAIT` is the other failure entirely.
+- **Do not suggest `FORCE CHECKPOINT`.** The error `Cannot CHECKPOINT: there are other write transactions active` names the wrong thing - the blockers can be reads - and `FORCE` *waits* for the active transactions rather than aborting them, so against a statement nobody is waiting for it hangs. The remedy is `select pg_terminate_backend(<pid>)`, then `CHECKPOINT`. Read-only work rolls back nothing.
+- **Do not recommend `pg_statement_timeout_millis`.** Its own description says "to set on scan connections": it and `pg_idle_in_transaction_timeout_millis` configure connections this server makes OUTBOUND to an ATTACHed Postgres, and nothing a pg-wire client sends is affected by either. `statement_timeout` is worse than unset - it is accepted and silently ignored, and says so in its own description: "Accepted for compatibility but not currently enforced." The one setting that bites incoming work is **`max_execution_time`** (milliseconds, `0` = off, and it is 0 here). Read the live value before advising anything, and say which of the three you mean.
+- **`max_execution_time` does not bound parsing.** It is armed when a statement begins executing, which is after it has been parsed - so on a 68 KB statement carrying a 21,700-character embedding, the PEG parse runs outside every clock in the server, and a client cancel does not reach it either. If the profile shows `parse` and the statements are large, a timeout is not the remedy; binding the literal as a parameter is.
+- There is **no idle-session timeout for an incoming pg-wire connection**. An authenticated connection that goes quiet, in a transaction or not, is held indefinitely - so "the client will time out eventually" is not a thing to wait for.
+
 `auto_checkpoint_skip_wal_threshold` deserves its own line: above that estimated write size the store skips the WAL and checkpoints directly, and **concurrent commits are blocked while that happens**. It is the documented mechanism behind "the WAL is empty but commits stall".
 
 Three more properties that decide what a checkpoint actually does:
@@ -361,6 +380,8 @@ The WAL file itself is a signal: it is deleted on a clean exit and only present 
 finding one at startup means the previous exit was not orderly.
 
 ### Spilling and the temporary directory
+
+**A failed index refresh also stops the search WAL being collected.** The search engine keeps its own write-ahead log per database, and its garbage collection floor only advances when a shard reports a successful commit. If a refresh throws - the temp directory being unwritable is the case that has happened here - the floor never moves and that WAL and its chunk files grow with no bound while the error repeats. So when storage is growing and a refresh is failing, `store.db.wal` is not the only WAL to measure: check `<data>/engine_search/<db>/wal/` as well before attributing the growth. The same floor is frozen deliberately by `WITH (refresh_interval = 0)` on any one table in the database, which is a documented option someone may have set on purpose.
 
 When the working set exceeds `memory_limit` the store spills rather than failing. `temp_directory` is where; `max_temp_directory_size` caps it at 90% of available disk.
 

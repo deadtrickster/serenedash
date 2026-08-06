@@ -100,6 +100,53 @@ def memory(s, host):
     }
 
 
+def recorded(perf_dir, limit=40, interval=5.0):
+    """What the dashboard SAW run, longest first. The half `pg_stat_activity` cannot answer.
+
+    That view is present-tense and this server has no `pg_stat_statements`, `log_query_path` is
+    empty and profiling is off - so a statement that has ended leaves no trace anywhere else. The
+    dashboard samples the live view every tick anyway, so this costs the server nothing.
+
+    Every caveat that matters is in the payload rather than implied: it is SAMPLED, so anything
+    shorter than one interval was never seen, and a duration is the last age the server reported,
+    which is a lower bound. Reporting these as exact would be the same class of mistake as calling
+    a thread percentage a share of the machine.
+    """
+    from . import statements                                     # noqa: PLC0415  - avoid a cycle
+    rows = statements.recent(perf_dir, limit=limit)
+    if not rows:
+        return {"available": False,
+                "reason": f"nothing recorded yet at {statements.path(perf_dir)}",
+                "fix": "run the dashboard (serenedash) - it records one sample per tick, and the "
+                       "file outlives it",
+                "note": "this is the dashboard's own record, not the server's. SereneDB has no "
+                        "pg_stat_statements; log_query_path and profiling are the server-side "
+                        "options and both are off by default."}
+    live, done = statements.running(rows, interval=interval)
+    return {
+        "available": True,
+        "statements_recorded": len(rows),
+        "still_running": len(live),
+        "sampling_interval_s": interval,
+        "note": "SAMPLED from pg_stat_activity once per tick, by the dashboard, not by the server. "
+                "A statement shorter than one interval was never seen. ran_for_s is the last age "
+                "the server reported for it, so it is accurate to within one interval and is a "
+                "LOWER bound - the statement may have run on after the last tick that saw it.",
+        "statements": [{
+            "ran_for_s": r.get("ran_for_s"),
+            "still_running": r in live,
+            "pid": r.get("pid"),
+            "statement_chars": r.get("chars"),
+            "statement": r.get("statement"),
+            "samples": r.get("samples"),
+            "first_seen_epoch": r.get("started"),
+            "last_seen_epoch": r.get("last_seen"),
+            "client_addr": r.get("client_addr") or None,
+            "application_name": r.get("application_name") or None,
+        } for r in rows],
+    }
+
+
 def progress(rows, max_rows=25):
     """`sdb_progress` for the backends the server reports as active, BOUNDED.
 
@@ -144,12 +191,29 @@ def activity(s, max_query_chars=400, prog=None):
     length is reported so a truncated one is never mistaken for a short one.
     """
     rows = []
-    for st, q, full_len in s["queries"]:
+    for st, q, full_len, *rest in s["queries"]:
+        age, conn, pid = (list(rest) + [-1, -1, ""])[:3]
         if "pg_stat_activity" in q:
             continue
         row = {"state": st, "query": (q[:max_query_chars] or None), "query_chars": full_len}
         if full_len > len(row["query"] or ""):
             row["query_truncated"] = True
+        # Age, because a statement's text says what it is doing and nothing about whether anyone is
+        # still waiting for it. -1 is "the server did not say", which is not 0.
+        addr, app = (list(rest) + [-1, -1, "", "", ""])[3:5]
+        if addr:
+            row["client_addr"] = addr
+        if app:
+            row["application_name"] = app
+        if age >= 0:
+            row["running_for_s"] = age
+        if conn >= 0:
+            row["connection_age_s"] = conn
+            # conn_age > query_age is a pooled connection that ran other statements first: a pool,
+            # not a person, is holding it - the shape an abandoned request leaves behind.
+            row["on_a_pooled_connection"] = conn > age + 1
+        if pid:
+            row["pid"] = pid
         rows.append(row)
     active = [r for r in rows if r["state"] == "active"]
     out = {
@@ -298,6 +362,202 @@ def hostinfo(host, s):
     }
 
 
+# When a running statement stops being "busy" and starts being a finding. A CHOSEN threshold, and
+# the row says so by carrying the age itself. An hour is past every legitimate analytical query on
+# the deployment this was measured on; the incident that produced this rule ran for 42 of them.
+ABANDONED_S = 3600
+
+
+# A checkpoint statement, forced or not. Matched on the text because that is what the server gives
+# us - there is no "waiting for a lock" column anywhere in this deployment's catalog.
+CHECKPOINT_RE = re.compile(r"^\s*(force\s+)?checkpoint\b", re.I)
+
+# When a checkpoint has clearly stopped making progress rather than merely taking a while. A
+# checkpoint on a 110 GB database is minutes of real work, so this is deliberately past that.
+CHECKPOINT_STUCK_S = 120
+
+
+# A share of the MACHINE, not of a core. Sustained above this with a statement nobody is waiting
+# for is the shape of the incident this was written from: five of 24 cores, for two days, while
+# ingestion sat at zero documents a minute.
+BURN_FRACTION = 0.15
+
+
+def cpu_burn(s, host, tcpu=None):
+    """The machine is busy and the oldest thing on it is not finishing.
+
+    Neither half is a finding alone. A busy server is a working server, and a long statement on an
+    idle machine is waiting for something rather than burning. Together they are "cores are being
+    spent on work nobody is waiting for", which is what nothing on the dashboard said while five
+    were pinned for 46 hours.
+
+    Deliberately NOT an anomaly rule. Those compare against the recent past and this is a LEVEL: it
+    has held for two days, so there is nothing for a change detector to see. The existing
+    `anomaly: process CPU spike` fires on the transition and then goes quiet exactly when the
+    problem becomes permanent.
+    """
+    # `tcpu` is the process CPU as a share of ONE core, summed over threads - the same number the
+    # threads panel prints. It is NOT on `host`: hostinfo reads /proc for memory, threads and
+    # uptime and has never carried a CPU figure, so the first version of this finding read a key
+    # that does not exist and could not fire.
+    cores = (host or {}).get("cores") or 0
+    used = tcpu
+    if not cores or used is None:
+        return []
+    share = used / (cores * 100.0)
+    oldest = max((q for q in (s or {}).get("queries", [])
+                  if len(q) > 3 and q[0] == "active" and "pg_stat_activity" not in q[1]),
+                 key=lambda q: q[3], default=None)
+    if share < BURN_FRACTION or not oldest or oldest[3] < ABANDONED_S:
+        return []
+    return [{
+        "kind": "cpu",
+        "what": f"{used / 100:.1f} of {cores} cores busy, oldest statement {human_time(oldest[3])}",
+        "detail": f"the process is using {share * 100:.0f}% of the machine and the oldest active "
+                  f"statement has been running {human_time(oldest[3])}"
+                  + (f" (pid {oldest[5]})" if len(oldest) > 5 and oldest[5] else "")
+                  + ". Busy is not a finding and a long statement is not a finding; together they "
+                    "mean cores are being spent on work nobody is waiting for. This is a LEVEL, "
+                    "not a spike - the anomaly rules compare against the recent past and go quiet "
+                    "once a burn has lasted long enough to be the new normal.",
+        "cpu_percent_of_one_core": used, "cores": cores,
+        "share_of_machine": round(share, 3),
+        "oldest_statement_s": oldest[3],
+        "pid": (oldest[5] if len(oldest) > 5 else ""),
+        "verify": "compare `threads` against `activity`: the per-thread percentages are shares of "
+                  "ONE core, and the statement ages say whether anyone is waiting for the result",
+        "threshold_share": BURN_FRACTION, "threshold_is_chosen": True,
+    }]
+
+
+def checkpoint_waiting(s):
+    """A CHECKPOINT that is itself running long. It is not working, it is waiting.
+
+    Worth its own finding because it looks like ordinary activity - `active 25m` beside six other
+    statements - and because the remedy printed in the server's own error message is what put it
+    there. FORCE CHECKPOINT waits for the active transactions rather than aborting them, so against
+    a statement nobody is waiting for it cannot finish.
+    """
+    out = []
+    for row in (s or {}).get("queries", []):
+        if len(row) < 4 or row[0] != "active" or not CHECKPOINT_RE.match(row[1] or ""):
+            continue
+        age, pid = row[3], (row[5] if len(row) > 5 else "")
+        if age < CHECKPOINT_STUCK_S:
+            continue
+        forced = bool(CHECKPOINT_RE.match(row[1]).group(1))
+        # The likely holder: the oldest OTHER active statement. A checkpoint needs every
+        # transaction finished, so the oldest one is what it is waiting behind.
+        others = [r for r in s["queries"]
+                  if len(r) > 3 and r[0] == "active" and r is not row
+                  and not CHECKPOINT_RE.match(r[1] or "") and "pg_stat_activity" not in r[1]]
+        oldest = max(others, key=lambda r: r[3], default=None)
+        behind = ""
+        if oldest and oldest[3] > age:
+            behind = (f" The oldest statement in front of it has been running "
+                      f"{human_time(oldest[3])}"
+                      + (f" (pid {oldest[5]})" if len(oldest) > 5 and oldest[5] else "")
+                      + ", and a checkpoint needs every transaction finished, reads included.")
+        out.append({
+            "kind": "activity",
+            "what": f"{'FORCE ' if forced else ''}CHECKPOINT waiting for {human_time(age)}",
+            "detail": "this checkpoint is not working, it is waiting."
+                      + (" FORCE CHECKPOINT retries in a loop with no timeout and no backoff, and "
+                         "it waits for the active transactions rather than aborting them - so "
+                         "against a statement nobody is waiting for it does not finish. While it "
+                         "spins it also holds the lock new WRITERS need, and not the one new "
+                         "READERS need, so the transaction horizon it is waiting on keeps being "
+                         "re-pinned." if forced else
+                         " A plain CHECKPOINT errors rather than waiting, so one that is still "
+                         "active is doing the work; if it stays here it is the checkpoint itself "
+                         "that is slow, which on this database is compression of the embeddings.")
+                      + behind,
+            "waiting_for_s": age, "pid": pid, "forced": forced,
+            "blocked_by_pid": (oldest[5] if oldest and len(oldest) > 5 else None),
+            "blocked_by_age_s": (oldest[3] if oldest else None),
+            "fix": "there is nothing to wait for. Cancel it, deal with the statement in front of "
+                   "it, then run a plain CHECKPOINT - which errors immediately rather than "
+                   "hanging, so it is safe to use as a test of whether the way is clear.",
+            "verify": "select pid, round(extract(epoch from (now()-query_start))) age_s, query "
+                      "from pg_stat_activity where state = 'active' order by query_start",
+            "threshold_s": CHECKPOINT_STUCK_S, "threshold_is_chosen": True,
+        })
+    return out
+
+
+def long_running(s):
+    """Statements old enough that nobody is plausibly waiting for them.
+
+    The number the dashboard did not collect. It had what was running and how big the statement was
+    and nothing about WHEN it started, so a 42-hour query and a one-second query drew the same row.
+
+    Reads are included on purpose, and are the point: on this engine a checkpoint needs every
+    transaction finished before it can rewrite the file, so an ordinary SELECT blocks it outright.
+    Anyone reasoning from PostgreSQL - where a long read holds back vacuum and not checkpoints -
+    rules SELECT out immediately, which is how two of them ran for 42 hours unnoticed.
+    """
+    out = []
+    for row in (s or {}).get("queries", []):
+        if len(row) < 4 or row[0] != "active" or "pg_stat_activity" in row[1]:
+            continue
+        age, conn, pid, addr, app = (list(row) + [-1, -1, "", "", ""])[3:8]
+        if age < ABANDONED_S:
+            continue
+        pooled = conn > age + 1
+        who = " · ".join(x for x in (f"pid {pid}" if pid else "",
+                                     f"from {addr}" if addr else "",
+                                     f"app {app}" if app else "") if x)
+        out.append({
+            "kind": "activity",
+            "what": f"statement running for {human_time(age)}",
+            "detail": f"active for {human_time(age)}"
+                      + (f" on a connection {human_time(conn)} old, so a pool rather than a person "
+                         f"is holding it - the shape an abandoned request leaves behind" if pooled
+                         else "")
+                      + ". On this engine a checkpoint needs every transaction finished before it "
+                        "can rewrite the file, so this blocks checkpointing whether it reads or "
+                        "writes - which is NOT the PostgreSQL model, where a long read holds back "
+                        "vacuum and never touches a checkpoint.",
+            "holder": who or "the server named no client for it",
+            "running_for_s": age, "connection_age_s": conn, "pid": pid,
+            "client_addr": addr, "application_name": app,
+            "statement_chars": row[2],
+            # As much of it as the sample carries. The row shows a head; the opened finding shows
+            # this, scrollable, with the true length beside it - a truncated statement must never
+            # be mistaken for a short one.
+            "statement": row[1],
+            "fix": f"if nobody is waiting for it: select pg_terminate_backend({pid or '<pid>'}), "
+                   f"then CHECKPOINT to recover the WAL. It is read-only work, so nothing rolls "
+                   f"back. Do NOT use FORCE CHECKPOINT - it waits for the transaction rather than "
+                   f"aborting it, which is the wrong move against a statement nobody is waiting "
+                   f"for. To stop it recurring the only setting that bites is max_execution_time "
+                   f"(0 = off here): statement_timeout is accepted and NOT enforced, and "
+                   f"pg_statement_timeout_millis is for outbound scan connections to an ATTACHed "
+                   f"Postgres, not for anything a client sends here. Note max_execution_time is "
+                   f"armed after parsing, so it does not bound the parse itself.",
+            "verify": "select pid, state, round(extract(epoch from (now()-query_start))) age_s "
+                      "from pg_stat_activity where state = 'active' order by query_start",
+            "threshold_s": ABANDONED_S, "threshold_is_chosen": True,
+        })
+        if pid:
+            # The dashboard can do this one itself. Every other `fix` here is a command to run
+            # elsewhere; this is the row that already knows the pid.
+            out[-1]["action"] = ("terminate", pid)
+    return out
+
+
+def human_time(sec):
+    """Seconds as something a person reads. Hours matter here; milliseconds do not."""
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{sec // 60}m"
+    if sec < 172800:
+        return f"{sec // 3600}h {(sec % 3600) // 60}m"
+    return f"{sec // 86400}d {(sec % 86400) // 3600}h"
+
+
 def search_findings(sr):
     """The `sdb_metrics` half of `findings`. Four comparisons, each carrying what it compared.
 
@@ -399,7 +659,7 @@ def search_findings(sr):
     return out
 
 
-def findings(s, sz, host, hist=None, sr=None, held=None):
+def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
     """Conditions that were MEASURED, each with the numbers behind it and how to check it.
 
     Not a severity list and not a verdict: an entry is here because a specific comparison came out a
@@ -482,6 +742,9 @@ def findings(s, sz, host, hist=None, sr=None, held=None):
             if warn:
                 out.append({"kind": "setting", "what": f"setting: {name}",
                             "detail": warn, "value": s["settings"].get(name)})
+    out.extend(long_running(s))
+    out.extend(cpu_burn(s, host, tcpu))
+    out.extend(checkpoint_waiting(s))
     out.extend({"kind": "search", **f} for f in search_findings(sr))
     # Everything above is a comparison against a threshold that someone chose. These are against
     # the series' own recent past, so they catch the shapes no threshold can: a pool that has been
@@ -516,7 +779,7 @@ def collect(cfg, thread_window=1.0, query_head=400, hist=None):
     prog = db.progress(cfg) if s is not None else None
 
     out = {
-        "findings": findings(s, sz, host, hist, sr=sr, held=held),
+        "findings": findings(s, sz, host, hist, sr=sr, held=held, tcpu=tcpu),
         "threads": threads(rows, tcpu, by_tid, host, thread_window),
         "profile": profile(newest, tops),
         "host": hostinfo(host, s),
@@ -533,6 +796,7 @@ def collect(cfg, thread_window=1.0, query_head=400, hist=None):
     out["storage"] = storage(s, sz, host, held)
     out["memory"] = memory(s, host)
     out["activity"] = activity(s, query_head, prog)
+    out["activity"]["recorded"] = recorded(cfg["perf_dir"])
     out["config"] = {n: s["settings"].get(n) for n in sorted(HAZARDS)}
     return out
 

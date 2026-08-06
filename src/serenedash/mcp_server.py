@@ -87,6 +87,25 @@ def instructions():
 INSTRUCTIONS, REVISION = instructions()
 
 
+def _read_brief():
+    """The short form, or "" when it is missing - in which case the full text is sent as before.
+
+    A missing brief must degrade to the OLD behaviour rather than to no instructions: a client that
+    gets nothing has no way to know it is missing anything.
+    """
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "brief.md")) as f:
+            return f.read().replace("{{VERSION}}", VERSION).replace("{{REVISION}}", REVISION)
+    except OSError:
+        return ""
+
+
+# Whether this process has already handed over the full guide. One per server process, and a server
+# process is one client session, so "first call of the session" and "first call of the process" are
+# the same thing.
+_first_call = True
+
+
 def _stamp():
     """What every tool result carries so an agent can tell its context from the running server."""
     return {"version": VERSION, "instructions_revision": REVISION,
@@ -134,17 +153,36 @@ def stamped(fn):
                               "", ok=False, err=e)
             raise
         if isinstance(out, dict):
+            mine = "server" not in out          # a tool that reports its own stamp keeps it whole
             out.setdefault("server", _stamp())
+            global _first_call                                   # noqa: PLW0603
+            if mine and _first_call and MODE == "lazy":
+                # The guide, once, on the call that made it relevant. Under `server` rather than at
+                # the top level so it cannot be mistaken for part of the measurement.
+                _first_call = False
+                out["server"]["instructions"] = INSTRUCTIONS
+                out["server"]["instructions_note"] = (
+                    "The full guide for reading this server, sent with the first tool result of "
+                    "the session rather than at connect - it is 16K tokens and most sessions never "
+                    "call these tools. Read it before drawing conclusions; it is also at "
+                    + INSTRUCTIONS_URI + " and will not be sent again.")
         if _SERVING:
             mcplog.record(PERF, fn.__name__, named, (time.perf_counter() - t0) * 1000, out)
         return out
     return wrapped
 
 
+# What the client injects at connect, and what it gets on first use. See the module note on
+# `_first_call`: the default is to send the short brief now and the full guide with the first tool
+# result, because this server is enabled per project and most sessions never ask it anything.
+MODE = os.environ.get("SERENEDASH_INSTRUCTIONS", "lazy").strip().lower()
+
+BRIEF = (_read_brief() or INSTRUCTIONS)
+
 server = MCPServer(
     name="serenedash",
     version=VERSION,
-    instructions=INSTRUCTIONS,
+    instructions=INSTRUCTIONS if MODE == "full" else BRIEF,
 )
 
 
@@ -242,7 +280,7 @@ def memory() -> dict:
 
 @server.tool()
 @stamped
-def activity(max_query_chars: int = 2000) -> dict:
+def activity(max_query_chars: int = 2000, history: bool = True) -> dict:
     """Sessions and their current statements, excluding this connection, with per-query progress.
 
     `nothing_running: true` alongside busy threads is a finding rather than an absence: it means
@@ -253,15 +291,28 @@ def activity(max_query_chars: int = 2000) -> dict:
     to wait and telling them to kill it. Unlike the session list it cannot exclude the connection
     that asked, so one row is always this collector.
 
+    `recorded` is the other half, and it is the only one there is: pg_stat_activity is present
+    tense, this server has no pg_stat_statements, and `log_query_path` and profiling are both off by
+    default — so a statement that has ENDED leaves no trace anywhere on the server. The dashboard
+    samples the live view every tick and keeps what it saw, which costs the server nothing and is
+    how a 42-hour statement that has since been terminated still has a duration. It is sampled, and
+    the payload says so: a statement shorter than one tick was never seen, and every duration is a
+    lower bound rather than a measurement.
+
     Args:
         max_query_chars: statement text is cut at this length. `query_chars` on each row is always
             the full length, so a truncated statement is never mistaken for a short one. Raise it
             deliberately — generated statements here run to ~185 KB each.
+        history: include `recorded`, the dashboard's sampled record of what has run. Turn it off
+            when you only want what is running right now.
     """
     s, err = _sample(query_head=max_query_chars)
     if err:
         return err
-    return snap.activity(s, max_query_chars, db.progress(CFG))
+    out = snap.activity(s, max_query_chars, db.progress(CFG))
+    if history:
+        out["recorded"] = snap.recorded(PERF)
+    return out
 
 
 @server.tool()

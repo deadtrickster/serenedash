@@ -258,8 +258,10 @@ def view_hint(view, nav=None, c=None):
             return keys(("j/k", "scrolls"), ("esc", "back"))
         opens = "reads the finding" if view == "findings" else "opens the statement"
         out = [("j/k", "moves"), ("enter", opens)]
-        if view == "findings" and n.get("fixable"):
-            out.append(("r", "runs the fix"))
+        if view == "findings" and n.get("armed"):
+            out.append(("r", f"again terminates pid {n['armed']}"))
+        elif view == "findings" and n.get("fixable"):
+            out.append(("r", n.get("fix_label") or "runs the fix"))
         return keys(*out)
     if view == "logs":
         return keys(("space", "follow"), ("/", "filter"), ("j/k", "scrolls"))
@@ -276,13 +278,29 @@ def key_to_view(extra=None):
     return {**{key: view for key, view, _l in BINDINGS if view}, **ALIAS, **(extra or {})}
 
 
+# Kinds that mean the server is actively burning or stuck, as opposed to configured badly or
+# growing. A 46-hour statement and five pinned cores are not the same news as "memory_limit is 80%
+# of RAM", and the pinned rule said both in the same yellow.
+URGENT = ("activity", "cpu")
+
 # `setup` is what `doctor` used to be a whole view of: the dashboard's own preconditions. It is a
 # kind rather than a screen because the distinction between "the tool cannot measure this" and "the
 # server has a problem" is the tool's, not the reader's - both are a check that came out badly.
-KINDNAME = {"storage": "storage", "memory": "memory", "setting": "setting",
-            "search": "search", "trend": "trend", "setup": "setup", "other": "other"}
+# Every kind the collector can emit needs an entry, or the row is labelled `?` - which is what the
+# long-query findings looked like on the live dashboard: `activity` was added to the collector and
+# never here.
+KINDNAME = {"storage": "storage", "memory": "memory", "setting": "setting", "search": "search",
+            "trend": "trend", "setup": "setup", "activity": "activity", "cpu": "cpu",
+            "other": "other"}
+# When a running statement stops being "busy" and starts being a finding. Both are CHOSEN, and the
+# rows say so by carrying the age itself rather than only a colour. 5 minutes is longer than any
+# dashboard query here and short enough to catch a stuck one; an hour is past every legitimate
+# analytical query this deployment runs, and the incident that produced these ran for 42 of them.
+STALE = 300
+ABANDONED = 3600
+
 KINDCOL = {"storage": "cyn", "memory": "mag", "setting": "yel", "search": "grn", "trend": "blu",
-           "setup": "yel"}
+           "setup": "yel", "activity": "red", "cpu": "red"}
 
 def qty(n):
     """A count, abbreviated base 1000. NOT human() — that is base 1024 and these are documents.
@@ -530,7 +548,7 @@ def biggest_literal(q):
 
 
 def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=40,
-                   anchors=None):
+                   anchors=None, ended=()):
     """The `a` view: every session, collapsed, and the whole statement of the one you open.
 
     Collapsed by DEFAULT. This view used to wrap every statement in full on the theory that the
@@ -545,11 +563,23 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
     c = C if col else NOCOLOR
     W = max(70, width)
     st = s["states"]
-    rows = [(stt, q, n) for stt, q, n in s["queries"] if "pg_stat_activity" not in q]
+    rows = [r for r in s["queries"] if "pg_stat_activity" not in r[1]]
     if full:
-        rows = [(stt, q, n) for stt, q, n in full if "pg_stat_activity" not in q]
+        rows = [r for r in full if "pg_stat_activity" not in r[1]]
+    # Statements that have since ended, in the same shape as live ones so everything below - the
+    # sort, the cursor, opening one - works on both without knowing the difference. pg_stat_activity
+    # forgets; this is what the dashboard saw before it did.
+    rows += [("ended", r.get("statement", ""), r.get("chars") or 0, r.get("ran_for_s") or -1,
+              r.get("connection_age_s") or -1, r.get("pid") or "",
+              r.get("client_addr") or "", r.get("application_name") or "")
+             for r in ended]
+    # Active first, then oldest first. The row that matters is the one nobody is waiting for, and
+    # ordering by state alone left a 42-hour query wherever the server happened to return it.
+    rows.sort(key=lambda r: (r[0] != "active", -(r[3] if len(r) > 3 else 0)))
     out = [f"{c['b']}activity{c['r']}  {c['dim']}"
-           + "  ".join(f"{k} {v}" for k, v in sorted(st.items())) + f"{c['r']}", ""]
+           + "  ".join(f"{k} {v}" for k, v in sorted(st.items()))
+           + (f"  ·  {len(ended)} ended, sampled every tick - anything shorter than one is not "
+              f"here" if ended else "") + f"{c['r']}", ""]
     if not rows:
         out.append(f"{c['dim']}no sessions{c['r']}")
         return out[scroll:]
@@ -559,7 +589,9 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
 
     room = max(1, height - len(out) - 1)
     start = max(0, min(sel - room // 2, len(rows) - room))
-    for i, (stt, q, n) in enumerate(rows[start:start + room], start=start):
+    for i, row in enumerate(rows[start:start + room], start=start):
+        stt, q, n = row[0], row[1], row[2]
+        age = row[3] if len(row) > 3 else -1
         run = stt == "active"
         mark = f"{c['b']}›{c['r']}" if i == sel else " "
         if anchors is not None:
@@ -569,13 +601,20 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
         # The size and the literal share are the two things that decide whether a statement is
         # worth opening, so they go on the collapsed row rather than inside it.
         size = f"{c['dim']}{n:,} chars{c['r']}" if n > 2000 else f"{c['dim']}{n:,}{c['r']}"
+        # Colour on age rather than on size: an hours-old statement is the finding whatever it
+        # says, and on this engine a long READ blocks every checkpoint.
+        ac = c["red"] if age >= ABANDONED else c["yel"] if age >= STALE else c["dim"]
+        # An ended statement's age is how long it RAN, which is the number you came for, so it is
+        # shown for both - just without the alarm colour, since it is over.
+        old = (f"{ac}{dur(age)}{c['r']}" if run and age >= 0 else
+               f"{c['dim']}ran {dur(age)}{c['r']}" if stt == "ended" and age >= 0 else "")
         share = ""
         if lit:
             lc = c["yel"] if lit > n / 4 else c["dim"]
             share = f"{lc}{lit / n * 100:.0f}% one literal{c['r']}"
         head = " ".join(str(q).split())
-        out.append(f" {mark}{state} {size:<24} {share:<26} "
-                   f"{'' if run else c['dim']}{clip(head, max(20, W - 60))}{c['r']}")
+        out.append(f" {mark}{state} {old:<20} {size:<22} {share:<24} "
+                   f"{'' if run else c['dim']}{clip(head, max(20, W - 78))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
     return out
@@ -584,10 +623,20 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
 def _statement(row, c, W, height, scroll):
     """One statement, whole. Wrapped rather than truncated - the interesting part of a statement is
     rarely in its first line, which is why the main panel's head is not enough."""
-    stt, q, n = row
+    stt, q, n = row[0], row[1], row[2]
+    age, conn, pid = (list(row) + [-1, -1, ""])[3:6]
     run = stt == "active"
     head = f"  {(c['grn'] + '▸ active') if run else (c['dim'] + '· ' + stt)}{c['r']}"
     lit, preview = biggest_literal(q) if n > 2000 and len(q) >= n else (0, "")
+    if age >= 0:
+        ac = c["red"] if age >= ABANDONED else c["yel"] if age >= STALE else c["dim"]
+        head += f"  {ac}running {dur(age)}{c['r']}"
+        if conn > age + 1:
+            # A pooled connection that ran other statements first - a pool, not a person, is
+            # holding it, which is the shape an abandoned request leaves behind.
+            head += f"  {c['dim']}on a connection {dur(conn)} old{c['r']}"
+        if pid:
+            head += f"  {c['dim']}pid {pid}{c['r']}"
     if n > 2000:
         # Characters, not bytes - human() is base 1024 and this is text the server measured with
         # length(). One denominator for the row: every figure on it divides by these characters.
@@ -1118,7 +1167,7 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     act, idle = st.get("active", 0), st.get("idle", 0)
     ahead = [line(c, "sessions", str(act + idle), " " * COL_BAR,
                   f"{c['grn']}{act} active{c['r']}  {c['dim']}{idle} idle{c['r']}", vc=c["b"])]
-    live = [q for stt, q, _ in s["queries"] if stt == "active" and "pg_stat_activity" not in q]
+    live = [r[1] for r in s["queries"] if r[0] == "active" and "pg_stat_activity" not in r[1]]
     if not live and act == 0:
         ahead.append(f"{c['dim']}{' ' * COL_LABEL}nothing running — a pinned core now means "
                      f"orphaned server-side work{c['r']}")
@@ -1132,7 +1181,8 @@ def frame(s, prev, sz, hist, perf, thr, tcpu, host, col, width, height=40, sql_w
     # difference between a query and a query carrying three copies of a 21,684-character embedding,
     # and `a` is where the split between statement and literal is measured.
     abody = []
-    for stt, q, n in ordered:
+    for row in ordered:
+        stt, q, n = row[0], row[1], row[2]
         mark = f"{(c['grn'] + '▸') if stt == 'active' else (c['dim'] + '·')}{c['r']} "
         size = f"{c['dim']}{qty(n)}{c['r']} " if n > 2000 else ""
         body = (clip(q, max(20, WIDE - len(strip(size)))) if q
@@ -1836,8 +1886,13 @@ def summary_line(found, c, width, key="f"):
                            for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
         tail = f" · {passed} passed" if passed else ""
         plain = f"{len(tripped)} finding{'s' if len(tripped) != 1 else ''} · {counts}{tail}"
-        body = (f"{c['yel']}{c['b']}{len(tripped)} finding"
-                f"{'s' if len(tripped) != 1 else ''}{c['r']}{c['dim']} · {counts}{tail}{c['r']}")
+        # Red when something is burning or stuck right now, yellow when something is merely wrong.
+        # The rule is glanced at from every panel, so it has to distinguish "look at this" from
+        # "know this" without being read.
+        hot = any(f.get("kind") in URGENT for f in tripped)
+        lead = (c["red"] + c["b"]) if hot else (c["yel"] + c["b"])
+        body = (f"{lead}{len(tripped)} finding{'s' if len(tripped) != 1 else ''}{c['r']}"
+                f"{c['dim']} · {counts}{tail}{c['r']}")
     # Clipped before it is centred. A rule that only ever pads runs past the frame on a narrow
     # terminal and wraps, which puts a stray half-rule under the top of every redraw.
     if len(plain) > W - 6:
@@ -1850,7 +1905,7 @@ def summary_line(found, c, width, key="f"):
 
 
 def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
-                   anchors=None):
+                   anchors=None, msg=None):
     """The `f` view: every measured finding, countable at a glance and readable one at a time.
 
     The summary line first, because "5 findings" is the answer to the question you had before you
@@ -1871,6 +1926,10 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     # the row the storage border starts on. One view sitting a line lower than the rest reads as
     # the frame having shifted rather than as a different panel.
     out = []
+    if msg:
+        # What the last fix did. On the first row because it is the answer to the keypress you just
+        # made, and a result printed at the foot of a list is a result you have to go looking for.
+        out.append(f"  {c['grn'] if msg[0] else c['red']}{msg[1]}{c['r']}")
     if not found:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
             "Nothing tripped is a result, not an absence of one: every comparison ran and none of "
@@ -1896,7 +1955,7 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
         # The first sentence of the detail, not the whole of it: what the finding IS goes in the
         # left column and the reason has to survive being cut, so the numbers come first in every
         # detail string the collector writes.
-        why = strip((f.get("detail") or "").split(". ")[0])
+        why = strip(f.get("holder") or (f.get("detail") or "").split(". ")[0])
         label = "passed" if ok else KINDNAME.get(f.get("kind"), "?")
         out.append(f" {mark}{(c['grn'] + c['dim']) if ok else c[kc]}{label:<8}{c['r']} "
                    f"{'' if ok else c['b']}{c['dim'] if ok else ''}"
@@ -1920,7 +1979,8 @@ def _finding_detail(f, c, W, height, scroll):
         out.append(f"  {ln}")
     # Every key that is not prose: the operands the sentence above was computed from.
     nums = {k: v for k, v in f.items()
-            if k not in ("what", "detail", "kind", "fix", "verify", "note") and v is not None}
+            if k not in ("what", "detail", "kind", "fix", "verify", "note", "statement",
+                         "action", "severity", "status") and v is not None and v != ""}
     if nums:
         out.append("")
         for k, v in nums.items():
@@ -1928,8 +1988,25 @@ def _finding_detail(f, c, W, height, scroll):
             out.append(f"  {c['dim']}{k:<28}{c['r']}{shown}")
     if f.get("action"):
         out.append("")
-        out.append(f"  {c['yel']}press r{c['r']} {c['dim']}and the dashboard does this itself"
-                   f"{c['r']}")
+        kind = f["action"][0] if isinstance(f["action"], (list, tuple)) else ""
+        if kind == "terminate":
+            out.append(f"  {c['yel']}press r twice{c['r']} {c['dim']}to terminate pid "
+                       f"{f.get('pid', '?')} from here - it asks once, because this aborts "
+                       f"whatever that backend is doing{c['r']}")
+        else:
+            out.append(f"  {c['yel']}press r{c['r']} {c['dim']}and the dashboard does this itself"
+                       f"{c['r']}")
+    if f.get("statement"):
+        # The whole of what was fetched, wrapped. This pane scrolls, so a 68 KB statement is
+        # readable here rather than only in the activity view.
+        out.append("")
+        n, got = f.get("statement_chars") or 0, len(f["statement"])
+        out.append(f"  {c['yel']}statement{c['r']}  {c['dim']}{n:,} chars"
+                   + (f", showing the first {got:,} - the activity view (a) fetches the whole of "
+                      f"it, this is the head the tick already had" if got < n else "")
+                   + f"{c['r']}")
+        out += [f"  {c['dim']}{ln}{c['r']}"
+                for ln in textwrap.wrap(f["statement"], max(40, W - 6))]
     for label, key in (("fix", "fix"), ("check it", "verify"), ("note", "note")):
         if f.get(key):
             out.append("")

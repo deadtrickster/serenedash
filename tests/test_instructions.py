@@ -154,3 +154,80 @@ def test_it_warns_that_published_duckdb_docs_are_not_authoritative_here():
     assert "fork" in t
     assert "v0.0.1" in t
     assert "duckdb_settings()" in t
+
+
+# ---- the guide arrives on first use, and the brief has to survive the client's cut --------------
+# Two facts drive this. Claude Code truncates server instructions at about 2 KB - visible in this
+# very repo's own session, where the injected block ends "does the… [truncated]" - so a 63,656-char
+# guide never reached a model through that channel at all. And MCP servers are enabled per project,
+# so whatever IS sent is paid for by every session, including the ones that never ask this server
+# anything.
+
+def test_the_brief_survives_a_two_kilobyte_truncation():
+    from serenedash.mcp_server import BRIEF
+
+    n = len(BRIEF.encode())
+    assert n <= 2048, f"the brief is {n} bytes and the client cuts at ~2048; the tail is discarded"
+
+
+def test_the_brief_says_the_rest_is_coming_before_it_could_be_cut():
+    # Truncation takes the TAIL, so anything the model must know has to be near the front - starting
+    # with the fact that a fuller guide exists at all, or it will not know to wait for one.
+    from serenedash.mcp_server import BRIEF
+
+    head = BRIEF.encode()[:600].decode("utf-8", "ignore")
+    assert "first tool result" in head
+    assert "serenedash://instructions" in head
+
+
+def test_the_brief_carries_the_misreadings_that_have_actually_happened():
+    # A model that reads one tool result and stops must still not report a parse cost as a search
+    # cost, or recommend a timeout that does nothing.
+    from serenedash.mcp_server import BRIEF
+
+    for rule in ("parse", "Matcher", "statement_timeout", "denominator", "ONE core",
+                 "blocks checkpointing"):
+        assert rule in BRIEF, rule
+
+
+def test_connect_is_cheap_and_the_first_call_carries_the_guide():
+    from serenedash import mcp_server as m
+
+    assert m.MODE == "lazy", "the default is lazy; `full` restores the old behaviour"
+    assert len(m.BRIEF) < len(m.INSTRUCTIONS) / 10, "connect must not carry the long form"
+    assert m.server.instructions == m.BRIEF
+
+
+def test_the_guide_is_sent_once_and_then_not_again(monkeypatch):
+    from serenedash import mcp_server as m
+
+    monkeypatch.setattr(m, "_first_call", True)
+    monkeypatch.setattr(m, "MODE", "lazy")
+
+    @m.stamped
+    def host():
+        return {"cores": 24}
+
+    first, second = host(), host()
+    assert first["server"]["instructions"] == m.INSTRUCTIONS
+    assert "instructions_note" in first["server"]
+    assert "instructions" not in second["server"], "sending it twice doubles the cost it saved"
+    assert second["server"]["instructions_revision"] == m.REVISION
+
+
+def test_a_missing_brief_degrades_to_the_old_behaviour_not_to_silence(monkeypatch):
+    # A client that gets nothing has no way to know it is missing anything.
+    from serenedash import mcp_server as m
+
+    monkeypatch.setattr(m.os.path, "dirname", lambda _p: "/nonexistent")
+    assert m._read_brief() == ""
+
+
+def test_the_brief_ships_in_the_wheel():
+    # instructions.md already had this test for the same reason: package data is found in the source
+    # tree by an editable install whatever the build config says, so only a real wheel proves it.
+    import os
+
+    from serenedash import mcp_server as m
+
+    assert os.path.exists(os.path.join(os.path.dirname(m.__file__), "brief.md"))
