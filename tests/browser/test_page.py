@@ -59,7 +59,7 @@ def test_the_key_bar_is_clickable_and_switches_the_view(dash, page):
     page.locator("#f svg rect.hit").filter(has=page.locator("title", has_text="key: o")).click()
     wait_for_frame(page, "checkpoint")
     assert "log" in frame(page)
-    assert "view=logs" in page.url, "the URL has to describe what the tab is showing"
+    assert page.url.endswith("/logs"), "the URL has to describe what the tab is showing"
 
 
 def test_a_hit_area_lights_up_under_the_pointer(dash, page):
@@ -80,21 +80,21 @@ def test_a_keypress_switches_the_view(dash, page):
     wait_for_frame(page)
     page.keyboard.press("o")
     wait_for_frame(page, "checkpoint")
-    assert "view=logs" in page.url
+    assert page.url.endswith("/logs")
 
 
 def test_escape_goes_back_to_main(dash, page):
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.keyboard.press("Escape")
     wait_for_frame(page, "q quit")
-    assert "view=main" in page.url
+    assert page.url.rstrip("/").endswith("/main")
 
 
 def test_a_view_link_opened_directly_shows_that_view(dash, page):
     # It used to show main: the page knew it wanted `logs`, the server did not, and every frame it
     # sent was for `main` and was discarded. Only `main` ever loaded from a link.
-    page.goto(dash.url + "/?view=storage")
+    page.goto(dash.url + "/storage")
     wait_for_frame(page)
     assert "storage" in frame(page).lower()
 
@@ -102,7 +102,7 @@ def test_a_view_link_opened_directly_shows_that_view(dash, page):
 def test_a_tab_survives_the_dashboard_restarting(dash, page):
     # The reported bug, end to end: kill the dashboard under an open tab, start it again, and the
     # tab has to come back to the panel it was on without being reloaded.
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     dash.stop()
     page.wait_for_function("() => document.getElementById('s').className.includes('off')",
@@ -113,15 +113,15 @@ def test_a_tab_survives_the_dashboard_restarting(dash, page):
         "() => { const s = document.querySelector('#f svg'); return s && !s.dataset.stale; }",
         timeout=30000)
     assert "checkpoint" in frame(page), "came back to a different view than the tab was showing"
-    assert "view=logs" in page.url
+    assert page.url.endswith("/logs")
 
 
 def test_two_tabs_can_watch_different_views(dash, page, context):
     # One shared server-side view meant the second tab silently blanked the first.
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     other = context.new_page()
-    other.goto(dash.url + "/?view=storage")
+    other.goto(dash.url + "/storage")
     other.wait_for_selector("#f svg")
     page.wait_for_timeout(1000)                  # a few ticks with both connected
     assert "checkpoint" in frame(page) and "storage" in frame(other).lower()
@@ -129,18 +129,18 @@ def test_two_tabs_can_watch_different_views(dash, page, context):
 
 
 def test_slash_focuses_the_log_filter(dash, page):
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.keyboard.press("/")
     assert page.evaluate("document.activeElement.id") == "q"
 
 
 def test_the_filter_narrows_the_log_and_survives_a_reload(dash, page):
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.fill("#q", "index build")
     wait_for_frame(page, "index build failed", without="checkpoint")
-    page.wait_for_url(re.compile(r"q=index"), timeout=5000)
+    page.wait_for_url(re.compile(r"/logs\?q=index"), timeout=5000)
     page.reload()                                 # the filter is in the URL, so it comes back
     wait_for_frame(page, "index build failed", without="checkpoint")
     assert page.input_value("#q") == "index build"
@@ -149,12 +149,15 @@ def test_the_filter_narrows_the_log_and_survives_a_reload(dash, page):
 def test_typing_a_filter_does_not_fire_the_view_shortcuts(dash, page):
     # 's' is the storage view. Typing "search" into the filter box must not navigate away twice
     # mid-word, which is what happens when a global keydown handler sees the box's keystrokes.
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.click("#q")
     page.keyboard.type("disk")
     page.wait_for_timeout(600)
-    assert "view=logs" in page.url and page.input_value("#q") == "disk"
+    # Still on the log, now with the filter as its parameter - which is the point of keeping the
+    # view in the path and the filter in the query.
+    assert page.url.rstrip("/").split("?")[0].endswith("/logs")
+    assert page.input_value("#q") == "disk"
 
 
 def test_the_filter_box_only_appears_where_it_does_something(dash, page):
@@ -197,7 +200,7 @@ def test_j_and_k_move_the_selection_in_the_browser(dash, page):
     # switch views, so every navigation key was silently dropped on the one view built around
     # moving through a list. SSE has no channel back, so they go as a GET and the server pushes the
     # new frame to that subscriber alone.
-    page.goto(dash.url + "/?view=mcp")
+    page.goto(dash.url + "/mcp")
     wait_for_frame(page, "sessions")
     first = frame(page)
     page.keyboard.press("j")
@@ -208,7 +211,7 @@ def test_j_and_k_move_the_selection_in_the_browser(dash, page):
 
 
 def test_enter_descends_and_escape_climbs_back_in_the_browser(dash, page):
-    page.goto(dash.url + "/?view=mcp")
+    page.goto(dash.url + "/mcp")
     wait_for_frame(page, "sessions")
     page.keyboard.press("Enter")
     wait_for_frame(page, "enter shows the whole call")     # level 2, that session's calls
@@ -218,24 +221,24 @@ def test_enter_descends_and_escape_climbs_back_in_the_browser(dash, page):
     wait_for_frame(page, "enter shows the whole call", without="esc closes")
     page.keyboard.press("Escape")
     wait_for_frame(page, "enter opens the session")        # back at level 1
-    assert "view=mcp" in page.url, "escape must unwind the levels before leaving the view"
+    assert page.url.endswith("/mcp"), "escape must unwind the levels before leaving the view"
 
 
 def test_escape_with_nothing_open_still_leaves_the_view(dash, page):
-    page.goto(dash.url + "/?view=mcp")
+    page.goto(dash.url + "/mcp")
     wait_for_frame(page, "enter opens the session")
     page.keyboard.press("Escape")
     wait_for_frame(page, "q quit")
-    page.wait_for_url(re.compile(r"view=main"), timeout=8000)
+    page.wait_for_url(re.compile(r"/main$"), timeout=8000)
 
 
 def test_two_tabs_scroll_independently(dash, page, context):
     # Position is per subscriber, like the view and the filter. One shared cursor would mean two
     # people reading the same log move each other's screen.
-    page.goto(dash.url + "/?view=mcp")
+    page.goto(dash.url + "/mcp")
     wait_for_frame(page, "sessions")
     other = context.new_page()
-    other.goto(dash.url + "/?view=mcp")
+    other.goto(dash.url + "/mcp")
     other.wait_for_selector("#f svg")
     before = frame(other)
     page.keyboard.press("Enter")
@@ -248,7 +251,7 @@ def test_two_tabs_scroll_independently(dash, page, context):
 def test_navigation_keys_are_left_alone_where_they_do_nothing(dash, page):
     # `j` is not bound on the storage panel. A page that took it to do nothing would be worse than
     # one that let it fall through to the browser.
-    page.goto(dash.url + "/?view=storage")
+    page.goto(dash.url + "/storage")
     wait_for_frame(page)
     before = frame(page)
     page.keyboard.press("j")
@@ -262,13 +265,59 @@ def test_the_key_that_doctor_used_to_have_still_opens_the_screen(dash, page):
     page.goto(dash.url)
     wait_for_frame(page)
     page.keyboard.press("d")
-    page.wait_for_url(re.compile(r"view=findings"), timeout=8000)
+    page.wait_for_url(re.compile(r"/findings$"), timeout=8000)
 
 
 def test_a_view_key_pressed_on_its_own_view_goes_back(dash, page):
     # The terminal toggles - the key that opens a view closes it - and the page did not, so a key
     # pressed while already on its own view did nothing, which reads exactly like an unbound key.
-    page.goto(dash.url + "/?view=logs")
+    page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.keyboard.press("o")
-    page.wait_for_url(re.compile(r"view=main"), timeout=8000)
+    page.wait_for_url(re.compile(r"/main$"), timeout=8000)
+
+
+def test_a_view_is_a_path_not_a_query_string(dash, page):
+    # `/?view=findings` was a query string doing a path's job. Each panel is a page: it has a name,
+    # you link to it, you go back to the one before.
+    page.goto(dash.url + "/findings")
+    wait_for_frame(page)
+    assert page.url.endswith("/findings")
+    page.keyboard.press("o")
+    page.wait_for_url(re.compile(r"/logs$"), timeout=8000)
+    assert "?" not in page.url, "the view is the path; the query is for parameters OF the page"
+
+
+def test_back_returns_to_the_panel_you_were_on(dash, page):
+    # replaceState overwrote the entry you came from, so Back left the dashboard entirely rather
+    # than going back one panel.
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    page.keyboard.press("o")
+    wait_for_frame(page, "checkpoint")
+    page.keyboard.press("s")
+    page.wait_for_url(re.compile(r"/storage$"), timeout=8000)
+    page.go_back()
+    page.wait_for_url(re.compile(r"/logs$"), timeout=8000)
+    wait_for_frame(page, "checkpoint")
+    page.go_forward()
+    page.wait_for_url(re.compile(r"/storage$"), timeout=8000)
+
+
+def test_the_filter_refines_the_page_rather_than_navigating(dash, page):
+    # Typing is not navigating: a history entry per keystroke is not history. One Back from a
+    # filtered log leaves the log, it does not walk the word back a letter at a time.
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    page.keyboard.press("o")
+    wait_for_frame(page, "checkpoint")
+    page.fill("#q", "index build")
+    page.wait_for_url(re.compile(r"/logs\?q=index"), timeout=8000)
+    page.go_back()
+    page.wait_for_url(re.compile(r"/main$"), timeout=8000)
+
+
+def test_a_deep_link_with_a_filter_opens_filtered(dash, page):
+    page.goto(dash.url + "/logs?q=index+build")
+    wait_for_frame(page, "index build failed", without="checkpoint")
+    assert page.input_value("#q") == "index build"

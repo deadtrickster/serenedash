@@ -81,7 +81,9 @@ body{margin:0;padding:.8rem;background:#1a1d23;color:#e6eaf2;
 <div id=f>connecting…</div>
 <script>
 const views = __VIEWS__, keys = __KEYS__;
-let view = new URLSearchParams(location.search).get('view') || 'main';
+const pathview = () => location.pathname.split('/').filter(Boolean)[0] || 'main';
+let view = pathview();
+if (!views.includes(view)) view = 'main';
 const fr = document.getElementById('f'), st = document.getElementById('s'),
       box = document.getElementById('q'), lbl = document.getElementById('lbl');
 let needle = new URLSearchParams(location.search).get('q') || '';
@@ -109,7 +111,7 @@ function connect(){
       if (!m.svg || (m.view !== view && !m.id)) return;
       fr.innerHTML = m.svg; fr.classList.remove('wait');
       sid = m.id || sid; navigable = !!m.nav;
-      if (m.view !== view){ view = m.view; history.replaceState(0,'',url()); }
+      if (m.view !== view){ view = m.view; history.replaceState({view: view}, '', url()); }
       overlay(m.hits || []);
       say(''); };
   es.onerror = () => say('disconnected - retrying', 'off');
@@ -134,22 +136,28 @@ function overlay(hits){
     svg.appendChild(r); });
 }
 
-function url(){ return '?view=' + view + (needle ? '&q=' + encodeURIComponent(needle) : ''); }
+function url(){ return '/' + view + (needle ? '?q=' + encodeURIComponent(needle) : ''); }
 
 // Typing is not a tick. Reconnecting on every keystroke would open and drop a stream per character,
 // so the wait is short enough to feel live and long enough to be one connection per word.
 let typing = null;
+// REPLACE for the filter: refining what a page shows is not navigating to another page, and a
+// history entry per keystroke is not history.
 box.oninput = () => { clearTimeout(typing); typing = setTimeout(() => {
-  needle = box.value.trim(); history.replaceState(0,'',url()); connect(); }, 250); };
+  needle = box.value.trim(); history.replaceState({view: view}, '', url()); connect(); }, 250); };
 box.onkeydown = e => { e.stopPropagation();          // the view keys must not fire while typing
   if (e.key === 'Escape'){ box.value = ''; box.blur(); needle = '';
-                           history.replaceState(0,'',url()); connect(); } };
+                           history.replaceState({view: view}, '', url()); connect(); } };
 
-function go(v){ if (!views.includes(v)) return;
+function go(v, push){ if (!views.includes(v)) return;
   if (v === view) v = 'main';        // the key that opens a view closes it, as in the terminal
   if (v === view) return;
   view = v; needle = ''; box.value = '';
-  history.replaceState(0,'',url());
+  // PUSH, not replace: replaceState overwrote the entry you came from, so Back left the dashboard
+  // rather than returning to the panel you were just on. `push === false` is popstate telling us
+  // the entry already exists.
+  if (push === false) history.replaceState({view: view}, '', url());
+  else history.pushState({view: view}, '', url());
   // Say so immediately on switch. Most views re-render from data already in memory and land in
   // milliseconds, but `activity` re-fetches whole statements and `doctor` re-runs its checks, and
   // a page that looks frozen for a second is indistinguishable from one that has broken.
@@ -164,6 +172,15 @@ box.value = needle;
 const NAV = {j:'j', k:'k', ArrowDown:'down', ArrowUp:'up', PageDown:'pgdn', PageUp:'pgup',
              Enter:'enter', End:'end', Home:'home'};
 function nav(key){ fetch('/nav?id=' + encodeURIComponent(sid) + '&key=' + encodeURIComponent(key)); }
+
+// Back and forward are ordinary navigation here, so they are answered by reading the location
+// rather than by remembering anything.
+window.addEventListener('popstate', () => {
+  const v = pathview();
+  needle = new URLSearchParams(location.search).get('q') || '';
+  box.value = needle;
+  if (v !== view && views.includes(v)) { view = v; fr.classList.add('wait'); }
+  connect(); });
 
 document.addEventListener('keydown', e => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;      // leave the browser's own shortcuts alone
@@ -306,7 +323,10 @@ def handler_for(hub, views, state, keys):
 
         def do_GET(self):
             path = self.path.split("?")[0]
-            if path == "/":
+            # A view is a page: `/findings`, not `/?view=findings`. Anything that is not an
+            # endpoint and names a view serves the app, and the app reads the path to know what to
+            # show - which is also what makes a deep link and the back button work at all.
+            if path == "/" or path.strip("/") in views:
                 page = (PAGE.replace("__VIEWS__", json.dumps(views))
                             .replace("__KEYS__", json.dumps(keys)))
                 return self._send(200, page.encode())
