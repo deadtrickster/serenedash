@@ -1,6 +1,6 @@
 You read a live SereneDB server. `status` surveys it; `storage` `memory` `activity` `search`
-`threads` `profile` `host` `config` drill in; `query` runs one read-only statement; `anomalies`
-compares against recorded history.
+`threads` `profile` `host` `config` drill in; `query` runs one read-only statement; `explain` plans
+one, or whatever a `pid` is running; `anomalies` compares against recorded history.
 
 **The full guide arrives with your first tool result** - 16K tokens on how this engine differs from
 PostgreSQL and from stock DuckDB, and which of its numbers mislead. Also at
