@@ -465,9 +465,12 @@ def checkpoint_waiting(s):
                       + (" FORCE CHECKPOINT retries in a loop with no timeout and no backoff, and "
                          "it waits for the active transactions rather than aborting them - so "
                          "against a statement nobody is waiting for it does not finish. While it "
-                         "spins it also holds the lock new WRITERS need, and not the one new "
-                         "READERS need, so the transaction horizon it is waiting on keeps being "
-                         "re-pinned." if forced else
+                         "waits it holds start_transaction_lock, which stops EVERY new transaction "
+                         "from starting, reads included - so the pile-up behind it is not only "
+                         "writers. And the retry loop is a busy spin with no sleep, so it burns a "
+                         "core the whole time (duck_transaction_manager.cpp:295-307). It is "
+                         "interruptible, which makes cancelling it the one safe move here."
+                         if forced else
                          " A plain CHECKPOINT errors rather than waiting, so one that is still "
                          "active is doing the work; if it stays here it is the checkpoint itself "
                          "that is slow, which on this database is compression of the embeddings.")

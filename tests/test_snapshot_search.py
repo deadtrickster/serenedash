@@ -381,7 +381,16 @@ def test_a_checkpoint_that_is_itself_running_long_is_a_finding():
     f = got[0]
     assert f["forced"] is True and "waiting" in f["what"]
     assert f["blocked_by_pid"] == "1265771991", "it names what is in front of it"
-    assert "no timeout" in f["detail"] and "re-pinned" in f["detail"]
+    assert "no timeout" in f["detail"]
+    # It used to say the horizon "keeps being re-pinned" by new readers. That is backwards: the
+    # force path holds start_transaction_lock for the whole wait
+    # (duck_transaction_manager.cpp:295-307), so NO new transaction starts, reader or writer, and
+    # the horizon is pinned by the statements already running. Getting this wrong sends whoever
+    # reads it looking for new arrivals instead of at the two that will never finish.
+    assert "re-pinned" not in f["detail"]
+    assert "start_transaction_lock" in f["detail"] and "reads included" in f["detail"]
+    assert "busy spin" in f["detail"], "burning a core while it waits is half of why this hurts"
+    assert "interruptible" in f["detail"], "and cancelling it is the one safe move"
     assert "nothing to wait for" in f["fix"]
 
 

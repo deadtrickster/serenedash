@@ -147,6 +147,36 @@ An empty `findings` list means nothing tripped. It does not mean nothing is wron
 - **`blocks` are the store's own block accounting**, at its block size (262144 bytes here). Free blocks are reusable, not returned to the filesystem.
 - **`wal_over_database` is the ratio that matters**, not the absolute WAL size — that depends entirely on write volume since the last successful checkpoint.
 
+## The pg_catalog surface is mostly shape, not data
+
+`pg_catalog` lists **148** relations here, and about five of them carry information. The rest are
+compatibility stubs so that Postgres clients and drivers introspect without erroring. They return
+zero rows, or rows whose every counter is zero, and nothing distinguishes them from a view that is
+genuinely reporting "nothing is happening".
+
+**Query one of these and an empty result is not a measurement.** Measured on a live deployment while
+seven statements were stuck and a `FORCE CHECKPOINT` had been waiting nine hours:
+
+| relation | what you get |
+|---|---|
+| `pg_stat_activity` | **real.** Sessions, statements, `query_start`. This is the one to use |
+| `pg_settings` | **real.** 297 settings |
+| `sdb_metrics`, `sdb_progress`, `sdb_settings` | **real.** SereneDB's own - the search-engine counters, per-statement progress, and the settings that differ from stock |
+| `pg_class`, `pg_indexes` | **real** for catalog shape |
+| `pg_stat_checkpointer`, `pg_stat_bgwriter`, `pg_stat_database`, `pg_stat_all_tables`, `pg_statio_all_tables` | rows exist, every counter is **zero** |
+| `pg_locks` | **empty** |
+| `pg_stat_wal`, `pg_stat_io`, `pg_wait_events`, `pg_stat_progress_*`, `pg_cursors`, `pg_prepared_statements`, `pg_stats`, `pg_backend_memory_contexts`, `pg_shmem_allocations` | **empty** |
+
+The one that has actually misled people is `pg_locks`. Empty there does not mean nothing holds a
+lock - it means the view is not implemented. Do not report "no locks are held" or "nothing is
+blocking" on the strength of it, and do not reach for it to explain a stalled checkpoint. **There is
+no lock or blocking view on this server.** What blocks a checkpoint here is the oldest open
+transaction, reads included, and you find that in `pg_stat_activity` by `query_start` - which is what
+the `checkpoint_blocked` finding does.
+
+Likewise, WAL size does not come from `pg_stat_wal` (zeroed). It comes from the files on disk, which
+is why `storage` measures the directory rather than asking the server.
+
 ## What the panels do not cover, and where to get it
 
 These are the queries worth reaching for. The first four are now behind tools — read those first and come back here when you need a column the tool does not carry, or the same number twice to see it move.
