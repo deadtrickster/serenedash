@@ -45,11 +45,16 @@ not cost a keypress. It also expires on its own after two refreshes, because the
 On the activity view: `enter` opens a statement, then `e` plans it and `e` again puts the text
 back. Same keys in the browser.
 
+![the plan of a statement that had been running 46 hours](serenedash-explain.png)
+
+That is a real one - 68,209 characters of RAGFlow hybrid search, planned while it was still
+running.
+
 `EXPLAIN` has always been something you could type. What you could not do is aim it at the
 statement currently burning a core: its text is in `pg_stat_activity` rather than in front of
 you, and on this deployment it is 68 KB, so getting it into a psql session means fetching it and
 quoting it back. This is one keypress on the row. `EXPLAIN` does not execute, so it is safe to
-point at something hung — 6 ms against a statement that had been spinning for twenty minutes.
+point at something hung - 6 ms against a statement that had been spinning for twenty minutes.
 
 The plan is drawn unwrapped, because DuckDB's box alignment *is* the tree, and it says when a
 row was too wide to fit rather than folding it into confetti. Moving the cursor drops the plan:
@@ -62,7 +67,7 @@ the right heading.
 |---|---|
 | storage | database vs WAL size, and the **ratio** — a WAL several times the database means checkpointing has stalled, not that the WAL is big. Temp files older than the process are counted as `orphaned`, not as spill |
 | memory | `duckdb_memory()` by pool with a history trace each, plus RSS and **swap** — a store reporting 34 GB of buffers while 30 GB of it is paged out looks fine until you see that row |
-| activity | live query text from `pg_stat_activity`; **and** it says so when nothing is running, because a pinned core with no session is orphaned server-side work. `enter` opens a statement whole, `e` plans it — see below |
+| activity | live query text from `pg_stat_activity`; **and** it says so when nothing is running, because a pinned core with no session is orphaned server-side work. `enter` opens a statement whole, `e` plans it - see below |
 | threads | total process CPU against every core, then the threads carrying it. 100% of one core reads as 4% at process level and as a pinned thread here. Rows are identified by tid — 103 of serened's 107 threads inherit the process name |
 | profile | sampled symbols by engine over a sliding window of captures, joined per thread so a row says what it is running |
 | search | the inverted indexes: segments, live against deleted documents, buffered writes not yet searchable, and how long commits and consolidations are taking. A rising pending queue is maintenance falling behind the write rate |
