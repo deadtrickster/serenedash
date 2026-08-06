@@ -14,6 +14,7 @@ import sys
 import time
 
 from serenedash import serve
+from serenedash.tui import _withbar        # the real wrapper: summary rule above, key bar below
 from serenedash.views import DETAIL, key_to_view, logs_frame, mcp_frame, mcp_nav
 
 from ..test_views import render  # noqa: TID252  - the same frames the other tests assert on
@@ -40,20 +41,25 @@ CALLS = [{"t": 1785000000 + i * 60, "tool": t, "ms": ms, "ok": True, "pid": pid,
               '{"rows": [[1]]}', "1 rows")])]
 
 
+FINDINGS = [{"kind": "memory", "what": "process memory paged out", "detail": "70.9G in swap."},
+            {"kind": "storage", "what": "orphaned temp files", "detail": "24 files, 72.6G."}]
+
+
 def render_view(name, needle="", st=None):
+    """One frame, wrapped the way the server wraps it - `_withbar` is the code under test as much
+    as the page is, since the key hints and the summary rule both live there now."""
+    n = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False, **(st or {})}
     if name == "mcp":
-        n = {"scroll": 0, "sel": 0, "open": None, "call": -1, "popup": False, **(st or {})}
         lines = mcp_frame(CALLS, [], True, COLS, n["scroll"], n["sel"], 44,
                           n["open"], n["call"], n["popup"])
-        return serve.frame_payload(name, lines, cols=COLS, keys=KEYS,
-                                   sid=(st or {}).get("id", ""), nav=True)
-    if name == "logs":
+    elif name == "logs":
         rows = [r for r in LOGS if needle.lower() in r[3].lower()]
         lines = logs_frame(rows, "canned", None, needle, True, COLS, 0, 44, True)
     else:
         lines = render(COLS, 44)
-    return serve.frame_payload(name, lines, cols=COLS, keys=KEYS,
-                               sid=(st or {}).get("id", ""))
+    body, _off = _withbar(lines, COLS, FINDINGS, name, n)
+    return serve.frame_payload(name, body, cols=COLS, keys=KEYS,
+                               sid=(st or {}).get("id", ""), nav=name == "mcp")
 
 
 def web_nav(st, key):

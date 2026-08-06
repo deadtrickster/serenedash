@@ -44,7 +44,7 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>serenedash</title><style>
 :root{color-scheme:dark light}
-body{margin:0;padding:.8rem;background:#1a1d23;color:#e6eaf2;
+body{margin:0;padding:.5rem;background:#1a1d23;color:#e6eaf2;
  font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
 /* The old top line carried the panel name and a clock, both of which the frame itself prints,
    and a status that only matters when something is wrong. So it is a chip now: absent while the
@@ -61,13 +61,14 @@ body{margin:0;padding:.8rem;background:#1a1d23;color:#e6eaf2;
  width:14rem}
 #q:focus{outline:none;border-color:#f5d08a}
 #s.find #q{display:block}
-#f{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.6rem;overflow-x:auto;
- transition:opacity .12s}
+#f{background:#101318;border:1px solid #2b303b;border-radius:6px;padding:.4rem;
+ overflow-x:auto;transition:opacity .12s}
 #f.wait{opacity:.35}
 /* The SVG carries width/height so a standalone .svg opens at a sane size, but on the page the
    viewBox should do the work: scale to the container rather than sit at 1229px with the rest of a
    wide window empty beside it. Aspect ratio is preserved by the viewBox. */
-#f svg{display:block;width:100%;height:auto}
+#f svg{display:block;margin:0 auto;width:auto;height:auto;max-width:100%;
+ max-height:calc(100vh - 2.6rem)}
 /* The key bar at the foot of every frame IS the navigation. A second row of buttons above it said
    the same thing twice, and the selected one changed weight and reflowed the row under the pointer.
    These are invisible hit areas over the bar the renderer already drew, so the only affordance is

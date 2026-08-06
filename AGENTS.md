@@ -62,13 +62,71 @@ data tick.
   exactly equals the budget is *not* truncated, even though trailing escape bytes remain — treating
   it as truncated appends an ellipsis worth one real column, which is how one memory row ended up a
   cell right of every other.
-- **Fit the terminal both ways**, and never exceed it. The status bar is pinned to the last line.
+- **Fit the terminal both ways**, and never exceed it. The status bar is pinned to the last line
+  and the findings rule to the first. Both rows come off the height ONCE, where the terminal size is
+  read - a height that is right in six branches and wrong in the seventh is how an 80x24 terminal
+  came to be handed 27 lines.
+- **Chrome is pinned, content scrolls.** Anything that tells you what you can press belongs on a
+  fixed row, not at the foot of the content. A hint printed after the last row moves whenever the
+  content changes height - down a line when a session appears, up two when a filter narrows the log
+  - and a control that moves is a control you have to look for. `view_hint()` is the one producer
+  and the key bar carries it; if the hint depends on how deep you are in a view, that belongs in the
+  function, not in a second copy at the bottom of a frame.
+- **The same element sits on the same row on every screen.** Every detail view starts its content on
+  the row the main frame starts its first panel border on. The findings screen kept the blank row
+  its old header had sat on and was one line lower than everything else, which reads as the frame
+  having shifted rather than as a different panel.
+- **Do not say it twice.** The counts are on the pinned rule, so the findings screen has no header
+  of its own: a first line repeating the line directly above it is one fewer row of content and one
+  more thing to read twice.
 - **An overlay draws over the frame, never into it.** The tooltip is written after the frame and
   marks the rows it covered dirty so the next pass repaints them. Inserting it into the line list
   would push the panels down and move the thing being pointed at. Its own border arithmetic is the
   usual trap: a box row is `│` + a space + the text + padding + `│`, so the inner width has to be
   the longest line **plus one** — sized to the longest line itself, that row's padding went negative
   and it printed a column past its own border, over the frame beneath.
+
+## One producer per fact, and per key
+
+Every duplicated expression in this codebase has eventually disagreed with its copy, always in the
+direction that looks like a different bug:
+
+- The findings cursor was bounded by `hazards` while the frame drew `hazards + the setup checks`, so
+  it stopped at the fifth row with nine below it. The page bounded its own cursor a third way and
+  worked by accident, which made it look like a terminal bug rather than a shared one.
+- `d` worked in the terminal and did nothing on the page, because each front end built its own
+  `{key: view}` map and the page's was made from `DETAIL` alone. `key_to_view()` is the producer
+  now; a front end passes in the views the other does not have rather than assembling the map.
+- The guard deciding whether a served panel already had a key bar looked for the literal `q quit`,
+  which never appears in a **coloured** bar - the escapes sit between the words. It matched only
+  under `--no-color`, so the browser got two bars.
+
+So: when the terminal and the page both need to answer "what does j do here", "which key opens
+this", "what is on this list" - write it once and have both call it. When a check reads rendered
+text, `strip()` it first.
+
+## The page is the same dashboard
+
+`--serve` renders through the same frame functions, so the panels cannot disagree. Everything
+*around* them is separate code, and that is where the drift lives: the summary rule, the key bar,
+the key map, which view is showing, where the cursor is. Each of those has broken on the page while
+working in the terminal.
+
+- **A view is a path.** `/findings`, not `/?view=findings`. A panel is a page - it has a name, you
+  link to it, you go back to the one before. The query string is for parameters OF that page, which
+  is where the log filter lives: `/logs?q=index`.
+- **Navigating pushes history; refining replaces it.** `replaceState` on a view switch overwrote the
+  entry you came from, so Back left the dashboard rather than returning to the panel you were on. A
+  history entry per keystroke in a filter box is not history either.
+- **Position is per subscriber.** The view, the filter and the cursor all belong to the tab, not to
+  the server. As one shared variable, a reconnecting tab discarded every frame it was sent and sat
+  empty, and two tabs could not watch different panels.
+- **No backslashes in the served JS.** `PAGE` is an ordinary Python string, so every escape in it is
+  Python's first and JavaScript's second. `\r` for Enter and `\x1b` for Escape became real control
+  bytes inside the string literals they sat in and the page threw before drawing anything; a regex
+  with escaped slashes was caught by ruff on the way in. Send key names, use `split()`, keep the
+  file free of them - and the two tests that guard this (no control characters, `node --check`) are
+  cheaper than any of the afternoons they save.
 
 ## Degrade by panel, not by process
 

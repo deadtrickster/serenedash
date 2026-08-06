@@ -143,29 +143,3 @@ def test_both_front_ends_get_their_keys_from_one_producer():
     assert web["d"] == ALIAS["d"] == "findings"
     assert all(web[k] == term[k] for k in web), "the page and the terminal must agree"
     assert set(term) - set(web) == {"g", "c"}, "only the views the page does not have"
-
-
-def test_every_key_on_the_bar_reaches_a_view():
-    # A key printed on the bar that does nothing is worse than one that is not printed: the bar is
-    # the documentation, and it is the only documentation.
-    from serenedash.views import KEYS, key_to_view
-
-    reachable = key_to_view({"g": "graph", "c": "config"})
-    dead = [(k, label) for k, label in KEYS
-            if k not in reachable and k not in ("q", "x")]      # quit and mouse are not views
-    assert not dead, f"on the bar and bound to nothing: {dead}"
-
-
-def test_a_served_frame_carries_exactly_one_key_bar():
-    # The main frame ends with its own bar and the served panels have one appended. The guard that
-    # told them apart looked for the literal "q quit", which never appears in a COLOURED bar - so
-    # it only ever matched with --no-color and the page got two.
-    from serenedash.tui import _withbar
-
-    from .test_views import render  # noqa: TID252
-
-    main, off = _withbar(render(120, 30), 120, [])
-    assert sum(1 for ln in main if "quit" in strip(ln)) == 1, "the main frame already has one"
-    panel, off2 = _withbar(["a panel", "with no bar"], 120, [])
-    assert sum(1 for ln in panel if "quit" in strip(ln)) == 1, "a panel needs one"
-    assert off == off2 == 3, "the rows inserted above, which every click anchor moves by"

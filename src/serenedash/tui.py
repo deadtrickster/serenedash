@@ -48,6 +48,7 @@ from .views import (
     storage_frame,
     summary_line,
     threads_frame,
+    view_hint,
 )
 
 
@@ -217,22 +218,36 @@ def _web_nav(st, key, perf_dir, cfg=None):
     return {**st, **out} if out else {**st, "view": "main"}
 
 
-def _withbar(lines, width, found=()):
-    """A served panel between the two pinned rows: the summary above, the key bar below.
+def _withbar(lines, width, found=(), view="main", nav=None):
+    """A served panel between the two pinned rows: the summary rule above, the key bar below.
 
     The terminal draws both around every view; view_lines returns the panel alone because the
     exporter wants a panel. The page needs both - removing the row of buttons above the frame left
     the detail views with no visible way to switch, since the boxes are computed from the bar's own
-    text and there was no bar to compute them from - and it needs the summary for the same reason
-    the terminal does: what is wrong with the server is not a property of the panel you are on.
+    text - and it needs the summary for the same reason the terminal does: what is wrong with the
+    server is not a property of the panel you are on.
+
+    Every frame comes out the SAME height with the bar's first row in the SAME place. On the page
+    the frame is an SVG sized to its own content, so a short panel pulled the bar up and a long one
+    pushed it down; the terminal has never done that, because it pads to the window. Two things had
+    to hold at once: the frame height (or the page reflows on every switch) and the row `q quit`
+    lands on (or the one thing that must not move, moves). So the bar is padded BELOW to a constant
+    height - `q quit` is on its first row - and the body absorbs the rest.
 
     Returns (lines, offset). The offset is how many rows were inserted ABOVE the panel, because a
     click lands on a row the frame reported by index and every one of those indices just moved.
     """
-    top = ["", summary_line(found, C, width), ""]
-    if lines and any("q quit" in strip(ln) for ln in lines[-4:]):
-        return [*top, *lines], len(top)           # the main frame already carries the bar
-    return [*top, *lines, "", *status(C, width)], len(top)
+    top = [summary_line(found, C, width), ""]
+    plain = status(C, width)                       # what the main frame carries, so what to split
+    bar = status(C, width, view_hint(view, nav, C) if view != "main" else "")
+    # Reserved from the widest hint any view can produce at this width, not from this one's.
+    rows = max(len(status(C, width, view_hint(v, {}, C))) for v in ("main", *DETAIL))
+    if lines and any("q quit" in strip(ln) for ln in lines[-len(plain) - 1:]):
+        lines = lines[:-len(plain)]                # the main frame carries its own; take it off
+    bar = bar + [""] * max(0, rows - len(bar))
+    room = max(1, WEB_ROWS + 2 - len(bar))
+    body = lines[:room] + [""] * max(0, room - len(lines))
+    return [*top, *body, "", *bar], len(top)
 
 
 def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, col, w,
@@ -587,9 +602,13 @@ def main():
                         "host": lambda: host_frame(hinfo, s, col, w, scroll),
                         "search": lambda: search_frame(sea, col, w, scroll),
                         "legend": lambda: legend_frame(col, w, scroll)}[view]()
+                vnav = {"findings": {**fnav, "fixable": bool(
+                            allfound and sorted(allfound, key=lambda f: -f.get("severity", 1))
+                            [min(fnav["sel"], len(allfound) - 1)].get("action"))},
+                        "activity": anav, "mcp": mnav}.get(view)
                 keybar = status(cc, w, f"{cc['b']}{DETAIL[view]}{cc['r']} "
                                        f"{cc['dim']}back{cc['r']}  {cc['dim']}·{cc['r']}  "
-                                       f"{cc['b']}j/k{cc['r']} {cc['dim']}scroll{cc['r']}")
+                                       + view_hint(view, vnav, cc))
                 # Pinned to the last rows of the terminal, not left floating under whatever the
                 # view happened to be tall. The keys belong in the same place on every screen.
                 lines = body[:max(1, h - len(keybar))]
@@ -661,7 +680,7 @@ def main():
                                 True, _w,
                                 full=full_queries(cfg) if name == "activity" else None,
                                 needle=needle, nav=nav, hazards=_fnd,
-                                anchors=anchors), _w, _fnd)
+                                anchors=anchors), _w, _fnd, name, nav)
                             # Every anchor moved down by the rows inserted above it.
                             return _serve.frame_payload(
                                 name, body, cols=_w, keys=wkeys,

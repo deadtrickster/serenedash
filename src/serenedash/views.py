@@ -198,6 +198,39 @@ DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profi
 ALIAS = {"d": "findings"}
 
 
+def view_hint(view, nav=None, c=None):
+    """What this view answers to right now, for the key bar to carry.
+
+    Depth matters: `enter` opens a session on the mcp list and does nothing inside the call box, so
+    a hint that named it in both would be wrong in one of them. Written here rather than at the
+    foot of each frame because a hint that moves with the content is a hint you have to look for.
+    """
+    c = c or NOCOLOR
+    n = nav or {}
+
+    def keys(*pairs):
+        return f"  {c['dim']}·{c['r']}  ".join(f"{c['b']}{k}{c['r']} {c['dim']}{what}{c['r']}"
+                                               for k, what in pairs)
+
+    if view == "mcp":
+        if n.get("popup"):
+            return keys(("j/k", "scrolls the reply"), ("esc", "closes"))
+        if n.get("open") is not None:
+            return keys(("j/k", "moves"), ("enter", "shows the call"), ("esc", "back"))
+        return keys(("j/k", "moves"), ("enter", "opens the session"))
+    if view in ("findings", "activity"):
+        if n.get("open"):
+            return keys(("j/k", "scrolls"), ("esc", "back"))
+        opens = "reads the finding" if view == "findings" else "opens the statement"
+        out = [("j/k", "moves"), ("enter", opens)]
+        if view == "findings" and n.get("fixable"):
+            out.append(("r", "runs the fix"))
+        return keys(*out)
+    if view == "logs":
+        return keys(("space", "follow"), ("/", "filter"), ("j/k", "scrolls"))
+    return keys(("j/k", "scroll"))
+
+
 def key_to_view(extra=None):
     """{key: view} for every key that switches a view, aliases included.
 
@@ -502,7 +535,7 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
     if open_:
         return out[:1] + _statement(rows[sel], c, W, height, scroll)
 
-    room = max(1, height - len(out) - 3)
+    room = max(1, height - len(out) - 1)
     start = max(0, min(sel - room // 2, len(rows) - room))
     for i, (stt, q, n) in enumerate(rows[start:start + room], start=start):
         run = stt == "active"
@@ -523,8 +556,6 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
                    f"{'' if run else c['dim']}{clip(head, max(20, W - 60))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
-    out.append("")
-    out.append(f"  {c['dim']}j/k moves · enter opens the whole statement{c['r']}")
     return out
 
 
@@ -558,7 +589,6 @@ def _statement(row, c, W, height, scroll):
     out += [f"  {'' if run else c['dim']}{chunk}{c['r']}" for chunk in body[scroll:scroll + room]]
     if len(body) > scroll + room:
         out.append(f"  {c['dim']}… {len(body) - scroll - room} more lines - j/k scrolls{c['r']}")
-    out.append(f"  {c['dim']}esc goes back{c['r']}")
     return out
 
 
@@ -1573,7 +1603,7 @@ def _mcp_sessions(sess, rows, c, width, height, sel, scroll):
             "exits with the session, so this fills in as soon as one starts - and a server that "
             "connected without asking anything shows up here too.", max(40, W - 4))]
         return out[scroll:]
-    room = max(1, height - len(out) - 3)      # a possible "… above", then the blank and the hint
+    room = max(1, height - len(out) - 1)      # just a possible "… above"; the hint is on the bar
     sel = max(0, min(sel, len(sess) - 1))
     start = max(0, min(sel - room // 2, len(sess) - room))
     for i, s in enumerate(sess[start:start + room], start=start):
@@ -1594,8 +1624,6 @@ def _mcp_sessions(sess, rows, c, width, height, sel, scroll):
                    f"{c['dim']}{when:<9} {clip(tools, max(6, W - 82))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
-    out.append("")
-    out.append(f"  {c['dim']}j/k moves · enter opens the session{c['r']}")
     return out
 
 
@@ -1614,9 +1642,8 @@ def _mcp_calls(mine, who, c, width, height, call_sel, scroll):
     out = [title, ""]
     if not mine:
         out.append(f"  {c['dim']}this session has not asked anything yet{c['r']}")
-        out += ["", f"  {c['dim']}esc goes back{c['r']}"]
         return out
-    room = max(1, height - len(out) - 3)      # a possible "… earlier", then the blank and the hint
+    room = max(1, height - len(out) - 1)      # just a possible "… earlier"
     sel = len(mine) - 1 if call_sel < 0 else max(0, min(call_sel, len(mine) - 1))
     start = max(0, min(sel - room // 2, len(mine) - room))
     for i, r in enumerate(mine[start:start + room], start=start):
@@ -1643,8 +1670,6 @@ def _mcp_calls(mine, who, c, width, height, call_sel, scroll):
                    f"{okc}{clip(what, max(10, W - 42))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} earlier{c['r']}")
-    out.append("")
-    out.append(f"  {c['dim']}j/k moves · enter shows the whole call · esc goes back{c['r']}")
     return out
 
 
@@ -1682,7 +1707,6 @@ def _mcp_call(r, who, c, width, height, scroll):
         pad = max(0, inner - len(strip(x)) - 1)
         out.append(f"{c['dim']}│{c['r']} {x}{' ' * pad}{c['dim']}│{c['r']}")
     out.append(f"{c['dim']}└{'─' * inner}┘{c['r']}")
-    out.append(f"  {c['dim']}esc closes{c['r']}")
     return out
 
 
@@ -1820,7 +1844,11 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     # No header. The counts are on the rule pinned above every view, including this one, and a
     # screen whose first line repeats the line directly above it is a screen with one fewer row of
     # content and one more thing to read twice.
-    out = [""]
+    #
+    # And no leading blank where the header used to be: every view starts on the same row, which is
+    # the row the storage border starts on. One view sitting a line lower than the rest reads as
+    # the frame having shifted rather than as a different panel.
+    out = []
     if not found:
         out += [f"  {c['dim']}{ln}{c['r']}" for ln in textwrap.wrap(
             "Nothing tripped is a result, not an absence of one: every comparison ran and none of "
@@ -1833,7 +1861,7 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
     if open_:
         return out[:1] + _finding_detail(found[sel], c, W, height, scroll)
 
-    room = max(1, height - len(out) - 3)
+    room = max(1, height - len(out) - 1)
     start = max(0, min(sel - room // 2, len(found) - room))
     for i, f in enumerate(found[start:start + room], start=start):
         mark = f"{c['b']}›{c['r']}" if i == sel else " "
@@ -1854,11 +1882,6 @@ def findings_frame(found, col, width, scroll, sel=0, height=40, open_=False,
                    f"{c['dim']}{clip(why, max(10, W - 50))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
-    out.append("")
-    hint = "j/k moves · enter reads the whole finding"
-    if found[sel].get("action"):
-        hint += f" · {c['yel']}r{c['dim']} runs the fix"
-    out.append(f"  {c['dim']}{hint}{c['r']}")
     return out
 
 
@@ -1891,8 +1914,6 @@ def _finding_detail(f, c, W, height, scroll):
             out.append(f"  {c['yel']}{label}{c['r']}")
             out += [f"  {c['dim']}{ln}{c['r']}"
                     for ln in textwrap.wrap(str(f[key]), max(40, W - 6))]
-    out.append("")
-    out.append(f"  {c['dim']}esc goes back{c['r']}")
     room = max(3, height - 2)
     if len(out) > room:
         scroll = max(0, min(scroll, len(out) - room))

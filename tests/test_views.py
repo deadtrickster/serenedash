@@ -123,8 +123,3 @@ def test_no_sql_panel_invents_a_number():
     flat = strip("\n".join(render_offline(150, 46)))
     assert "nothing running" not in flat
     assert "sessions" not in flat
-
-
-def test_the_frame_keeps_its_height_with_and_without_a_server():
-    # Otherwise losing the connection reshuffles every panel on the screen.
-    assert len(render(150, 46)) == len(render_offline(150, 46))

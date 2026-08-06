@@ -107,17 +107,25 @@ def rows(n=3):
 def test_the_view_opens_at_the_session_list():
     # Level 1. Which agents are talking to this deployment is the question you have before you have
     # any other question, and it is the only one that fits on a screen.
+    # The hint moved to the key bar - a line at the foot of the panel moved whenever the content
+    # changed height, and a control that moves is a control you have to look for.
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import view_hint
+
     out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30)]
     assert any("session" in ln for ln in out)
-    assert any("enter opens the session" in ln for ln in out)
+    assert "enter opens the session" in strip(view_hint("mcp", {}, NOCOLOR))
 
 
 def test_a_session_expands_to_its_own_calls():
     # Level 2. Grouped by pid, because four `claude` sessions look identical from /proc and are
     # four different conversations.
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import view_hint
+
     out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30, open_pid=7)]
     assert any("pid 7" in ln for ln in out)
-    assert any("enter shows the whole call" in ln for ln in out)
+    assert "enter shows the call" in strip(view_hint("mcp", {"open": 7}, NOCOLOR))
     assert sum(1 for ln in out if "status" in ln or "search" in ln or "query" in ln) >= 3
 
 
@@ -126,9 +134,12 @@ def test_a_call_opens_in_full_with_its_reply():
     # gets a frame rather than a corner of one.
     out = [strip(x) for x in mcp_frame(rows(), [], False, 120, 0, 0, 30, open_pid=7, call_sel=2,
                                        popup=True)]
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import view_hint
+
     assert out[0].startswith("┌─ query"), out[0]
     assert any('"rows"' in ln for ln in out)
-    assert any("esc closes" in ln for ln in out)
+    assert "esc closes" in strip(view_hint("mcp", {"open": 7, "popup": True}, NOCOLOR))
 
 
 def test_a_truncated_reply_is_still_readable():
@@ -580,8 +591,12 @@ def test_a_finding_that_can_be_fixed_from_here_says_so():
 
     got = setup_findings([("warn", "symbols", "no build-ids registered", "extract the binary")],
                          ("extract", "/tmp/serened"))
+    from serenedash.fmt import NOCOLOR
+    from serenedash.views import view_hint
+
     assert got[0]["action"] == ("extract", "/tmp/serened")
-    out = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20)]
-    assert any("r" in ln and "runs the fix" in ln for ln in out)
+    # On the bar, and only when the row under the cursor is one that can be fixed.
+    assert "runs the fix" in strip(view_hint("findings", {"fixable": True}, NOCOLOR))
+    assert "runs the fix" not in strip(view_hint("findings", {}, NOCOLOR))
     opened = [strip(x) for x in findings_frame(got, False, 140, 0, 0, 20, True)]
     assert any("press r" in ln for ln in opened)

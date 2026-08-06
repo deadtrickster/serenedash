@@ -214,11 +214,11 @@ def test_enter_descends_and_escape_climbs_back_in_the_browser(dash, page):
     page.goto(dash.url + "/mcp")
     wait_for_frame(page, "sessions")
     page.keyboard.press("Enter")
-    wait_for_frame(page, "enter shows the whole call")     # level 2, that session's calls
+    wait_for_frame(page, "enter shows the call")     # level 2, that session's calls
     page.keyboard.press("Enter")
-    wait_for_frame(page, "esc closes")                     # level 3, the call in full
+    wait_for_frame(page, "scrolls the reply")                     # level 3, the call in full
     page.keyboard.press("Escape")
-    wait_for_frame(page, "enter shows the whole call", without="esc closes")
+    wait_for_frame(page, "enter shows the call", without="scrolls the reply")
     page.keyboard.press("Escape")
     wait_for_frame(page, "enter opens the session")        # back at level 1
     assert page.url.endswith("/mcp"), "escape must unwind the levels before leaving the view"
@@ -242,7 +242,7 @@ def test_two_tabs_scroll_independently(dash, page, context):
     other.wait_for_selector("#f svg")
     before = frame(other)
     page.keyboard.press("Enter")
-    wait_for_frame(page, "enter shows the whole call")
+    wait_for_frame(page, "enter shows the call")
     other.wait_for_timeout(800)                            # a few ticks with both connected
     assert frame(other) == before, "one tab's keypress moved another tab"
     other.close()
@@ -321,3 +321,33 @@ def test_a_deep_link_with_a_filter_opens_filtered(dash, page):
     page.goto(dash.url + "/logs?q=index+build")
     wait_for_frame(page, "index build failed", without="checkpoint")
     assert page.input_value("#q") == "index build"
+
+
+def test_the_key_bar_does_not_move_between_views(dash, page):
+    # "things shouldn't jump". On the page the frame is an SVG sized to its own content, so a short
+    # panel pulled the bar up and a long one pushed it down - the terminal never did that, because
+    # it pads to the window.
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    rows = []
+    for view in ("main", "logs", "mcp", "storage"):
+        page.goto(dash.url + "/" + view)
+        page.wait_for_selector("#f svg")
+        page.wait_for_timeout(400)
+        rows.append(page.evaluate(
+            "() => { const t = [...document.querySelectorAll('#f svg text')]"
+            ".filter(e => e.textContent.includes('quit'))[0];"
+            "  return t ? Math.round(+t.getAttribute('y')) : -1; }"))
+    assert len(set(rows)) == 1, f"the key bar sat at {rows} across four views"
+    assert rows[0] > 0, "the bar was not found on the frame at all"
+
+
+def test_the_frame_is_the_same_height_on_every_view(dash, page):
+    heights = []
+    for view in ("main", "logs", "mcp", "findings"):
+        page.goto(dash.url + "/" + view)
+        page.wait_for_selector("#f svg")
+        page.wait_for_timeout(400)
+        heights.append(page.evaluate(
+            "() => document.querySelector('#f svg').getAttribute('viewBox')").split()[3])
+    assert len(set(heights)) == 1, f"the frame resized between views: {heights}"
