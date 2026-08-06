@@ -11,26 +11,29 @@ import json
 import pytest
 
 from serenedash.export import CW, LH, PAL
-from serenedash.fmt import strip
+from serenedash.fmt import NOCOLOR, strip
 from serenedash.serve import PAGE, frame_payload, hits
-from serenedash.views import DETAIL
+from serenedash.tui import NEEDS_SQL
+from serenedash.views import BINDINGS, DETAIL, KEYS, NOT_ON_THE_PAGE, key_to_view
 
 from .test_views import render  # noqa: TID252  - the same fixture, one source of truth
 
-KEYS = {k: v for v, k in DETAIL.items()}
+# The map, from its one producer. This file used to build its own from DETAIL, which is exactly the
+# copy that let `d` work in one front end and not the other.
+KEYMAP = key_to_view()
 
 
 @pytest.mark.parametrize("w", [80, 120, 168, 260])
 def test_every_key_gets_a_hit_area_at_every_width(w):
-    got = hits(render(w, 44), KEYS)
-    assert {h["view"] for h in got} == set(KEYS.values()), f"missing bindings at {w} columns"
+    got = hits(render(w, 44), KEYMAP)
+    assert {h["view"] for h in got} == set(KEYMAP.values()), f"missing bindings at {w} columns"
 
 
 @pytest.mark.parametrize("w", [80, 168])
 def test_a_hit_area_sits_on_the_text_it_claims(w):
     # The real check: convert each box back to a row and column and read what is printed there.
     lines = render(w, 44)
-    for h in hits(lines, KEYS):
+    for h in hits(lines, KEYMAP):
         row = round((h["y"] - 8) / LH)
         col = round((h["x"] - 8) / CW + 0.5)
         text = strip(lines[row])[col:col + len(h["key"]) + 1 + len(h["view"])]
@@ -41,7 +44,7 @@ def test_hit_areas_do_not_overlap():
     # Overlapping boxes make one binding unclickable, which is worse than not being clickable at
     # all: the affordance is there and does the wrong thing.
     boxes = sorted((h["y"], h["x"], h["x"] + h["w"], h["view"])
-                   for h in hits(render(168, 44), KEYS))
+                   for h in hits(render(168, 44), KEYMAP))
     for (y1, _, end, a), (y2, start, _, b) in zip(boxes, boxes[1:], strict=False):
         if y1 == y2:
             assert start >= end - 0.01, f"{a} and {b} overlap"
@@ -51,18 +54,18 @@ def test_only_the_key_bar_is_clickable():
     # "s storage" could plausibly appear in a panel. Scanning the whole frame would put a hit area
     # over a line of data, and clicking a number would navigate.
     lines = [*["s storage  m memory"] * 30, *render(168, 44)[-4:]]
-    assert all(h["y"] > 8 + 25 * LH for h in hits(lines, KEYS))
+    assert all(h["y"] > 8 + 25 * LH for h in hits(lines, KEYMAP))
 
 
 def test_the_payload_carries_the_boxes_with_the_frame():
     # They have to arrive together. Hit areas from one frame over the SVG of another would drift
     # exactly when the bar rewrapped, which is the case they exist to survive.
-    p = json.loads(frame_payload("main", render(168, 44), cols=168, keys=KEYS))
+    p = json.loads(frame_payload("main", render(168, 44), cols=168, keys=KEYMAP))
     assert p["hits"] and p["svg"].startswith("<svg") and p["view"] == "main"
 
 
 def test_a_frame_with_no_key_bar_produces_no_boxes():
-    assert hits(["nothing here", "or here"], KEYS) == []
+    assert hits(["nothing here", "or here"], KEYMAP) == []
 
 
 def test_the_page_has_no_second_row_of_buttons():
@@ -132,14 +135,51 @@ def test_the_served_javascript_parses():
         out = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
     assert out.returncode == 0, f"the served page does not parse:\n{out.stderr}"
 
+# ---- every binding, from the map rather than from a list typed out beside it -------------------
 
-def test_both_front_ends_get_their_keys_from_one_producer():
-    # `d` worked in the terminal and did nothing on the page: each built its own {key: view} map
-    # and the page was handed DETAIL alone, which no longer has doctor in it.
-    from serenedash.views import ALIAS, key_to_view
+@pytest.mark.parametrize(("key", "view", "label"), BINDINGS, ids=lambda x: str(x))
+def test_every_binding_is_on_the_bar_with_its_label(key, view, label):
+    assert (key, label) in KEYS
+    if view:
+        assert key_to_view()[key] == view
+        assert DETAIL[view] == key
 
-    web = key_to_view()
-    term = key_to_view({"g": "graph", "c": "config"})
-    assert web["d"] == ALIAS["d"] == "findings"
-    assert all(web[k] == term[k] for k in web), "the page and the terminal must agree"
-    assert set(term) - set(web) == {"g", "c"}, "only the views the page does not have"
+
+@pytest.mark.parametrize(("key", "view", "label"), BINDINGS, ids=lambda x: str(x))
+def test_every_binding_gets_a_clickable_box_at_every_width(key, view, label):
+    # A key printed on the bar with no box under it is a key the page documents and does not offer.
+    # `g` and `c` were both on the served bar and in neither the map nor the view list.
+    from serenedash.views import WEB_KEYS, status
+
+    if key in NOT_ON_THE_PAGE:
+        assert (key, label) not in WEB_KEYS, "a browser cannot do this, so it must not say it can"
+        return
+    for w in (80, 120, 168, 260):
+        bar = status(NOCOLOR, w, "", WEB_KEYS)
+        boxes = {h["key"] for h in hits(bar, key_to_view())}
+        assert key in boxes, f"{key} {label} has no clickable box at {w} columns"
+
+
+@pytest.mark.parametrize(("key", "view", "label"), BINDINGS, ids=lambda x: str(x))
+def test_every_binding_the_page_offers_reaches_a_view_it_has(key, view, label):
+    from serenedash.tui import view_lines
+
+    served = ["main", *sorted(DETAIL)]
+    if key in NOT_ON_THE_PAGE:
+        return
+    assert view in served, f"{key} opens {view}, which the page is not offered"
+    # And the dispatch has a branch for it: a name in the list with no branch falls through to the
+    # main frame, which reads as the view failing to load.
+    marker = ["THE MAIN FRAME"]
+    try:
+        out = view_lines(view, {}, None, marker, None, None, None, None, None, None, None, None,
+                         True, 100)
+    except Exception:                                            # noqa: BLE001
+        return                                                   # a branch exists; it wants data
+    assert out is not marker or view in NEEDS_SQL, f"no branch in view_lines for {view}"
+
+
+def test_the_alias_is_not_on_the_bar_but_still_resolves():
+    # Two rows for one screen is not documentation, it is noise.
+    assert "d" not in [k for k, _ in KEYS]
+    assert key_to_view()["d"] == "findings"

@@ -28,6 +28,7 @@ from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
 from .views import (
     DETAIL,
+    WEB_KEYS,
     activity_frame,
     config_frame,
     frame,
@@ -239,9 +240,10 @@ def _withbar(lines, width, found=(), view="main", nav=None):
     """
     top = [summary_line(found, C, width), ""]
     plain = status(C, width)                       # what the main frame carries, so what to split
-    bar = status(C, width, view_hint(view, nav, C) if view != "main" else "")
+    bar = status(C, width, view_hint(view, nav, C) if view != "main" else "", WEB_KEYS)
     # Reserved from the widest hint any view can produce at this width, not from this one's.
-    rows = max(len(status(C, width, view_hint(v, {}, C))) for v in ("main", *DETAIL))
+    rows = max(len(status(C, width, view_hint(v, {}, C), WEB_KEYS))
+               for v in ("main", *DETAIL))
     if lines and any("q quit" in strip(ln) for ln in lines[-len(plain) - 1:]):
         lines = lines[:-len(plain)]                # the main frame carries its own; take it off
     bar = bar + [""] * max(0, rows - len(bar))
@@ -282,6 +284,16 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
                               col, w, 0, 0, WEB_ROWS)
     if name == "legend":
         return legend_frame(col, w, 0)
+    if name == "graph":
+        nm, ls = callstacks(perf_dir or cfg.get("perf_dir", ""))
+        return [f"call graph  {nm or 'no captures'}", "", *ls[:WEB_ROWS]]
+    if name == "config":
+        rows_ = query(cfg, ["select name, value, coalesce(description,''), input_type, scope "
+                            "from duckdb_settings()"])
+        n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+        lines_, _scroll, _sel = config_frame(rows_[0] if rows_ else [], s, col, w, n["scroll"],
+                                             n["sel"], None)
+        return lines_
     if name == "findings":
         n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
         return findings_frame(hazards, col, w, n["scroll"], n["sel"], WEB_ROWS, n["open"],

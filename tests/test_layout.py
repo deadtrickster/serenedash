@@ -20,6 +20,8 @@ from serenedash.fmt import NOCOLOR, strip
 from serenedash.tui import WEB_ROWS, _withbar
 from serenedash.views import (
     DETAIL,
+    KEYS,
+    WEB_KEYS,
     activity_frame,
     findings_frame,
     frame,
@@ -36,6 +38,16 @@ from serenedash.views import (
 from .test_views import sample_state
 
 SIZES = [(80, 24), (100, 30), (120, 40), (168, 44), (200, 60), (300, 80)]
+
+# How to find the key bar in a frame, from the map rather than by guessing a word: the first
+# binding's `key label` pair appears on the bar and nowhere else. The terminal's bar and the page's
+# start with different ones, because a browser cannot quit.
+TERM_MARK = f"{KEYS[0][0]} {KEYS[0][1]}"
+WEB_MARK = f"{WEB_KEYS[0][0]} {WEB_KEYS[0][1]}"
+
+
+def bar_row(lines, mark):
+    return next(i for i, ln in enumerate(lines) if mark in strip(ln))
 
 HOST = {"cores": 24, "load": ["1", "2", "3"], "threads": 100, "rss": 2**33, "swap": 0,
         "peak": 2**34, "uptime": 3600, "ram_total": 128 * 2**30, "pid": 1, "container": "c"}
@@ -89,8 +101,7 @@ def test_a_busy_server_draws_the_same_shape_as_an_idle_one(w, h):
     # when a query starts is one you have to re-read from the top on every refresh.
     idle, busy = main_frame(w, h, sessions=1, tags=1), main_frame(w, h, sessions=40, tags=16)
     assert len(idle) == len(busy) == h
-    bar = [i for i, ln in enumerate(idle) if "quit" in strip(ln)]
-    assert bar and bar == [i for i, ln in enumerate(busy) if "quit" in strip(ln)]
+    assert bar_row(idle, TERM_MARK) == bar_row(busy, TERM_MARK)
 
 
 @pytest.mark.parametrize("w", [80, 120, 168, 300])
@@ -183,7 +194,7 @@ def test_a_served_frame_is_the_same_size_and_shape_on_every_view(w):
     for view in ("main", *DETAIL):
         lines = main_frame(w, 44) if view == "main" else ["one short panel"]
         out, _off = _withbar(lines, w, [], view, {})
-        shapes[view] = (len(out), next(i for i, ln in enumerate(out) if "quit" in strip(ln)))
+        shapes[view] = (len(out), bar_row(out, WEB_MARK))
     assert len(set(shapes.values())) == 1, f"the frame moved between views at {w}: {shapes}"
 
 
@@ -200,8 +211,10 @@ def test_a_served_frame_carries_exactly_one_key_bar():
     # --no-color and the browser got a second bar under the first.
     main, off = _withbar(main_frame(120, 44), 120, [], "main", {})
     panel, off2 = _withbar(["a panel", "with no bar"], 120, [], "storage", {})
-    assert sum(1 for ln in main if "quit" in strip(ln)) == 1
-    assert sum(1 for ln in panel if "quit" in strip(ln)) == 1
+    assert sum(1 for ln in main if WEB_MARK in strip(ln)) == 1
+    assert sum(1 for ln in panel if WEB_MARK in strip(ln)) == 1
+    # And the terminal's own bar is gone from the served main frame - it was replaced, not stacked.
+    assert sum(1 for ln in main if TERM_MARK in strip(ln)) == 0
     # The rule and the blank under it: the rows inserted above the panel, which every click anchor
     # moves down by.
     assert off == off2 == 2
@@ -209,7 +222,7 @@ def test_a_served_frame_carries_exactly_one_key_bar():
 
 def test_the_served_body_is_the_rows_it_says_it_is():
     out, off = _withbar(["x"] * 5, 168, [], "storage", {})
-    bar = next(i for i, ln in enumerate(out) if "quit" in strip(ln))
+    bar = bar_row(out, WEB_MARK)
     assert bar - off <= WEB_ROWS + 2, "the body must not exceed the rows reserved for it"
     assert out[-1] == "" or strip(out[-1]).strip(), "no ragged tail past the bar"
 
@@ -217,7 +230,7 @@ def test_the_served_body_is_the_rows_it_says_it_is():
 def test_the_bar_reserves_room_for_the_longest_hint_any_view_can_produce():
     # Reserved from the widest hint at this width, not from this view's - otherwise the reservation
     # itself changes with the view, which is the thing it exists to stop.
-    widest = max(len(status(NOCOLOR, 168, view_hint(v, {}, NOCOLOR))) for v in ("main", *DETAIL))
+    widest = max(len(status(NOCOLOR, 168, view_hint(v, {}, NOCOLOR), WEB_KEYS))
+                 for v in ("main", *DETAIL))
     out, _ = _withbar(["x"], 168, [], "main", {})
-    bar_at = next(i for i, ln in enumerate(out) if "quit" in strip(ln))
-    assert len(out) - bar_at >= widest
+    assert len(out) - bar_row(out, WEB_MARK) >= widest

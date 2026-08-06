@@ -10,6 +10,8 @@ import re
 
 import pytest
 
+from serenedash.views import BINDINGS, NOT_ON_THE_PAGE
+
 pytestmark = pytest.mark.browser
 
 
@@ -41,7 +43,7 @@ def test_the_page_draws_a_frame(dash, page):
     page.goto(dash.url)
     wait_for_frame(page)
     assert page.locator("#f svg rect").count() > 0
-    assert "q quit" in frame(page)
+    assert "f findings" in frame(page), "the key bar is the navigation and has to be on the frame"
 
 
 def test_there_is_no_second_row_of_buttons(dash, page):
@@ -87,7 +89,7 @@ def test_escape_goes_back_to_main(dash, page):
     page.goto(dash.url + "/logs")
     wait_for_frame(page, "checkpoint")
     page.keyboard.press("Escape")
-    wait_for_frame(page, "q quit")
+    wait_for_frame(page, "f findings")
     assert page.url.rstrip("/").endswith("/main")
 
 
@@ -228,7 +230,7 @@ def test_escape_with_nothing_open_still_leaves_the_view(dash, page):
     page.goto(dash.url + "/mcp")
     wait_for_frame(page, "enter opens the session")
     page.keyboard.press("Escape")
-    wait_for_frame(page, "q quit")
+    wait_for_frame(page, "f findings")
     page.wait_for_url(re.compile(r"/main$"), timeout=8000)
 
 
@@ -334,12 +336,14 @@ def test_the_key_bar_does_not_move_between_views(dash, page):
         page.goto(dash.url + "/" + view)
         page.wait_for_selector("#f svg")
         page.wait_for_timeout(400)
+        # The bottom-most text on the frame IS the bar - it is the last thing drawn on every view -
+        # so this needs no marker word and cannot be fooled by a label that also appears in the
+        # content of one panel.
         rows.append(page.evaluate(
-            "() => { const t = [...document.querySelectorAll('#f svg text')]"
-            ".filter(e => e.textContent.includes('quit'))[0];"
-            "  return t ? Math.round(+t.getAttribute('y')) : -1; }"))
+            "() => Math.round(Math.max(...[...document.querySelectorAll('#f svg text')]"
+            ".map(e => +e.getAttribute('y'))))"))
     assert len(set(rows)) == 1, f"the key bar sat at {rows} across four views"
-    assert rows[0] > 0, "the bar was not found on the frame at all"
+    assert rows[0] > 0, "no text on the frame at all"
 
 
 def test_the_frame_is_the_same_height_on_every_view(dash, page):
@@ -351,3 +355,80 @@ def test_the_frame_is_the_same_height_on_every_view(dash, page):
         heights.append(page.evaluate(
             "() => document.querySelector('#f svg').getAttribute('viewBox')").split()[3])
     assert len(set(heights)) == 1, f"the frame resized between views: {heights}"
+
+
+def test_the_key_bar_is_clickable_after_the_frame_is_scaled_to_fit(dash, page):
+    # The frame is capped at the viewport height now, so on a short window the whole SVG is scaled
+    # down. A hit area is a rect inside that SVG, and a click has to land through the scale.
+    page.set_viewport_size({"width": 1400, "height": 500})
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    box = page.locator("#f svg rect.hit").filter(has=page.locator("title", has_text="key: o"))
+    assert box.count() == 1, "the key bar has no clickable box at all"
+    box.click()
+    page.wait_for_url(re.compile(r"/logs$"), timeout=8000)
+
+
+def test_the_key_bar_is_clickable_on_a_detail_view_too(dash, page):
+    # Detail views get their bar appended rather than built in, and the boxes are computed from the
+    # bar's own text - so "is there a bar" and "is it clickable" are two different questions.
+    page.goto(dash.url + "/storage")
+    wait_for_frame(page)
+    page.locator("#f svg rect.hit").filter(has=page.locator("title", has_text="key: m")).click()
+    page.wait_for_url(re.compile(r"/memory$"), timeout=8000)
+
+
+def test_the_page_does_not_scroll(dash, page):
+    # A dashboard you have to scroll is two dashboards. The frame is a fixed 50 rows now, which at
+    # width:100% was taller than the window.
+    for h in (500, 800, 1200):
+        page.set_viewport_size({"width": 1400, "height": h})
+        page.goto(dash.url + "/main")
+        wait_for_frame(page)
+        page.wait_for_timeout(200)
+        assert page.evaluate(
+            "() => document.documentElement.scrollHeight <= window.innerHeight + 2"), f"at {h}px"
+
+
+# ---- every key on the bar, from the map rather than from a list typed out here ------------------
+# `g` and `c` were printed on the served bar and were in neither the map nor the list of views the
+# page had been given, so one was unclickable and the other did nothing.
+
+@pytest.mark.parametrize(("key", "view"), sorted(
+    (k, v) for k, v, _l in BINDINGS if v and k not in NOT_ON_THE_PAGE))
+def test_every_key_on_the_bar_opens_its_view(dash, page, key, view):
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    page.keyboard.press(key)
+    page.wait_for_url(re.compile(rf"/{view}$"), timeout=8000)
+
+
+@pytest.mark.parametrize(("key", "view"), sorted(
+    (k, v) for k, v, _l in BINDINGS if v and k not in NOT_ON_THE_PAGE))
+def test_every_key_on_the_bar_is_clickable(dash, page, key, view):
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    box = page.locator("#f svg rect.hit").filter(
+        has=page.locator("title", has_text=f"key: {key}"))
+    assert box.count() == 1, f"{key} is printed on the bar with no box under it"
+    box.click()
+    page.wait_for_url(re.compile(rf"/{view}$"), timeout=8000)
+
+
+def test_the_bar_does_not_offer_what_a_browser_cannot_do(dash, page):
+    # `q quit` and `x mouse` were on the served bar. A browser cannot quit and has no terminal
+    # mouse tracking to toggle, and documentation that lists a key which does nothing is worse than
+    # a shorter bar.
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    for key in NOT_ON_THE_PAGE:
+        assert page.locator("#f svg rect.hit").filter(
+            has=page.locator("title", has_text=f"key: {key}")).count() == 0
+    assert not any(lbl in frame(page) for lbl in ("q quit", "x mouse"))
+
+
+def test_the_alias_still_opens_the_screen_it_used_to(dash, page):
+    page.goto(dash.url + "/main")
+    wait_for_frame(page)
+    page.keyboard.press("d")
+    page.wait_for_url(re.compile(r"/findings$"), timeout=8000)

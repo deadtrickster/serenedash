@@ -189,13 +189,48 @@ LEGEND = (
 # legend. Every view is a toggle: the same key returns to the main frame, as does Esc.
 # `search` takes i, for index: s was storage before there was a search engine on screen at all, and
 # moving it would retrain the one key that is used most.
-DETAIL = {"storage": "s", "memory": "m", "activity": "a", "threads": "t", "profile": "p",
-          "logs": "o", "mcp": "n", "findings": "f",   # `d` is an alias; see ALIAS
-          "host": "h", "legend": "l", "search": "i"}
+# The one map. Everything that needs "which key opens what" reads it: the key bar below, the
+# terminal's dispatch, the page's key handler, the clickable boxes over the bar, and the tests.
+# In bar order, because the bar is generated from it.
+#
+# A `view` of None is an action rather than a panel - the terminal quits and toggles its own mouse
+# tracking, and a browser can do neither, which is why the served bar is filtered rather than
+# copied. It advertised both for a while, along with `g` and `c`, which the page had never been
+# given at all.
+BINDINGS = (
+    ("q", None, "quit"),
+    ("f", "findings", "findings"),
+    ("s", "storage", "storage"),
+    ("m", "memory", "memory"),
+    ("a", "activity", "activity"),
+    ("t", "threads", "threads"),
+    ("p", "profile", "profile"),
+    ("i", "search", "search"),
+    ("o", "logs", "logs"),
+    ("n", "mcp", "mcp"),
+    ("g", "graph", "graph"),
+    ("c", "config", "config"),
+    ("h", "host", "host"),
+    ("l", "legend", "legend"),
+    ("x", None, "mouse"),
+)
 
 # Keys that reach a view under another name. `d` was doctor for as long as there was a doctor view;
-# it is the same screen now and the fingers do not know that.
+# it is the same screen now and the fingers do not know that. Off the bar on purpose: two rows for
+# one screen is not documentation, it is noise.
 ALIAS = {"d": "findings"}
+
+# What a browser cannot do. Quitting closes nothing and there is no terminal mouse tracking to
+# turn off, so the served bar does not offer them - the bar is the documentation, and documentation
+# that lists a key which does nothing is worse than a shorter bar.
+NOT_ON_THE_PAGE = ("q", "x")
+
+# view -> key, for the "press this to go back" hint and for the served view list.
+DETAIL = {view: key for key, view, _label in BINDINGS if view}
+
+KEYS = tuple((key, label) for key, _view, label in BINDINGS)
+WEB_KEYS = tuple((key, label) for key, _view, label in BINDINGS
+                 if key not in NOT_ON_THE_PAGE)
 
 
 def view_hint(view, nav=None, c=None):
@@ -235,25 +270,12 @@ def key_to_view(extra=None):
     """{key: view} for every key that switches a view, aliases included.
 
     One producer, because the terminal and the page each built this themselves and drifted: the
-    page was handed DETAIL alone, so `d` did nothing there while it worked in the terminal.
-    `extra` is for the views a front end has that the other does not - the terminal's `graph` and
-    `config` are not served.
+    page was handed a map made from DETAIL alone, so `d` did nothing there while it worked in the
+    terminal, and the bar advertised `g` and `c` which were in neither.
     """
-    return {**{v: n for n, v in DETAIL.items()}, **ALIAS, **(extra or {})}
+    return {**{key: view for key, view, _l in BINDINGS if view}, **ALIAS, **(extra or {})}
 
 
-# No j/k here: nothing on the main frame scrolls, so it is carried by the views that do scroll and
-# the bar gets its width back. Eleven labelled keys need ~100 columns and wrapped onto a second line
-# on a 96-column terminal.
-KEYS = (("q", "quit"), ("f", "findings"), ("s", "storage"), ("m", "memory"),
-        ("a", "activity"), ("t", "threads"), ("p", "profile"), ("i", "search"), ("o", "logs"),
-        ("n", "mcp"), ("g", "graph"), ("c", "config"), ("h", "host"),
-        ("l", "legend"), ("x", "mouse"))
-
-
-
-# What each kind is called on screen, and its colour. Kept beside each other so a kind cannot get a
-# name in one place and a colour in another.
 # `setup` is what `doctor` used to be a whole view of: the dashboard's own preconditions. It is a
 # kind rather than a screen because the distinction between "the tool cannot measure this" and "the
 # server has a problem" is the tool's, not the reader's - both are a check that came out badly.
@@ -289,7 +311,7 @@ def msec(v):
     return f"{v:,.0f}ms" if v < 1000 else f"{v / 1000:.1f}s"
 
 
-def status(c, width, extra=""):
+def status(c, width, extra="", keys=KEYS):
     """The key bar, as however many lines it needs. The bindings used to hide in the config panel.
 
     Wrapped rather than clipped: with a view behind every panel there are ten of them, which do not
@@ -297,7 +319,7 @@ def status(c, width, extra=""):
     Returns a list so the caller can count the rows it costs — clipping silently cost the last few
     keys, and the single line was also one column too wide for its own frame.
     """
-    items = ([f"{c['b']}{k}{c['r']} {c['dim']}{v}{c['r']}" for k, v in KEYS]
+    items = ([f"{c['b']}{k}{c['r']} {c['dim']}{v}{c['r']}" for k, v in keys]
              + ([extra] if extra else []))
     W = max(20, width)
     rows, cur, used = [], [], 0

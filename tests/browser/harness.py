@@ -21,7 +21,7 @@ from ..test_views import render  # noqa: TID252  - the same frames the other tes
 
 COLS = 168
 VIEWS = ["main", *sorted(DETAIL)]
-KEYS = key_to_view()      # aliases included, as the real server sends them
+KEYS = key_to_view()                      # the map, exactly as the real server sends it
 
 # Enough lines that a filter has something to remove, and distinctive enough to assert on.
 LOGS = ([(f"08-03 10:00:{i:02d}", "Storage", "INFO", f"checkpoint {i} written") for i in range(20)]
