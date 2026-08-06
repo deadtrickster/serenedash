@@ -1882,20 +1882,30 @@ def summary_line(found, c, width, key="f"):
         kinds = {}
         for f in tripped:
             kinds[f.get("kind", "other")] = kinds.get(f.get("kind", "other"), 0) + 1
-        counts = "  ".join(f"{n} {KINDNAME.get(k, k)}"
-                           for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
+        order = sorted(kinds.items(), key=lambda kv: -kv[1])
+        counts = "  ".join(f"{n} {KINDNAME.get(k, k)}" for k, n in order)
         tail = f" · {passed} passed" if passed else ""
         plain = f"{len(tripped)} finding{'s' if len(tripped) != 1 else ''} · {counts}{tail}"
+        # Coloured by SEVERITY, not by which panel a finding belongs to: red for something burning
+        # or stuck right now, yellow for something merely wrong, grey for what only needs knowing.
+        # A kind palette looked decorative - storage cyan next to memory magenta says nothing about
+        # which to look at first, and "8 activity" has to read differently from "1 storage".
+        shown = "  ".join(f"{c['red'] if k in URGENT else c['yel']}{n} {KINDNAME.get(k, k)}{c['r']}"
+                          for k, n in order)
         # Red when something is burning or stuck right now, yellow when something is merely wrong.
         # The rule is glanced at from every panel, so it has to distinguish "look at this" from
         # "know this" without being read.
         hot = any(f.get("kind") in URGENT for f in tripped)
         lead = (c["red"] + c["b"]) if hot else (c["yel"] + c["b"])
         body = (f"{lead}{len(tripped)} finding{'s' if len(tripped) != 1 else ''}{c['r']}"
-                f"{c['dim']} · {counts}{tail}{c['r']}")
+                f"{c['dim']} · {c['r']}{shown}"
+                # Checks that passed are grey: they are what you need to know, not what to look at.
+                f"{c['dim']}{tail}{c['r']}")
     # Clipped before it is centred. A rule that only ever pads runs past the frame on a narrow
     # terminal and wraps, which puts a stray half-rule under the top of every redraw.
     if len(plain) > W - 6:
+        # Clipped to the visible text, which loses the per-kind colours - a rule that wraps is worse
+        # than a rule that is monochrome, and this only happens on a very narrow terminal.
         body, plain = clip(strip(body), W - 7), plain[:W - 7] + "…"
     # Measured against the VISIBLE text, not the escaped string - the arithmetic every border in
     # this renderer needs, and the one that goes wrong first.
