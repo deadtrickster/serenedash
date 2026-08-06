@@ -61,6 +61,110 @@ def elf_build_id(path):
     return None
 
 
+def elf_symbol_count(path):
+    """How many symbols an ELF carries - symtab plus dynsym. None if it is not an ELF.
+
+    A matching build-id is NOT enough, and finding that out the slow way cost most of a day. The
+    release image here is statically linked and stripped to nothing: `docker cp` produced exactly
+    the binary that made the capture, `perf buildid-cache --add` reported success, and the profile
+    stayed hex, because there was never a symbol in it to find. Nothing said so - a registered
+    build-id and a resolvable build-id look identical from the outside.
+
+    So: count them. Zero means registering it is pointless and the answer is a different copy of the
+    same build, not a retry. Parsed here for the same reason as `elf_build_id` - stdlib only, no
+    readelf, one file read per candidate instead of a process.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if head[:4] != b"\x7fELF":
+                return None
+            wide = head[4] == 2
+            end = "little" if head[5] == 1 else "big"
+
+            def num(off, size):
+                return int.from_bytes(head[off:off + size], end)
+
+            shoff = num(0x28, 8) if wide else num(0x20, 4)
+            shentsize = num(0x3a, 2) if wide else num(0x2e, 2)
+            shnum = num(0x3c, 2) if wide else num(0x30, 2)
+            if not shoff or not shnum:
+                return 0                                 # sections stripped outright
+            f.seek(shoff)
+            shdrs = f.read(shentsize * shnum)
+            total = 0
+            for i in range(shnum):
+                s = shdrs[i * shentsize:(i + 1) * shentsize]
+                if len(s) < shentsize:
+                    break
+                kind = int.from_bytes(s[4:8], end)
+                if kind not in (2, 11):                  # SHT_SYMTAB, SHT_DYNSYM
+                    continue
+                size = int.from_bytes(s[32:40], end) if wide else int.from_bytes(s[20:24], end)
+                ent = int.from_bytes(s[56:64], end) if wide else int.from_bytes(s[36:40], end)
+                total += size // ent if ent else 0
+            return total
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def mount_sources(cfg, dso_path):
+    """Host paths the container mounts over `dso_path`. [(host_path, read_only)].
+
+    The case this exists for: the deployment that mattered here does not run the image's binary at
+    all. It bind-mounts a RelWithDebInfo build over `/usr/bin/serened`, which is why perf resolved
+    its captures and why a second container of the SAME image resolved nothing - one was running a
+    binary with 333 iterator symbols in it, the other the stripped one from the image.
+
+    That host path is sitting in `docker inspect`. It needs no docker cp, no root and no build-tree
+    search, and it is by construction the exact binary the process is executing.
+    """
+    if not cfg.get("container"):
+        return []
+    try:
+        o = subprocess.run(
+            ["docker", "inspect", "-f",
+             "{{range .Mounts}}{{.Source}}\t{{.Destination}}\t{{.RW}}\n{{end}}", cfg["container"]],
+            capture_output=True, text=True, timeout=60)
+    except Exception:                                           # noqa: BLE001
+        return []
+    out = []
+    for ln in o.stdout.splitlines():
+        f = ln.split("\t")
+        if len(f) >= 3 and f[1] == dso_path and os.path.exists(f[0]):
+            out.append((f[0], f[2].strip().lower() != "true"))
+    return out
+
+
+def binary_candidates(cfg, dso_path, dest_dir=None, want=None):
+    """Every way to get symbols for `dso_path`, best first, each with what it actually offers.
+
+    One list rather than a sequence of attempts, because the useful comparison is BETWEEN them: the
+    bind-mount and the image binary can carry the same build-id and differ by 333 symbols to none,
+    and picking either without seeing the other is how an afternoon goes.
+
+    Each entry is {origin, path, build_id, symbols, matches}. Nothing is registered here - this
+    reports, the caller decides.
+    """
+    out = []
+    for host, _ro in mount_sources(cfg, dso_path):
+        out.append({"origin": "bind mount", "path": host, "build_id": elf_build_id(host),
+                    "symbols": elf_symbol_count(host)})
+    if dest_dir:
+        got = os.path.join(dest_dir, os.path.basename(dso_path))
+        if not os.path.exists(got):
+            got, _err = extract_container_binary(cfg, dso_path, dest_dir)
+        if got and os.path.exists(got):
+            out.append({"origin": "copied out of the image", "path": got,
+                        "build_id": elf_build_id(got), "symbols": elf_symbol_count(got)})
+    for c in out:
+        c["matches"] = bool(want) and c["build_id"] in want
+    # A candidate with no symbols cannot resolve anything, whatever its build-id says, so it sorts
+    # below one that can even when the one that can is a worse match.
+    out.sort(key=lambda c: (not c.get("symbols"), not c["matches"]))
+    return out
+
+
 def capture_build_ids(perf_file):
     """(build_id, dso path) the capture references, biggest-looking user binary first.
 
@@ -83,9 +187,19 @@ def capture_build_ids(perf_file):
 
 def buildid_cached(bid, debug_dir=None):
     """Whether perf's build-id cache can already resolve this build for the current user."""
+    return buildid_cached_path(bid, debug_dir) is not None
+
+
+def buildid_cached_path(bid, debug_dir=None):
+    """Where the cache keeps this build, or None. The path, because being IN the cache is not the
+    same as being usable - see `elf_symbol_count`, and the stripped binary that registered fine and
+    resolved nothing."""
     root = debug_dir or os.environ.get("PERF_BUILDID_DIR", os.path.expanduser("~/.debug"))
     p = os.path.join(root, ".build-id", bid[:2], bid[2:])
-    return os.path.exists(p) or os.path.exists(p + "/elf")
+    for cand in (p + "/elf", p):
+        if os.path.exists(cand):
+            return os.path.realpath(cand)
+    return None
 
 
 def symbol_sources(want, paths, limit=400):
@@ -318,8 +432,28 @@ def doctor(cfg, perf_dir):
         if not want:
             rows.append(("warn", "build-ids", "the newest capture names no user binary", ""))
         elif not missing:
-            rows.append(("ok", "symbols",
-                         f"{len(want)} build-id(s) registered - names will resolve", ""))
+            # Registered is not the same as resolvable. The release image's binary is statically
+            # linked and stripped: docker cp produced exactly the build that made the capture,
+            # buildid-cache took it, and the profile stayed hex because there was no symbol in it.
+            # That looked like a dashboard bug for most of a day, so it gets its own row.
+            blind = [(b, buildid_cached_path(b)) for b, _p in want]
+            blind = [(b, p) for b, p in blind if p and not elf_symbol_count(p)]
+            if blind:
+                bid, path = blind[0]
+                alt = [c for c in binary_candidates(cfg, want[0][1], want=[b for b, _ in want])
+                       if c["symbols"]]
+                fix = ("register", alt[0]["path"]) if alt else None
+                rows.append(("fail", "symbols",
+                             f"build {bid[:12]}… is registered, but that copy has no symbols in it "
+                             f"- {path} is stripped, so the profile stays hex",
+                             (f"press r to use the {alt[0]['origin']} at {alt[0]['path']} instead "
+                              f"({alt[0]['symbols']:,} symbols)" if alt else
+                              "registering it again will not help. You need a copy of this build "
+                              "that kept its symbols - on this deployment that is the "
+                              "RelWithDebInfo binary the container bind-mounts over the image's")))
+            else:
+                rows.append(("ok", "symbols",
+                             f"{len(want)} build-id(s) registered - names will resolve", ""))
         else:
             found = symbol_sources({b for b, _ in missing}, cfg.get("symbol_paths"))
             if found:
@@ -331,14 +465,39 @@ def doctor(cfg, perf_dir):
                              "press r to register it - a symlink into ~/.debug, no copy, and every "
                              "capture from this build resolves afterwards"))
             elif cfg.get("target", "docker") == "docker":
-                # The container has the exact binary and docker can read it out without root.
+                # Look at what the container actually runs before reaching for docker cp. This
+                # deployment does not execute the image's binary at all - it bind-mounts a
+                # RelWithDebInfo build over /usr/bin/serened - and that host path needs no copy, no
+                # root and no search, and is by construction the binary in the profile. A second
+                # container of the SAME image without that mount resolved nothing.
                 dso = missing[0][1]
-                fix = ("extract", dso)
-                rows.append(("warn", "symbols",
-                             f"build {missing[0][0][:12]}… is not registered and no local build "
-                             f"matches, but the container has the exact binary at {dso}",
-                             "press r to copy it out with docker cp and register it. It is the "
-                             "binary that produced this capture, so nothing has to match"))
+                cands = binary_candidates(cfg, dso, want=[b for b, _ in missing])
+                usable = [c for c in cands if c["symbols"] and c["matches"]]
+                if usable:
+                    c0 = usable[0]
+                    fix = ("register", c0["path"])
+                    rows.append(("warn", "symbols",
+                                 f"build {missing[0][0][:12]}… is not registered, but the container "
+                                 f"{'mounts' if c0['origin'] == 'bind mount' else 'has'} it at "
+                                 f"{c0['path']} - {c0['symbols']:,} symbols",
+                                 f"press r to register the {c0['origin']}. It is the binary this "
+                                 f"process is executing, so nothing has to match"))
+                elif cands and not any(c["symbols"] for c in cands):
+                    fix = None
+                    rows.append(("fail", "symbols",
+                                 f"the binary at {dso} is stripped - "
+                                 + ", ".join(f"{c['origin']} has 0 symbols" for c in cands)
+                                 + ", so registering one resolves nothing",
+                                 "run the server on a build that kept its symbols, or bind-mount "
+                                 "one over the image's binary the way the profiling deployment "
+                                 "does - a matching build-id is not enough on its own"))
+                else:
+                    fix = ("extract", dso)
+                    rows.append(("warn", "symbols",
+                                 f"build {missing[0][0][:12]}… is not registered and no local build "
+                                 f"matches, but the container has the exact binary at {dso}",
+                                 "press r to copy it out with docker cp and register it. It is the "
+                                 "binary that produced this capture, so nothing has to match"))
             else:
                 misses = near_misses([p for _, p in missing], cfg.get("symbol_paths"))
                 if misses:
