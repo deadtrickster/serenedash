@@ -209,6 +209,13 @@ WEB_ROWS = 44
 # nothing to move, and a page that swallowed j on those would be taking a key to do nothing.
 NAVIGABLE = ("mcp", "findings", "activity")
 
+# The views the generic panel dispatch draws, and the ones that have their own branch before it.
+# Declared so a test can assert they cover every binding: a view in DETAIL with no branch is a
+# KeyError on the keypress, not a blank screen, and that is how `c` took the dashboard down.
+PANELS = ("storage", "memory", "activity", "threads", "profile", "host", "search", "legend",
+          "logs", "mcp", "findings")
+OWN_BRANCH = ("graph", "config")
+
 
 def _web_nav(st, key, perf_dir, cfg=None):
     """One key from a browser, applied to that tab's position. None leaves the view.
@@ -578,6 +585,22 @@ def main():
                 lines = [f"{cc['b']}call graph{cc['r']}  {cc['dim']}{nm or 'no captures'}"
                          f"{cc['r']}", ""] + ls[scroll:scroll + max(1, h - 2 - len(keybar))]
                 lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view == "config" and s is None:
+                keybar = status(cc, w, f"{cc['b']}c{cc['r']} {cc['dim']}back{cc['r']}")
+                lines = ([f"{cc['b']}config{cc['r']}  {cc['yel']}"
+                          f"{(why or ('unavailable', ''))[0]}{cc['r']}", "",
+                          f"  {cc['dim']}the settings are the server's own; there is no reading "
+                          f"them without a connection{cc['r']}"])
+                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
+            elif view == "config":
+                # 297 settings is a big result and they change only when someone changes them,
+                # so it is fetched on the data tick and reused for every keypress in between.
+                if fresh or not crows:
+                    rows_ = query(cfg,
+                               ["select name, value, coalesce(description,''), "
+                                "input_type, scope from duckdb_settings()"])
+                    crows = rows_[0] if rows_ else []
+                lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
             # Every panel has a view behind it, keyed by its own name. They share one shape:
             # build the whole thing, slice to the window, and end with the status bar carrying
             # the key that goes back — so no view is a place you can get stuck.
@@ -650,22 +673,6 @@ def main():
                 # view happened to be tall. The keys belong in the same place on every screen.
                 lines = body[:max(1, h - len(keybar))]
                 lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
-            elif view == "config" and s is None:
-                keybar = status(cc, w, f"{cc['b']}c{cc['r']} {cc['dim']}back{cc['r']}")
-                lines = ([f"{cc['b']}config{cc['r']}  {cc['yel']}"
-                          f"{(why or ('unavailable', ''))[0]}{cc['r']}", "",
-                          f"  {cc['dim']}the settings are the server's own; there is no reading "
-                          f"them without a connection{cc['r']}"])
-                lines += [""] * max(0, h - len(lines) - len(keybar)) + keybar
-            elif view == "config":
-                # 297 settings is a big result and they change only when someone changes them,
-                # so it is fetched on the data tick and reused for every keypress in between.
-                if fresh or not crows:
-                    rows_ = query(cfg,
-                               ["select name, value, coalesce(description,''), "
-                                "input_type, scope from duckdb_settings()"])
-                    crows = rows_[0] if rows_ else []
-                lines, scroll, sel = config_frame(crows, s, col, w, scroll, sel, detail, edit, msg)
             else:
                 lines = frame(s, prev, sz, hist, perf, thr, tcpu, hinfo, col, w, h, why,
                               sea, held)
