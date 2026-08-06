@@ -25,6 +25,7 @@ from . import logs as _logs
 from . import mcplog as _mcplog
 from .db import (
     apply_setting,
+    explain,
     full_queries,
     query,
     sample,
@@ -40,6 +41,7 @@ from .views import (
     DETAIL,
     WEB_KEYS,
     activity_frame,
+    activity_rows,
     config_frame,
     frame,
     host_frame,
@@ -225,6 +227,19 @@ def _web_nav(st, key, perf_dir, cfg=None):
     row index and nothing else; only the views that list something accept it.
     """
     view = st.get("view")
+    if view == "activity" and key == "e" and st.get("open"):
+        # Same toggle the terminal has. `e` is not a NAV_KEY - it does not move a cursor - so it
+        # has to be let through here explicitly or the page silently ignores it.
+        if st.get("plan"):
+            return {**st, "plan": None, "scroll": 0}
+        # The page's nav state holds a cursor, not data - so fetch the same rows the served
+        # frame is built from. One query, on a keypress, for the one view that wants it.
+        ended = stmts.running(stmts.recent(perf_dir))[1] if perf_dir else []
+        rows = activity_rows({"queries": []}, full_queries(cfg or {}), ended)
+        i = min(st.get("sel", 0), len(rows) - 1) if rows else -1
+        return {**st, "scroll": 0,
+                "plan": explain(cfg or {}, rows[i][1]) if i >= 0 else
+                {"error": "no statement here to plan"}}
     if view not in NAVIGABLE or not (key in NAV_KEYS or key.startswith("sel:")):
         return st
     if view == "mcp":
@@ -233,6 +248,8 @@ def _web_nav(st, key, perf_dir, cfg=None):
         # findings and activity are the same interaction - a list with one item open - so they
         # share a reducer. The item count only bounds the cursor, and the frame clamps it again.
         out = list_nav(st, key, range(st.get("_n") or 200))
+    if out and out.get("open") != st.get("open"):
+        out["plan"] = None                 # a plan belongs to one statement, not to the view
     return {**st, **out} if out else {**st, "view": "main"}
 
 
@@ -283,11 +300,11 @@ def view_lines(name, cfg, perf_dir, lines, s, sz, hist, perf, thr, tcpu, hinfo, 
     if name == "memory":
         return memory_frame(s, hist, hinfo, col, w, 0)
     if name == "activity":
-        n = {"scroll": 0, "sel": 0, "open": False, **(nav or {})}
+        n = {"scroll": 0, "sel": 0, "open": False, "plan": None, **(nav or {})}
         pd = perf_dir or cfg.get("perf_dir", "")
         ended = stmts.running(stmts.recent(pd))[1] if pd else []
         return activity_frame(s, col, w, n["scroll"], full=full, sel=n["sel"], open_=n["open"],
-                              height=WEB_ROWS, anchors=anchors, ended=ended)
+                              height=WEB_ROWS, anchors=anchors, ended=ended, plan=n.get("plan"))
     if name == "search":
         return search_frame(sea, col, w, 0) if sea else lines
     if name == "threads":
@@ -649,7 +666,8 @@ def main():
                         "memory": lambda: memory_frame(s, hist, hinfo, col, w, scroll),
                         "activity": lambda: activity_frame(
                             s, col, w, anav["scroll"], full=fullq, sel=anav["sel"],
-                            open_=anav["open"], height=h - 1, ended=aended),
+                            open_=anav["open"], height=h - 1, ended=aended,
+                            plan=anav.get("plan")),
                         "threads": lambda: threads_frame(thr, tcpu, perf[2], hinfo, col, w,
                                                          scroll),
                         "profile": lambda: profile_frame(perf, col, w, scroll),
@@ -949,8 +967,26 @@ def main():
                 fnav = findings_nav(fnav, k, allfound)
                 shown = [None] * len(shown)
                 continue
+            if view == "activity" and k == "e" and anav.get("open"):
+                # Toggle. Pressing it again puts the statement back rather than leaving the plan
+                # up, because the two answer different questions and only one can be on screen.
+                if anav.get("plan"):
+                    anav = {**anav, "plan": None, "scroll": 0}
+                else:
+                    # The frame's own ordering, not a second copy of it - the cursor is an index
+                    # into that list and the two must not drift.
+                    arows = activity_rows(s, fullq, aended) if s else []
+                    i = min(anav.get("sel", 0), len(arows) - 1) if arows else -1
+                    anav = {**anav, "scroll": 0,
+                            "plan": explain(cfg, arows[i][1]) if i >= 0 else
+                            {"error": "no statement here to plan"}}
+                shown = [None] * len(shown)
+                continue
             if view == "activity" and k in NAV_KEYS and k != "\x1b":
+                was = anav.get("open")
                 anav = list_nav(anav, k, (fullq or s["queries"]) if s else [])
+                if anav.get("open") != was:
+                    anav["plan"] = None        # a plan belongs to one statement, not to the view
                 shown = [None] * len(shown)
                 continue
             if view == "mcp" and k in NAV_KEYS and k != "\x1b":

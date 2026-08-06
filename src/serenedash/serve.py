@@ -188,6 +188,7 @@ document.addEventListener('keydown', e => {
   if (e.key === '/' && FILTERS.includes(view)){ e.preventDefault(); return box.focus(); }
   if (navigable && e.key === 'Escape'){ e.preventDefault(); return nav('esc'); }
   if (e.key === 'Escape') return go('main');
+  if (navigable && view === 'activity' && e.key === 'e'){ e.preventDefault(); return nav('e'); }
   if (navigable && NAV[e.key]){ e.preventDefault(); return nav(NAV[e.key]); }
   const v = keys[e.key.toLowerCase()];
   if (v) { e.preventDefault(); go(v); }

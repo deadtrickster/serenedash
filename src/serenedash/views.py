@@ -255,6 +255,11 @@ def view_hint(view, nav=None, c=None):
         return keys(("j/k", "moves"), ("enter", "opens the session"))
     if view in ("findings", "activity"):
         if n.get("open"):
+            if view == "activity":
+                # `e` is only offered where it means something. It plans the open statement, so it
+                # has nothing to say on the list and nothing to say on a finding.
+                back = "shows the statement" if n.get("plan") else "explains it"
+                return keys(("j/k", "scrolls"), ("e", back), ("esc", "back"))
             return keys(("j/k", "scrolls"), ("esc", "back"))
         opens = "reads the finding" if view == "findings" else "opens the statement"
         out = [("j/k", "moves"), ("enter", opens)]
@@ -547,8 +552,32 @@ def biggest_literal(q):
     return hi - lo, q[lo:lo + 48]
 
 
+def activity_rows(s, full=None, ended=()):
+    """The activity view's rows, filtered and in the order it draws them.
+
+    Shared rather than inlined because the cursor is an INDEX into this list, so anything that acts
+    on "the row the cursor is on" - drawing it, opening it, planning it - has to agree on what
+    order it is in. `e` first computed its own copy of this, which meant the day the sort changed it
+    would have explained a different statement than the one on screen, silently.
+    """
+    rows = [r for r in s["queries"] if "pg_stat_activity" not in r[1]]
+    if full:
+        rows = [r for r in full if "pg_stat_activity" not in r[1]]
+    # Statements that have since ended, in the same shape as live ones so everything downstream -
+    # the sort, the cursor, opening one - works on both without knowing the difference.
+    # pg_stat_activity forgets; this is what the dashboard saw before it did.
+    rows += [("ended", r.get("statement", ""), r.get("chars") or 0, r.get("ran_for_s") or -1,
+              r.get("connection_age_s") or -1, r.get("pid") or "",
+              r.get("client_addr") or "", r.get("application_name") or "")
+             for r in ended]
+    # Active first, then oldest first. The row that matters is the one nobody is waiting for, and
+    # ordering by state alone left a 42-hour query wherever the server happened to return it.
+    rows.sort(key=lambda r: (r[0] != "active", -(r[3] if len(r) > 3 else 0)))
+    return rows
+
+
 def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=40,
-                   anchors=None, ended=()):
+                   anchors=None, ended=(), plan=None):
     """The `a` view: every session, collapsed, and the whole statement of the one you open.
 
     Collapsed by DEFAULT. This view used to wrap every statement in full on the theory that the
@@ -563,19 +592,7 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
     c = C if col else NOCOLOR
     W = max(70, width)
     st = s["states"]
-    rows = [r for r in s["queries"] if "pg_stat_activity" not in r[1]]
-    if full:
-        rows = [r for r in full if "pg_stat_activity" not in r[1]]
-    # Statements that have since ended, in the same shape as live ones so everything below - the
-    # sort, the cursor, opening one - works on both without knowing the difference. pg_stat_activity
-    # forgets; this is what the dashboard saw before it did.
-    rows += [("ended", r.get("statement", ""), r.get("chars") or 0, r.get("ran_for_s") or -1,
-              r.get("connection_age_s") or -1, r.get("pid") or "",
-              r.get("client_addr") or "", r.get("application_name") or "")
-             for r in ended]
-    # Active first, then oldest first. The row that matters is the one nobody is waiting for, and
-    # ordering by state alone left a 42-hour query wherever the server happened to return it.
-    rows.sort(key=lambda r: (r[0] != "active", -(r[3] if len(r) > 3 else 0)))
+    rows = activity_rows(s, full, ended)
     out = [f"{c['b']}activity{c['r']}  {c['dim']}"
            + "  ".join(f"{k} {v}" for k, v in sorted(st.items()))
            + (f"  ·  {len(ended)} ended, sampled every tick - anything shorter than one is not "
@@ -585,6 +602,8 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
         return out[scroll:]
     sel = max(0, min(sel, len(rows) - 1))
     if open_:
+        if plan:
+            return out[:1] + _plan(rows[sel], plan, c, W, height, scroll)
         return out[:1] + _statement(rows[sel], c, W, height, scroll)
 
     room = max(1, height - len(out) - 1)
@@ -617,6 +636,45 @@ def activity_frame(s, col, width, scroll, full=None, sel=0, open_=False, height=
                    f"{'' if run else c['dim']}{clip(head, max(20, W - 78))}{c['r']}")
     if start:
         out.insert(2, f"  {c['dim']}… {start} above{c['r']}")
+    return out
+
+
+def _plan(row, plan, c, W, height, scroll):
+    """The plan for the open statement, in place of its text.
+
+    In place rather than below it: both are long, the statement is already the default, and a plan
+    pushed under 68 KB of SQL is a plan nobody scrolls to. `e` goes back.
+
+    The plan is drawn as it arrives - DuckDB returns box-drawing art whose alignment IS the tree, so
+    wrapping it the way `_statement` wraps SQL would turn the tree into confetti. Wider than the
+    panel, it gets cut and says so.
+    """
+    stt, pid = row[0], (list(row) + [-1, -1, ""])[5]
+    err = plan.get("error")
+    head = (f"  {c['b']}plan{c['r']}"
+            + (f"  {c['dim']}pid {pid}{c['r']}" if pid else "")
+            + (f"  {c['dim']}{plan['chars']:,} chars planned{c['r']}" if plan.get("chars") else "")
+            + (f"  {c['dim']}· the statement has since ended{c['r']}" if stt == "ended" else ""))
+    out = ["", head, ""]
+    if err:
+        out.append(f"  {c['red']}{clip(err, max(30, W - 6))}{c['r']}")
+        for k in ("detail", "fix"):
+            if plan.get(k):
+                out += [f"  {c['dim']}{clip(ln, max(30, W - 6))}{c['r']}"
+                        for ln in textwrap.wrap(str(plan[k]), max(30, W - 6))]
+        return out
+    body = plan.get("plan") or ["(the server returned no plan)"]
+    room = max(3, height - len(out) - 3)
+    scroll = max(0, min(scroll, max(0, len(body) - room)))
+    cut = 0
+    for ln in body[scroll:scroll + room]:
+        cut += len(ln) > W - 6
+        out.append(f"  {clip(ln, max(30, W - 6))}")
+    if len(body) > scroll + room:
+        out.append(f"  {c['dim']}… {len(body) - scroll - room} more lines - j/k scrolls{c['r']}")
+    if cut:
+        out.append(f"  {c['dim']}{cut} row(s) wider than this panel - the tree is drawn with "
+                   f"box characters and is not wrapped{c['r']}")
     return out
 
 

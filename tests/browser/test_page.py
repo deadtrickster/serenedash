@@ -432,3 +432,56 @@ def test_the_alias_still_opens_the_screen_it_used_to(dash, page):
     wait_for_frame(page)
     page.keyboard.press("d")
     page.wait_for_url(re.compile(r"/findings$"), timeout=8000)
+
+
+def test_e_plans_the_open_statement_in_the_browser(dash, page):
+    # `e` is not a navigation key - it moves no cursor - so the page dropped it silently, the way
+    # it dropped j and k before them. The plan and the statement are both long, so the plan takes
+    # the statement's place rather than following it down the panel.
+    page.goto(dash.url + "/activity")
+    wait_for_frame(page, "enter opens the statement")
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "explains it")               # a statement is open; `e` now means something
+    assert "m_idx" in frame(page), "the statement should be on screen before it is planned"
+    page.keyboard.press("e")
+    wait_for_frame(page, "IRESEARCH_SCAN")
+    body = frame(page)
+    assert "bm25(k1=1.2, b=0.75)" in body
+    assert "shows the statement" in body, "the hint has to offer the way back"
+
+
+def test_e_toggles_back_to_the_statement(dash, page):
+    page.goto(dash.url + "/activity")
+    wait_for_frame(page, "enter opens the statement")
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "explains it")
+    page.keyboard.press("e")
+    wait_for_frame(page, "IRESEARCH_SCAN")
+    page.keyboard.press("e")
+    wait_for_frame(page, "explains it", without="IRESEARCH_SCAN")
+
+
+def test_moving_off_a_statement_drops_its_plan(dash, page):
+    # The plan belongs to ONE statement. Left on screen after the cursor moves it is not stale
+    # decoration, it is the wrong answer under the right heading.
+    page.goto(dash.url + "/activity")
+    wait_for_frame(page, "enter opens the statement")
+    page.keyboard.press("Enter")
+    page.keyboard.press("e")
+    wait_for_frame(page, "IRESEARCH_SCAN")
+    page.keyboard.press("Escape")                                  # back to the list
+    wait_for_frame(page, "enter opens the statement", without="IRESEARCH_SCAN")
+    page.keyboard.press("Enter")
+    wait_for_frame(page, "explains it", without="IRESEARCH_SCAN")
+
+
+def test_e_does_nothing_on_a_view_that_cannot_plan(dash, page):
+    # It must not reach the server as a view switch either: `e` opens no view, and a key that does
+    # nothing has to do nothing rather than something surprising.
+    page.goto(dash.url + "/mcp")
+    wait_for_frame(page, "enter opens the session")
+    before = frame(page)
+    page.keyboard.press("e")
+    page.wait_for_timeout(600)
+    assert frame(page) == before, "e changed the mcp view"
+    assert page.url.endswith("/mcp")

@@ -262,6 +262,59 @@ def terminate(cfg, pid):
                 f"pid {pid} did not terminate - it may have already finished")
 
 
+def explain(cfg, statement, timeout=20):
+    """The plan for a statement, without having to get the statement out first.
+
+    `explain` has always been in READ_ONLY, so the `query` tool could already run one. What it could
+    not do is run it on a statement that is ALREADY RUNNING, which is the only case that comes up
+    mid-incident: the text is 68 KB, it is in pg_stat_activity rather than in anyone's editor, and
+    the interesting question is what the server decided to do with the thing currently burning a
+    core. So this takes the statement the activity view already fetched in full and plans it.
+
+    Read-only on both sides, same as `read_query`: the kind is checked here and the connection is
+    opened read-only as well. EXPLAIN does not execute - no ANALYZE - so planning a statement that
+    is hung is safe and, on the one that mattered here, took 87 ms on 68,217 characters.
+
+    Returns {"plan": [lines], "chars": n} or {"error": ..., "detail": ...}. Never raises.
+    """
+    drv = pg_driver()
+    if drv is None:
+        return {"error": "no driver", "fix": "pip install 'psycopg[binary]'"}
+    if not cfg.get("password"):
+        return {"error": "no credentials",
+                "fix": "PGPASSWORD, `password`, or `password_command` in the config file"}
+    sql = (statement or "").strip().rstrip(";").strip()
+    if not sql:
+        return {"error": "nothing to explain"}
+    kind = statement_kind(sql)
+    if kind == "explain":
+        return {"error": "that statement is already an EXPLAIN",
+                "detail": "planning a plan is not a thing; run it through `query` instead"}
+    if kind not in READ_ONLY:
+        # EXPLAIN never executes, so a write would not run - but the connection is read-only and
+        # would refuse it anyway, and the server's error is worse than this sentence.
+        return {"error": f"refused: {kind or 'unrecognised'} is not a read-only statement",
+                "allowed": list(READ_ONLY)}
+    try:
+        with drv.connect(host=cfg.get("host") or "127.0.0.1", port=int(cfg["port"]),
+                         user=cfg.get("user") or "postgres", password=cfg["password"],
+                         dbname=cfg.get("database") or "postgres",
+                         connect_timeout=min(10, timeout)) as cn:
+            cn.read_only = True
+            with cn.cursor() as cur:
+                cur.execute("EXPLAIN " + sql)
+                rows = cur.fetchall() if cur.description else []
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": "explain failed", "detail": str(e).strip()[:2000]}
+    # DuckDB answers with (explain_key, explain_value); through the wire it can arrive as one
+    # column. Take the LAST one either way - the first is the label, not the plan - and split, so
+    # the caller gets rendered rows rather than one string with newlines in it.
+    out = []
+    for r in rows:
+        out += str(r[-1] if len(r) > 1 else r[0]).splitlines()
+    return {"plan": out, "chars": len(sql)}
+
+
 def _num(v):
     """A number the server may not have given. -1 means unknown, which is not the same as 0."""
     try:

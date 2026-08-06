@@ -466,6 +466,39 @@ def query(sql: str, max_rows: int = 200, max_chars: int = 20000) -> dict:
 
 @server.tool()
 @stamped
+def explain(sql: str = "", pid: str = "") -> dict:
+    """The plan for a statement — either one you pass, or the one a session is running right now.
+
+    `query` could already run an EXPLAIN by hand, but not on a statement that is already executing:
+    that text lives in pg_stat_activity, it is routinely tens of kilobytes, and getting it into a
+    tool call means fetching it, quoting it and sending it back. Give this a `pid` from `activity`
+    instead and it plans what that session is doing.
+
+    EXPLAIN does not execute — there is no ANALYZE here — so this is safe to point at a statement
+    that is hung, which is the case it exists for. On the 68 KB hybrid search that started all this
+    it returned in 87 ms.
+
+    Args:
+        sql: a statement to plan. Ignored when `pid` is given.
+        pid: plan whatever this session is currently running instead.
+    """
+    if pid:
+        rows = [r for r in db.full_queries(CFG) if str(r[5]) == str(pid).strip()]
+        if not rows:
+            return {"error": f"no session with pid {pid}",
+                    "fix": "call activity() for the pids that exist right now"}
+        if not (rows[0][1] or "").strip():
+            return {"error": f"pid {pid} is not running a statement", "state": rows[0][0]}
+        out = db.explain(CFG, rows[0][1])
+        out["pid"], out["state"] = str(pid).strip(), rows[0][0]
+        return out
+    if not sql.strip():
+        return {"error": "give me either sql or a pid"}
+    return db.explain(CFG, sql)
+
+
+@server.tool()
+@stamped
 def anomalies() -> dict:
     """What has moved, judged against the recorded history rather than a threshold.
 
