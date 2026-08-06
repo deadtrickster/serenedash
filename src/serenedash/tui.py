@@ -655,7 +655,18 @@ def main():
                         "profile": lambda: profile_frame(perf, col, w, scroll),
                         "host": lambda: host_frame(hinfo, s, col, w, scroll),
                         "search": lambda: search_frame(sea, col, w, scroll),
-                        "legend": lambda: legend_frame(col, w, scroll)}[view]()
+                        "legend": lambda: legend_frame(col, w, scroll)}
+                # `.get`, not `[view]`. A view with no panel is a bug and there is a test for it,
+                # but the consequence of that bug must not be the process dying under someone's
+                # hands: `c` reached this dict once and took the dashboard down with a KeyError.
+                # A frame that says what is missing is recoverable; a traceback is not.
+                draw = body.get(view)
+                body = draw() if draw else [
+                    f"{cc['b']}{view}{cc['r']}  {cc['red']}no panel is bound to this view{cc['r']}",
+                    "",
+                    f"  {cc['dim']}The key works and the view exists, but nothing draws it. This is",
+                    f"  a bug in serenedash, not a problem with the server.{cc['r']}", "",
+                    f"  {cc['dim']}Press {DETAIL.get(view, '?')} again to go back.{cc['r']}"]
                 _sel = (sorted(allfound, key=lambda f: -f.get("severity", 1))
                         [min(fnav["sel"], len(allfound) - 1)] if allfound else {})
                 vnav = {"findings": {**fnav, "armed": armed if _sel.get("action") else None,

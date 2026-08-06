@@ -193,7 +193,27 @@ hand_back() {
 	chown -R "$owner" "$OUT" 2>/dev/null
 	return 0
 }
-trap hand_back EXIT INT TERM
+# The pid of the capture in flight, so a signal can stop it rather than leaving perf writing into a
+# file nobody will read.
+capture_pid=""
+
+# EXIT hands the output back and nothing else - it runs on every path including the signal one.
+# INT and TERM hand it back and LEAVE, which is the whole point: a handler that returns normally
+# resumes the script, and this one used to, so ^C chowned the captures and went round the loop
+# again. Sixteen of them did not stop a three-and-a-half-hour run.
+on_signal() {
+	trap - INT TERM # a second ^C is immediate, whatever this handler is doing
+	say "interrupted - stopping after $n capture(s)"
+	if [ -n "$capture_pid" ]; then
+		kill -TERM "$capture_pid" 2>/dev/null
+		wait "$capture_pid" 2>/dev/null
+	fi
+	hand_back
+	exit 130
+}
+
+trap hand_back EXIT
+trap on_signal INT TERM
 hand_back
 
 MANIFEST="$OUT/manifest.tsv"
@@ -260,7 +280,13 @@ capture() { # capture SIGNATURE TRIGGER THREADS CPU WRITE VOL COMMITTED
 	local f
 	f="$(printf '%s/snap-%03d-%s-%s.data' "$OUT" "$n" "$(date +%H%M%S)" "$sig")"
 	say "capture $n [$trig] $sig - ${thr} runnable, cpu ${cpu}%, write ${wr}MB/s, ${vol} vol/cpu-s"
-	perf record -F "$FREQ" -g --call-graph fp -p "$TARGET_PID" -o "$f" -- sleep "$WINDOW" >/dev/null 2>&1
+	# Backgrounded and waited on, NOT run in the foreground: bash does not run a trap while a
+	# foreground child is executing, so an interrupt sat unhandled until perf finished. With `wait`
+	# the handler runs at once and can stop the capture.
+	perf record -F "$FREQ" -g --call-graph fp -p "$TARGET_PID" -o "$f" -- sleep "$WINDOW" >/dev/null 2>&1 &
+	capture_pid=$!
+	wait "$capture_pid" 2>/dev/null
+	capture_pid=""
 	# A symbol summary next to each capture, so the directory is readable without perf. Cycle-weighted
 	# via read-perf.sh where it exists: this box is a hybrid CPU and a plain `perf report | head` reads
 	# the E-core table only, which understated one symbol as 35.60% when it was 93.39% on the P-cores.
@@ -306,7 +332,11 @@ prev_com="$(committed_kb)"
 prev_t=$t0
 
 while :; do
-	sleep "$POLL"
+	# Same reason as the capture: a foreground sleep defers the trap until it returns.
+	sleep "$POLL" &
+	capture_pid=$!
+	wait "$capture_pid" 2>/dev/null
+	capture_pid=""
 
 	kill -0 "$TARGET_PID" 2>/dev/null || {
 		say "target exited after $(($(date +%s) - t0))s, $n captures"

@@ -114,3 +114,28 @@ def test_the_shared_dispatch_also_draws_every_panel(view):
     except Exception:                                            # noqa: BLE001
         return                                                   # a branch exists; it wants data
     assert out is not marker or view in tui.NEEDS_SQL, f"view_lines has no branch for {view}"
+
+
+def test_a_missing_panel_cannot_kill_the_process():
+    # `c` took the dashboard down with a KeyError, twice. There is a test above that a binding must
+    # have a branch - but the consequence of that test ever failing must not be a traceback under
+    # someone's hands mid-incident. The dispatch uses .get and draws an explanation instead.
+    assert "}[view]()" not in SRC, "a dict-literal subscript can raise KeyError on a keypress"
+    assert "body.get(view)" in SRC
+    assert "no panel is bound to this view" in SRC, "and it has to say what happened"
+
+
+def test_the_config_view_is_claimed_by_its_own_branch_not_the_generic_one():
+    # The specific regression, stated as the thing that must hold rather than as a line comparison:
+    # walk the if/elif chain in source order and find who claims `config` first.
+    lines = SRC.splitlines()
+    claimed_by = None
+    for ln in lines:
+        st = ln.strip()
+        if st.startswith(("if view ==", "elif view ==")) and '"config"' in st:
+            claimed_by = "own"
+            break
+        if st.startswith("elif view in DETAIL"):
+            claimed_by = "generic"
+            break
+    assert claimed_by == "own", "the generic branch claims config first; the key crashes"
