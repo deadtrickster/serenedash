@@ -14,10 +14,27 @@ from .fmt import human, to_bytes
 # Deliberately short. A hazard list that grows to fifty entries stops being read, and the value of
 # this one is that every line in it cost someone a day.
 def _rel_temp(v, _s):
+    # Read a relative value here as "the server has restarted since someone last fixed this", not as
+    # "someone configured it badly". Nobody sets `.tmp`; it is the DuckDB default, and the only route
+    # back to it is a restart. Measured 2026-08-07: the value was corrected on 08-03, the container
+    # restarted on 08-06 at 22:55, and by morning it was `.tmp` again with nothing said. A relative
+    # value is therefore a restart marker, and the previous wording — which described only the
+    # permissions failure — sent the reader looking for a bad config change that never happened.
+    #
+    # It cannot be fixed durably at 26.07.4. There is no `--temp_directory` flag: writing one into
+    # the flagfile makes serened refuse to boot with "Unknown command line flag 'temp_directory'",
+    # and --helpfull lists exactly one directory flag, --server_directory. So `SET GLOBAL` after
+    # every single start is the only route, and it must be re-applied by whatever restarts the
+    # server rather than by hand.
     if not str(v).startswith("/"):
-        return ("RELATIVE path. serened runs as uid 999 with cwd /, which is root-owned, so this "
-                "resolves to /.tmp and CANNOT BE CREATED. Every spill fails with EACCES — silently, "
-                "until the working set first exceeds memory_limit.")
+        return ("RELATIVE path, which is the DEFAULT — so the server has almost certainly RESTARTED "
+                "and lost its setting, rather than been misconfigured. serened runs as uid 999 with "
+                "cwd /, which is root-owned, so this resolves to /.tmp and CANNOT BE CREATED. Every "
+                "spill fails with EACCES — silently, until the working set first exceeds "
+                "memory_limit; last time that was 2.5 days of correct operation then 5,853 failed "
+                "inserts in five hours. There is NO flag for this at 26.07.4, so it cannot be fixed "
+                "in the config: run  SET GLOBAL temp_directory='/var/lib/serenedb/tmp'  now, "
+                "creating the directory as the server's uid first, and re-apply it on EVERY start.")
     return None
 
 
