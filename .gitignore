@@ -38,3 +38,8 @@ serenedash.desktop
 # A real .envrc is yours, not the repo's - see .envrc.example
 .envrc
 serenedash.toml
+
+# uv is not this project's package manager - pip and .venv are, see README. A stray uv.lock from
+# someone running uv once is 180 KB of lockfile nothing reads, which drifts from pyproject.toml
+# silently. Ignored rather than committed so it stops reappearing in unrelated commits.
+uv.lock
