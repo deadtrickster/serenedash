@@ -61,7 +61,8 @@ def hostinfo(pid, container):
     `duckdb_memory()` reports. All of it is free: three small reads under /proc.
     """
     d = {"container": container, "pid": pid, "cores": os.cpu_count() or 0, "load": [], "rss": 0,
-         "threads": 0, "peak": 0, "swap": 0, "ram_total": 0}
+         "threads": 0, "peak": 0, "swap": 0, "ram_total": 0, "vol_switches": 0,
+         "nonvol_switches": 0}
     try:
         with open("/proc/loadavg") as f:
             d["load"] = f.read().split()[:3]
@@ -97,6 +98,29 @@ def hostinfo(pid, container):
                     if k in want:
                         d[want[k]] = int(ln.split()[1]) * 1024
         except (OSError, ValueError, IndexError):
+            pass
+        # Voluntary context switches, summed over EVERY thread. This is the signal that separates a
+        # spin from a block, and nothing else the dashboard collects can: a spin burns CPU without
+        # ever yielding, so this collapses toward zero, while work blocked on IO, a lock or a condvar
+        # yields constantly - same cpu%, same thread count, opposite diagnosis. perf-snap.sh has
+        # bucketed on it for months; the dashboard never read it.
+        #
+        # Per thread rather than from /proc/<pid>/status, because that file counts the group leader
+        # only on some kernels and the leader is usually the one thread NOT doing the work.
+        try:
+            vol = nonvol = 0
+            for t in os.scandir(f"/proc/{pid}/task"):
+                try:
+                    with open(f"{t.path}/status") as f:
+                        for ln in f:
+                            if ln.startswith("voluntary_ctxt_switches:"):
+                                vol += int(ln.split()[1])
+                            elif ln.startswith("nonvoluntary_ctxt_switches:"):
+                                nonvol += int(ln.split()[1])
+                except (OSError, ValueError, IndexError):
+                    continue
+            d["vol_switches"], d["nonvol_switches"] = vol, nonvol
+        except OSError:
             pass
         # Field 22 of /proc/<pid>/stat is start time in ticks since boot; /proc/uptime is the other
         # half of the subtraction. Worth having: "the WAL has not checkpointed in two days" reads

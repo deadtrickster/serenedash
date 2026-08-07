@@ -44,6 +44,14 @@ CONVOY_SPREAD_S = 2
 CONVOY_MIN_AGE_S = 60
 CONVOY_MIN = 3
 
+# Voluntary context switches per cpu-second, below which the process is not yielding. CHOSEN, with
+# one validation: the 55-hour spin on this deployment held 13, and perf-snap.sh has bucketed at 50
+# for months without a false call. Anything blocked on IO or a lock is in the thousands, so the gap
+# either side of this number is wide - which is why a crude threshold works at all.
+SPIN_SWITCHES = 50
+# And at least one core has to be busy, or an idle server with no switches trips it.
+SPIN_CPU = 90
+
 
 def temp_split(sz, host):
     """Live spill vs files older than the process. The split, not the sum.
@@ -681,6 +689,45 @@ def search_findings(sr):
     return out
 
 
+def spin_suspected(hist, tcpu, host=None):
+    """CPU burning without yielding. The shape of a loop that is not making progress.
+
+    Takes the recorded series rather than one reading, because a single tick catches a process
+    mid-anything; a spin holds the shape. Reports the SHAPE and names the measurement that would
+    settle it - a tight loop doing useful arithmetic looks exactly like this, and only a profile
+    tells them apart.
+    """
+    vps = [v for v in (hist or {}).get("volps", []) if v is not None]
+    if len(vps) < 3 or (tcpu or 0) < SPIN_CPU:
+        return []
+    recent = vps[-3:]
+    if max(recent) >= SPIN_SWITCHES:
+        return []
+    cores = round((tcpu or 0) / 100.0, 1)
+    return [{
+        "kind": "cpu",
+        "what": f"{cores} core(s) busy with almost no yielding - a spin, not work",
+        "detail": f"voluntary context switches are {recent[-1]:.0f} per cpu-second over the last "
+                  f"{len(recent)} samples (max {max(recent):.0f}), against a threshold of "
+                  f"{SPIN_SWITCHES}. A loop that never blocks does not yield, so this collapses "
+                  f"toward zero; anything waiting on IO, a lock or a condvar yields constantly and "
+                  f"reads in the thousands. Same cpu%, same thread count, opposite diagnosis - and "
+                  f"no other cheap signal separates them. Measured on the 55-hour hang here: 13. "
+                  f"THIS IS A SHAPE, NOT A CAUSE: a tight loop doing useful arithmetic looks "
+                  f"identical.",
+        "switches_per_cpu_s": recent[-1],
+        "samples": len(recent),
+        "cpu_cores_busy": cores,
+        "threshold_switches": SPIN_SWITCHES,
+        "threshold_is_chosen": True,
+        "fix": "take a profile - `sudo ./perf-snap.sh --container <name>` - and read which symbol "
+               "holds it. If one symbol dominates and the profile does not change between two "
+               "captures minutes apart, it is a spin and the statement will not finish on its own.",
+        "verify": "select pid, round(extract(epoch from (now()-query_start))) age_s, query "
+                  "from pg_stat_activity where state = 'active' order by query_start",
+    }]
+
+
 def convoy(s):
     """Active statements that all started within a moment of each other and none has moved since.
 
@@ -874,6 +921,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
     out.extend({"kind": "search", **f} for f in search_findings(sr))
     out.extend(bm25_exposure(sr))
     out.extend(convoy(s))
+    out.extend(spin_suspected(hist, tcpu, host))
     # Everything above is a comparison against a threshold that someone chose. These are against
     # the series' own recent past, so they catch the shapes no threshold can: a pool that has been
     # climbing all afternoon is not over any limit until it is.

@@ -466,6 +466,132 @@ def query(sql: str, max_rows: int = 200, max_chars: int = 20000) -> dict:
 
 @server.tool()
 @stamped
+def triage(pid: str = "") -> dict:
+    """Why is this statement not finishing? Gathers the evidence and walks the tree.
+
+    Three outcomes look identical in `pg_stat_activity` - spin, blocked, genuinely slow - because
+    `state = 'active'` covers all three and this server reports no wait events. Separating them
+    needs the statement's age, the process's CPU, whether it is yielding, and the plan; that is four
+    sources, and doing it by hand across three terminals is what made one incident take two days.
+
+    Returns `{verdict, confidence, evidence, what_would_settle_it, next}`. The verdict is a SHAPE,
+    never a cause: a tight loop doing useful arithmetic looks exactly like a spin from out here.
+    When the evidence fits more than one branch it says so and names the measurement that would
+    separate them.
+
+    Terminates nothing. Note that on this engine a statement whose loop never polls cannot be
+    cancelled at all - `pg_terminate_backend` returns true and the statement keeps running - so
+    "kill it" is not always available and this tool will not pretend otherwise.
+
+    Args:
+        pid: the session to look at. Without one, the oldest active statement is used.
+    """
+    s, err = _sample(query_head=400)
+    if err:
+        return err
+    rows = [r for r in db.full_queries(CFG)
+            if r[0] == "active" and "pg_stat_activity" not in r[1]]
+    if not rows:
+        return {"verdict": "nothing is running",
+                "note": "no active statement other than this connection"}
+    rows.sort(key=lambda r: -(r[3] or 0))
+    row = next((r for r in rows if str(r[5]) == str(pid).strip()), None) if pid else rows[0]
+    if row is None:
+        return {"error": f"no active session with pid {pid}",
+                "fix": "call activity() for the pids that exist right now"}
+
+    # CPU and the switch rate are both RATES, so both need two reads and the interval between
+    # them. One call to threads() with no previous sample returns 0.0 - the counters are there but
+    # there is nothing to subtract them from.
+    hpid = system.host_pid(CFG)
+    host = system.hostinfo(hpid, CFG.get("container"))
+    tcpu, volps = 0.0, None
+    if hpid:
+        _rows, _tot, prev, last = system.threads(hpid, {}, 0.0)
+        v0 = host.get("vol_switches") or 0
+        time.sleep(1.0)
+        _rows, tcpu, _cur, now = system.threads(hpid, prev, last)
+        host = system.hostinfo(hpid, CFG.get("container"))
+        cpu_s = (tcpu / 100.0) * max(0.001, now - last)
+        if cpu_s > 0.05:
+            volps = round(((host.get("vol_switches") or 0) - v0) / cpu_s, 1)
+
+    age = row[3] or 0
+    near = [r for r in rows if abs((r[3] or 0) - age) <= snap.CONVOY_SPREAD_S]
+    ev = {
+        "pid": row[5], "age_s": age, "statement_head": (row[1] or "")[:200],
+        "statement_chars": row[2],
+        "connection_age_s": row[4],
+        "process_cpu_percent_of_one_core": round(tcpu, 1),
+        "cores_busy": round(tcpu / 100.0, 1),
+        "voluntary_switches_per_cpu_s": volps,
+        "statements_starting_together": len(near),
+    }
+
+    # The tree. Order matters: a convoy member can also be at 0% CPU, and "blocked" is the more
+    # useful answer of the two.
+    if len(near) >= snap.CONVOY_MIN and age >= snap.CONVOY_MIN_AGE_S:
+        kinds = [((r[1] or "").strip().lstrip("(").split(None, 1) or [""])[0].upper() for r in near]
+        forced = any(k in ("FORCE", "CHECKPOINT") for k in kinds)
+        return {
+            "verdict": "blocked - a convoy",
+            "confidence": "strong" if forced else "moderate",
+            "evidence": {**ev, "convoy_kinds": kinds,
+                         "convoy_pids": [r[5] for r in near]},
+            "reasoning": f"{len(near)} statements began within {snap.CONVOY_SPREAD_S}s of each "
+                         f"other and none has finished. Independent clients do not agree on a start "
+                         f"time that closely, so one event released or blocked them together."
+                         + (" A FORCE CHECKPOINT is among them, and it holds start_transaction_lock "
+                            "for its entire wait - that stops EVERY new transaction, reads "
+                            "included." if forced else ""),
+            "what_would_settle_it": "there is no lock view on this server (pg_locks returns 0 rows), "
+                                    "so the holder cannot be named from SQL. The oldest member is "
+                                    "where to look.",
+            "next": ("cancel the FORCE CHECKPOINT - it is interruptible and releases the rest"
+                     if forced else "triage the oldest member of the convoy"),
+        }
+    if volps is not None and volps < snap.SPIN_SWITCHES and tcpu >= snap.SPIN_CPU:
+        return {
+            "verdict": "spinning",
+            "confidence": "moderate",
+            "evidence": ev,
+            "reasoning": f"{round(tcpu / 100.0, 1)} core(s) busy at {volps} voluntary context "
+                         f"switches per cpu-second, against a threshold of {snap.SPIN_SWITCHES}. A "
+                         f"loop that never blocks never yields; anything waiting on IO or a lock "
+                         f"reads in the thousands. This is a SHAPE - useful arithmetic in a tight "
+                         f"loop looks the same from here.",
+            "what_would_settle_it": "two perf captures a few minutes apart. One dominant symbol AND "
+                                    "no change between them is a spin; a profile that moves is work.",
+            "next": "sudo ./perf-snap.sh --container "
+                    f"{CFG.get('container', '<name>')}, then read profile() and callgraph()",
+        }
+    if tcpu >= snap.SPIN_CPU:
+        return {
+            "verdict": "working, or slow - not a spin",
+            "confidence": "moderate",
+            "evidence": ev,
+            "reasoning": f"CPU is busy and the process IS yielding "
+                         f"({volps} switches per cpu-second), which is what work blocked on IO, "
+                         f"locks or condvars looks like.",
+            "what_would_settle_it": "explain(pid=...) for what the planner chose, and profile() for "
+                                    "where the time goes.",
+            "next": f"explain(pid='{row[5]}')",
+        }
+    return {
+        "verdict": "not consuming CPU, and not obviously in a convoy",
+        "confidence": "weak",
+        "evidence": ev,
+        "reasoning": "the statement is active and old, but the process is not busy and no other "
+                     "statement started alongside it. It is waiting for something this server does "
+                     "not report - there are no wait events and no lock view.",
+        "what_would_settle_it": "whether anything else holds a lock. Not answerable from SQL here; "
+                                "the profile will show whether any thread is doing anything at all.",
+        "next": "activity() for the full picture, then a perf capture if nothing explains it",
+    }
+
+
+@server.tool()
+@stamped
 def explain(sql: str = "", pid: str = "") -> dict:
     """The plan for a statement — either one you pass, or the one a session is running right now.
 

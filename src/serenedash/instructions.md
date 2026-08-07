@@ -177,6 +177,83 @@ the `checkpoint_blocked` finding does.
 Likewise, WAL size does not come from `pg_stat_wal` (zeroed). It comes from the files on disk, which
 is why `storage` measures the directory rather than asking the server.
 
+## Decision trees
+
+Each branch names the measurement that separates it from its siblings, not the symptom. Every tree
+here was walked by hand on a real incident first; the discriminators are the ones that actually
+worked, and the numbers beside them say whether they were measured or chosen.
+
+### A statement will not finish
+
+The expensive one. Three outcomes look identical in `pg_stat_activity`, because `state = 'active'`
+covers all three and there are no wait events on this server.
+
+```
+statement active past a threshold
+├─ its threads are at ~0% CPU
+│  └─ did several statements start within a second of each other?    -> BLOCKED (a convoy)
+│     the `convoy` finding fires on this. There is no lock view, so agreeing
+│     start times are the whole signal: independent clients do not agree to
+│     the second. Look at the oldest member; if a FORCE CHECKPOINT is among
+│     them, cancel that first - it holds start_transaction_lock, which stops
+│     EVERY new transaction, and it IS interruptible
+├─ CPU near 100% of a core, voluntary switches < 50 per cpu-second      -> SPIN
+│  the `spin_suspected` finding. Confirm with two perf captures minutes
+│  apart: one symbol dominant and NO change between them. A spin cannot be
+│  cancelled if its loop never polls - pg_terminate_backend returns true and
+│  nothing stops - so the remedy is a restart, not a timeout
+└─ CPU high AND the profile changes between captures                   -> genuinely slow
+   read the profile for where the time goes, and `explain(pid=...)` for what
+   the planner chose
+```
+
+`activity` gives you the ages, `threads` the per-thread CPU, `profile` and `callgraph` the symbols,
+`explain(pid=...)` the plan. Gather all of them before choosing a branch: on the 46-hour incident
+`EXPLAIN` was identical either side of the change that triggered it, so starting there gives you
+"the plan is fine, it must be data volume", which is wrong and sounds researched.
+
+### Checkpointing is not happening
+
+```
+WAL / database ratio above 1
+├─ is a CHECKPOINT in pg_stat_activity?
+│  ├─ FORCE  -> it is WAITING, not working. It waits for active transactions
+│  │           rather than aborting them, holds start_transaction_lock the
+│  │           whole time (so nothing new starts, reads included), and
+│  │           busy-spins a core. Cancel it: interruptible, and it releases
+│  │           everything queued behind it
+│  └─ plain  -> a plain CHECKPOINT errors rather than waits, so one that is
+│              still active is doing real work
+└─ none      -> nothing is trying. The blocker is the oldest open statement,
+                READS INCLUDED -> go to the first tree with that statement
+```
+
+### The profile is unreadable
+
+```
+symbols are hex
+├─ is the capture's build-id registered?
+│  ├─ no  -> does the container bind-mount a binary over the image's?
+│  │        if so register THAT (no copy, no root, and it is by construction
+│  │        the binary in the profile); otherwise docker cp and register
+│  └─ yes -> does that copy have any symbols at all?
+│            zero means it is stripped, and registering it again cannot help.
+│            A matching build-id is not enough
+```
+
+The `d` screen checks all of this and offers the fix as a keypress.
+
+### Index maintenance is falling behind
+
+```
+refresh/compaction/cleanup pending WHILE one is active   -> arriving faster than it retires
+num_docs - num_live_docs climbing                        -> deletions accumulating
+```
+
+Both from `sdb_metrics`, per index. The deletion count is also the exposure gauge for a known hang -
+see the `bm25_exposure` finding - and it fires at ANY deletion, because twelve documents out of 14.6
+million was the entire trigger.
+
 ## What the panels do not cover, and where to get it
 
 These are the queries worth reaching for. The first four are now behind tools — read those first and come back here when you need a column the tool does not carry, or the same number twice to see it move.

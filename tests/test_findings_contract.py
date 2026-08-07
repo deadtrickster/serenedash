@@ -197,3 +197,38 @@ def test_exposure_is_silent_when_the_metrics_are_unavailable():
     from serenedash import snapshot as sn
     assert sn.bm25_exposure(None) == []
     assert sn.bm25_exposure({"available": False, "reason": "sdb_metrics could not be read"}) == []
+
+
+def test_a_spin_is_told_from_a_block_by_yielding_not_by_cpu():
+    """CPU cannot separate them and neither can the thread count. A loop that never blocks never
+    yields, so voluntary switches per cpu-second collapse toward zero - 13 on the 55-hour hang -
+    while anything waiting on IO, a lock or a condvar reads in the thousands."""
+    from serenedash import snapshot as sn
+    spin = sn.spin_suspected({"volps": [12.0, 13.0, 13.0]}, 503)
+    assert len(spin) == 1 and spin[0]["switches_per_cpu_s"] == 13.0
+    assert spin[0]["cpu_cores_busy"] == 5.0
+    assert sn.spin_suspected({"volps": [3000, 2800, 3100]}, 503) == [], "blocked work is not a spin"
+
+
+def test_an_idle_server_is_not_a_spin():
+    # Zero switches and zero CPU is a server doing nothing, which trips a switches-only rule.
+    from serenedash import snapshot as sn
+    assert sn.spin_suspected({"volps": [0, 0, 0]}, 4) == []
+
+
+def test_one_sample_is_not_enough_to_call_a_spin():
+    from serenedash import snapshot as sn
+    assert sn.spin_suspected({"volps": [1.0, 2.0]}, 503) == [], "a tick can catch anything mid-yield"
+    assert sn.spin_suspected({}, 503) == []
+    assert sn.spin_suspected(None, 503) == []
+
+
+def test_the_spin_finding_reports_a_shape_and_not_a_cause():
+    # A tight loop doing useful arithmetic looks identical. Naming a cause here would be the same
+    # error as the checkpoint finding's "the horizon keeps being re-pinned" - a plausible mechanism
+    # asserted from a measurement that does not reach it.
+    from serenedash import snapshot as sn
+    f = sn.spin_suspected({"volps": [1.0, 1.0, 1.0]}, 200)[0]
+    assert "SHAPE, NOT A CAUSE" in f["detail"]
+    assert f["threshold_is_chosen"] is True
+    assert "perf-snap" in f["fix"], "it has to name the measurement that would settle it"

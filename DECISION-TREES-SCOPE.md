@@ -109,6 +109,35 @@ The BM25 one is the most valuable and the most dangerous: it is a *predictive* f
 server is exposed to a known hang" - not an observation. It must say so, and it must name the
 version range, or it becomes noise the day the bug is fixed.
 
+## Status
+
+Phases 1-3 are done (2026-08-07). What shipped and what it cost:
+
+| item | state |
+|---|---|
+| `convoy` finding | done - fires on 3+ statements whose ages agree within 2s |
+| `bm25_exposure` finding | done - fires at ANY deletion, says it has 1 ingredient of 3 |
+| `spin_suspected` finding | done - needed a new collector: voluntary switches per cpu-second |
+| `index_maintenance_behind` | already existed as `search {kind} queue behind a running {kind}` |
+| trees into `instructions.md` | done - four trees, discriminator named at each branch |
+| `triage(pid=)` tool | done - executes the first tree, returns verdict + evidence + what would settle it |
+
+Two things learned building it, both worth keeping:
+
+**The index DDL is not readable.** `bm25_exposure` was meant to check two ingredients - deletions
+AND a top-k scorer on the index. It cannot: `pg_indexes.indexdef` is empty and
+`duckdb_indexes().sql` normalises the definition to `USING inverted ()`, dropping the WITH clause.
+So the finding reports one ingredient of three and names the EXPLAIN that checks the rest, rather
+than implying a diagnosis it does not have.
+
+**The spin rule needed a collector, not a rule.** Voluntary context switches per cpu-second is the
+only cheap signal that separates a spin from a block, `perf-snap.sh` has bucketed on it for months,
+and the dashboard never read it. The rule itself is four lines; the collection and the rate were the
+work.
+
+Remaining: trees B-E exist in the guide but only B and D have findings behind them. Tree C is
+implemented in the doctor screen and is documentation only.
+
 ## Proposed order
 
 1. **Findings first** (`snapshot.py`): `convoy`, `spin_suspected`, `bm25_exposure`,

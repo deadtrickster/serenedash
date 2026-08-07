@@ -475,6 +475,7 @@ def main():
     # frame for a move that lands on the same row saying the same thing is pure heat.
     mouse = cfg["mouse"] and not a.once and sys.stdout.isatty()
     tip, tipkey, tipon, tipage, mpos = None, None, False, 0, (0, 0)
+    vprev = None                     # (voluntary switch count, when) for the rate above
     hpid = host_pid(cfg)
     # Prime the tick counters before the first frame. Percentages are deltas, so a cold start has
     # nothing to subtract from and the panel came up empty — for the whole of a first tick that also
@@ -572,6 +573,18 @@ def main():
                 if hpid:
                     thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast)
                 hinfo = hostinfo(hpid, cfg["container"])
+                # Voluntary switches per cpu-second: the signal that tells a spin from a block.
+                # A rate, so it needs two samples and the interval between them - which only this
+                # loop knows. tcpu is a share of ONE core, so tcpu/100 * dt is the cpu-seconds the
+                # process actually consumed over the tick, and the ratio is independent of how many
+                # threads were busy.
+                vol, vnow = hinfo.get("vol_switches") or 0, time.time()
+                if vprev and vol >= vprev[0] and vnow > vprev[1]:
+                    cpu_s = (tcpu / 100.0) * (vnow - vprev[1])
+                    hist["volps"] = (hist.get("volps", [])
+                                     + [round((vol - vprev[0]) / cpu_s, 1) if cpu_s > 0.05
+                                        else 0.0])[-HIST:]
+                vprev = (vol, vnow)
                 for key, val in (("cpu", tcpu), ("rss", hinfo.get("rss") or 0),
                                  ("swap", hinfo.get("swap") or 0)):
                     hist[key] = (hist.get(key, []) + [val])[-HIST:]
