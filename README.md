@@ -68,7 +68,7 @@ the right heading.
 |---|---|
 | storage | database vs WAL size, and the **ratio** — a WAL several times the database means checkpointing has stalled, not that the WAL is big. Temp files older than the process are counted as `orphaned`, not as spill |
 | memory | `duckdb_memory()` by pool with a history trace each, plus RSS and **swap** — a store reporting 34 GB of buffers while 30 GB of it is paged out looks fine until you see that row |
-| activity | live query text from `pg_stat_activity`; **and** it says so when nothing is running, because a pinned core with no session is orphaned server-side work. `enter` opens a statement whole, `e` plans it - see below |
+| activity | live query text from `pg_stat_activity`; **and** it says so when nothing is running, because a pinned core with no session is orphaned server-side work. Maintenance is named rather than counted as a long query - a 7h compaction and a 7h hang are not the same row. `enter` opens a statement whole, `e` plans it - see below |
 | threads | total process CPU against every core, then the threads carrying it. 100% of one core reads as 4% at process level and as a pinned thread here. Rows are identified by tid — 103 of serened's 107 threads inherit the process name |
 | profile | sampled symbols by engine over a sliding window of captures, joined per thread so a row says what it is running |
 | search | the inverted indexes: segments, live against deleted documents, buffered writes not yet searchable, and how long commits and consolidations are taking. A rising pending queue is maintenance falling behind the write rate |
@@ -124,6 +124,15 @@ the tooltip and the MCP `findings` carry what was measured, what was expected, a
 Samples are also written to `<perf_dir>/history.jsonl` as the dashboard runs, so the baseline
 outlives a restart and the MCP server (a different process, one instant per call) has something to
 judge against. Under 24 samples nothing speaks, and it says that rather than reporting all clear.
+
+What is recorded: CPU, `duckdb_memory()` in total and per pool, RSS, swap, the WAL, and per index
+the deleted-document count, segment count and average consolidation time. The last three earn their
+place because they are only meaningful as events. `avg_consolidation_time_ms` is a *rolling*
+average - a `VACUUM (COMPACT_TABLE)` that ran 7h20m pushed it to 405,762 and two hours later it read
+1,327, so nothing looking at the live value could tell you it had happened. Deleted documents went
+0 to 12 and back over one incident, and twelve out of 14.6 million was the entire precondition for
+the hang that incident was about. A level you read live answers "how is it now"; only a recorded
+series answers "when did this start".
 
 ## MCP
 
