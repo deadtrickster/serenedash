@@ -60,3 +60,36 @@ def test_load_returns_the_tail_not_the_head(tmp_path):
     for i in range(50):
         history.append(d, float(i), {"mem": i})
     assert history.load(d, limit=10)["mem"] == list(range(40, 50))
+
+
+def test_the_search_engine_series_are_recorded():
+    """cpu/mem/rss/swap and the memory pools were the whole recorded set. Everything from
+    sdb_metrics was read live and thrown away, and two of those are only meaningful as events:
+
+    - avg_consolidation_time_ms is a ROLLING average. A 7h20m VACUUM (COMPACT_TABLE) pushed it to
+      405,762 and two hours later it read 1,327 - the seven hours were unrecoverable.
+    - deleted_docs is the precondition for the mask/max-score hang; 12 out of 14.6M documents is the
+      whole trigger, and it went 0 -> 12 -> 0 across the incident with nothing keeping it.
+
+    Plus the WAL, which went 16 MB -> 42.5 GB -> 0 and is the number that says checkpointing stopped.
+    """
+    import inspect
+    from serenedash import tui
+    src = inspect.getsource(tui)
+    assert 'hist["wal"]' in src, "the WAL is not recorded"
+    assert 'f"ix:{rel}:{name}"' in src, "the per-index series are not recorded"
+    for metric in ("deleted", "consolidation_ms", "segments"):
+        assert f'"{metric}"' in src, f"{metric} is not recorded"
+    # Per index, not summed: a total hides which index moved, and the metrics have relation_id.
+    assert "(sea or {}).get(\"indexes\", {}).items()" in src
+
+
+def test_a_missing_metric_does_not_record_a_negative_deletion():
+    # num_docs and num_live_docs are read independently, and _num returns -1 for unknown. Without a
+    # floor, one missing metric records deleted = -1 or a large negative, which the anomaly rules
+    # would then happily call a step change.
+    import inspect
+    from serenedash import tui
+    src = inspect.getsource(tui)
+    i = src.index('f"ix:{rel}:{name}"')
+    assert "max(0, val)" in src[i:i + 200], "an unknown metric must not record as negative"

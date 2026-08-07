@@ -34,6 +34,7 @@ from .db import (
     temp_files_held,
     terminate,
 )
+from .snapshot import _num
 from .system import SLOW_EVERY, host_pid, hostinfo, slow, threads
 from .perf import callstacks, perf_window
 from .symbols import extract_container_binary, doctor, register_symbols
@@ -561,6 +562,12 @@ def main():
                 lrows, lsrc, lwhy = _logs.tail(cfg, 400)
             if fresh:
                 perf = perf_window(a.perf_dir)
+                # Re-resolve when the process we were watching is gone. `hpid or host_pid(cfg)`
+                # alone caches the first answer forever, so after the server is restarted the
+                # dashboard follows a dead pid: every /proc read fails and every thread and memory
+                # number reads zero, for as long as it is left running. One stat per tick.
+                if hpid and not os.path.exists(f"/proc/{hpid}"):
+                    hpid, tprev, tlast = None, {}, 0.0
                 hpid = hpid or host_pid(cfg)
                 if hpid:
                     thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast)
@@ -568,6 +575,21 @@ def main():
                 for key, val in (("cpu", tcpu), ("rss", hinfo.get("rss") or 0),
                                  ("swap", hinfo.get("swap") or 0)):
                     hist[key] = (hist.get(key, []) + [val])[-HIST:]
+                # The search engine's own numbers, and the WAL. These were read live and never
+                # kept, which is fine for a level and useless for an event: avg_consolidation_time
+                # is a ROLLING average, so a 7h20m compaction showed as 405,762 and had decayed to
+                # 1,327 two hours later with nothing able to say it happened. deleted_docs is the
+                # precondition for the mask/max-score hang and went 0 -> 12 -> 0 unrecorded. Per
+                # index, because a sum across indexes hides the one that moved.
+                if s is not None:
+                    hist["wal"] = (hist.get("wal", []) + [s.get("wal") or 0])[-HIST:]
+                for rel, m in sorted((sea or {}).get("indexes", {}).items()):
+                    for name, val in (("deleted", _num(m.get("num_docs"))
+                                       - _num(m.get("num_live_docs"))),
+                                      ("consolidation_ms", _num(m.get("avg_consolidation_time_ms"))),
+                                      ("segments", _num(m.get("num_segments")))):
+                        k = f"ix:{rel}:{name}"
+                        hist[k] = (hist.get(k, []) + [max(0, val)])[-HIST:]
                 # On disk as well as in memory. The in-memory window is a bit over two hours and
                 # dies with the process, which makes it a poor baseline for the anomaly rules and
                 # no use at all to the MCP server, which is a different process entirely.

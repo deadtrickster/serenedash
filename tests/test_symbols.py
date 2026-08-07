@@ -158,3 +158,36 @@ def test_the_cache_path_is_returned_so_what_is_in_it_can_be_checked(tmp_path):
     got = symbols.buildid_cached_path(bid, str(tmp_path))
     assert got and got.endswith("elf"), "without the path, 'registered' cannot be checked"
     assert symbols.buildid_cached_path("ff" + "e" * 38, str(tmp_path)) is None
+
+
+# ── the watched process going away ───────────────────────────────────────────────────────────────
+
+
+def test_threads_returns_the_same_shape_when_the_process_is_gone():
+    """It did not, and restarting the server killed the dashboard.
+
+    The happy path returns (rows, total, cur, now). The OSError path returned (rows, cur, prev_t) -
+    three values, and `cur` sitting where `total` belongs. main() unpacks four, so the moment the
+    watched pid disappeared the whole process died with "not enough values to unpack (expected 4,
+    got 3)" rather than drawing a panel with no threads in it.
+    """
+    from serenedash.system import threads
+    gone = threads(2 ** 31 - 1, {"1": 5}, 1000.0)          # a pid that cannot exist
+    assert len(gone) == 4, "the error path must return what the caller unpacks"
+    rows, total, cur, when = gone
+    assert rows == [] and total == 0.0
+    assert isinstance(cur, dict), "third element is the counter map, as on the happy path"
+    assert when == 1000.0, "and the clock is carried through, not reset"
+
+
+def test_the_dashboard_re_resolves_a_pid_that_has_gone_away():
+    # `hpid = hpid or host_pid(cfg)` caches the first answer for the life of the process, so after
+    # the server is restarted the dashboard follows a dead pid and every /proc number reads zero -
+    # silently, for as long as it is left up.
+    import inspect
+    from serenedash import tui
+    src = inspect.getsource(tui)
+    assert 'not os.path.exists(f"/proc/{hpid}")' in src, "a stale pid is never noticed"
+    i = src.index('not os.path.exists(f"/proc/{hpid}")')
+    after = src[i:i + 400]
+    assert "hpid, tprev, tlast = None" in after, "and its counters have to be dropped with it"

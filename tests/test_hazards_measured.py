@@ -123,3 +123,28 @@ def test_writers_reads_the_head_only():
     assert _writers(s(queries=[("active", "  UPDATE t SET a = 1", 20)])) == 1
     assert _writers(s(queries=[("active", "", 0)])) == 0
     assert _writers({}) == 0
+
+
+def test_maintenance_is_not_reported_like_an_abandoned_statement():
+    """A 7h20m VACUUM (COMPACT_TABLE) and a 55-hour hang drew the same row: "statement running
+    for 7h". They want opposite responses - one is working, one cannot be stopped without a restart
+    - and rendering them identically is how the row that matters gets skimmed past."""
+    from serenedash import snapshot as sn
+    rows = [("active", "VACUUM (COMPACT_TABLE) ragflow_x", 31, 26400, 26500, "395", "", ""),
+            ("active", "FORCE CHECKPOINT", 16, 45000, 45000, "491", "", ""),
+            ("active", "WITH lex AS (SELECT id, BM25(", 68209, 199000, 199000, "126", "", "")]
+    got = sn.long_running({"queries": rows})
+    by_pid = {f["pid"]: f for f in got}
+    assert by_pid["395"]["maintenance"] is True
+    assert by_pid["395"]["what"].startswith("VACUUM running for")
+    assert by_pid["491"]["maintenance"] is True
+    assert by_pid["126"]["maintenance"] is False
+    assert by_pid["126"]["what"].startswith("statement running for")
+
+
+def test_the_keyword_survives_leading_punctuation_and_case():
+    from serenedash import snapshot as sn
+    for q, chore in (("(VACUUM (COMPACT_TABLE) t", True), ("vacuum analyze t", True),
+                     ("  Checkpoint", True), ("select 1", False), ("", False)):
+        got = sn.long_running({"queries": [("active", q, 9, 99999, 99999, "1", "", "")]})
+        assert got and got[0]["maintenance"] is chore, f"{q!r} classified wrong"

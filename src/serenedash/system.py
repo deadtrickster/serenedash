@@ -234,7 +234,11 @@ def threads(pid, prev, prev_t):
             except (OSError, IndexError, ValueError):
                 continue
     except OSError:
-        return [], cur, prev_t
+        # The process went away mid-scan - it was restarted, or it died. Four values, in the same
+        # order as the normal return: this path returned three, in a different order, and the caller
+        # unpacks four, so the dashboard did not degrade here, it crashed with
+        # "not enough values to unpack" the moment the server it watches was restarted.
+        return [], 0.0, cur, prev_t
     now = time.time()
     dt = now - prev_t if prev_t else 0.0
     total = 0.0

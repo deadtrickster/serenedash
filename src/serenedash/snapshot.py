@@ -31,6 +31,10 @@ CONSOLIDATION_MS = 1000
 # to against index_size so the number can be argued with rather than trusted.
 DELETED_SHARE = 0.10
 
+# Maintenance runs as an ordinary statement here, so a long compaction and a hung query arrive as
+# the same row. They want opposite responses, so the leading keyword is used to separate them.
+MAINTENANCE = ("vacuum", "checkpoint", "force", "analyze", "reindex")
+
 
 def temp_split(sz, host):
     """Live spill vs files older than the process. The split, not the sum.
@@ -510,9 +514,15 @@ def long_running(s):
         who = " · ".join(x for x in (f"pid {pid}" if pid else "",
                                      f"from {addr}" if addr else "",
                                      f"app {app}" if app else "") if x)
+        # The leading keyword, so a compaction is not reported the way an abandoned SELECT is.
+        word = (row[1] or "").strip().lstrip("(").split(None, 1)
+        word = word[0].lower() if word else ""
+        chore = word in MAINTENANCE
         out.append({
             "kind": "activity",
-            "what": f"statement running for {human_time(age)}",
+            "maintenance": chore,
+            "what": (f"{word.upper()} running for {human_time(age)}" if chore
+                     else f"statement running for {human_time(age)}"),
             "detail": f"active for {human_time(age)}"
                       + (f" on a connection {human_time(conn)} old, so a pool rather than a person "
                          f"is holding it - the shape an abandoned request leaves behind" if pooled
