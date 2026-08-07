@@ -115,3 +115,85 @@ def test_a_finding_reads_nothing_it_was_not_given():
                      ("search_findings", lambda: snapshot.search_findings(None)),
                      ("setup_findings", lambda: snapshot.setup_findings([], None))):
         assert fn() == [], f"{name} invented a finding from nothing"
+
+
+# ── decision trees, phase 1 ──────────────────────────────────────────────────────────────────────
+
+REAL_CONVOY = [
+    ("active", "WITH lex AS (SELECT id, BM25(", 68209, 199000, 199000, "1265771991", "", ""),
+    ("active", "WITH lex AS (SELECT id, BM25(", 68209, 198910, 198910, "1711618162", "", ""),
+    ("active", "FORCE CHECKPOINT", 16, 42564, 42564, "491336051", "", ""),
+    ("active", "SELECT count(*) FROM ragflow_x", 44, 42564, 42564, "1558815683", "", ""),
+    ("active", "CREATE INDEX IF NOT EXISTS idx_x", 260, 42563, 42563, "2119928374", "", ""),
+    ("active", "CREATE INDEX IF NOT EXISTS idx_x", 260, 42563, 42563, "360567690", "", ""),
+]
+
+
+def test_a_convoy_is_recognised_by_agreeing_start_times():
+    """The real one: four statements within 166 ms of a FORCE CHECKPOINT taking
+    start_transaction_lock, then stuck 11.8 hours. There is no lock view on this server, so the
+    only signal that these are one pile-up rather than four slow queries is that independent
+    clients do not agree on a start time to the second."""
+    from serenedash import snapshot as sn
+    got = sn.convoy({"queries": REAL_CONVOY})
+    assert len(got) == 1, "one finding per convoy, not one per member"
+    f = got[0]
+    assert set(f["pids"]) == {"491336051", "1558815683", "2119928374", "360567690"}
+    # The two 55-hour spinners started 90s apart and 43 hours earlier: not part of this convoy.
+    assert "1265771991" not in f["pids"]
+    assert f["statement_kinds"][0] == "FORCE"
+
+
+def test_the_convoy_finding_does_not_name_a_blocker():
+    # There is no lock view. Saying "blocked by pid X" would be inference dressed as measurement -
+    # the finding gives the set and the ordering and lets the reader draw the conclusion.
+    from serenedash import snapshot as sn
+    f = sn.convoy({"queries": REAL_CONVOY})[0]
+    assert "blocked_by" not in f
+    assert "cannot be named from SQL" in f["detail"]
+
+
+def test_ordinary_traffic_is_not_a_convoy():
+    from serenedash import snapshot as sn
+    # Three statements at the same age but young: a burst, not a pile-up.
+    young = [("active", f"select {i}", 9, 5, 5, str(i), "", "") for i in range(4)]
+    assert sn.convoy({"queries": young}) == []
+    # Three old statements that did NOT start together.
+    apart = [("active", f"select {i}", 9, 3600 * i + 3600, 9999, str(i), "", "") for i in range(4)]
+    assert sn.convoy({"queries": apart}) == []
+    # Two is not a convoy.
+    pair = [("active", f"select {i}", 9, 5000, 5000, str(i), "", "") for i in range(2)]
+    assert sn.convoy({"queries": pair}) == []
+
+
+def test_exposure_fires_on_any_deletion_not_on_a_share():
+    """Twelve documents out of 14.6 million - 0.00008% - was the entire trigger. The existing
+    'deleted documents not reclaimed' finding is about wasted space and has a 10% threshold; this
+    one is about a hang and must have none."""
+    from serenedash import snapshot as sn
+    sr = {"available": True, "indexes": [
+        {"relation_id": "2000801", "deleted_docs": 12, "num_docs": 14621592, "num_segments": 22},
+        {"relation_id": "2000422", "deleted_docs": 0, "num_docs": 247665, "num_segments": 1}]}
+    got = sn.bm25_exposure(sr)
+    assert [f["relation_id"] for f in got] == ["2000801"], "a clean index must not be flagged"
+    assert got[0]["deleted_docs"] == 12
+
+
+def test_exposure_says_how_much_of_the_diagnosis_it_actually_has():
+    # The hang needs three ingredients and only one is readable here: the index DDL is not
+    # recoverable (pg_indexes.indexdef is empty, duckdb_indexes() drops the WITH clause) and nothing
+    # reports query shapes. A finding claiming the other two would be asserting what it did not
+    # measure - the failure this whole file exists to prevent.
+    from serenedash import snapshot as sn
+    f = sn.bm25_exposure({"available": True, "indexes": [
+        {"relation_id": "1", "deleted_docs": 1, "num_docs": 10, "num_segments": 2}]})[0]
+    assert f["ingredients_checked"] == 1 and f["ingredients_total"] == 3
+    assert "not readable from this server" in f["detail"]
+    assert "Exposure, not a fault" in f["detail"]
+    assert "EXPLAIN" in f["fix"], "and it has to say how to check the ones it cannot"
+
+
+def test_exposure_is_silent_when_the_metrics_are_unavailable():
+    from serenedash import snapshot as sn
+    assert sn.bm25_exposure(None) == []
+    assert sn.bm25_exposure({"available": False, "reason": "sdb_metrics could not be read"}) == []

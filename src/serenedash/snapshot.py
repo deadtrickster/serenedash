@@ -35,6 +35,15 @@ DELETED_SHARE = 0.10
 # the same row. They want opposite responses, so the leading keyword is used to separate them.
 MAINTENANCE = ("vacuum", "checkpoint", "force", "analyze", "reindex")
 
+# A convoy is statements that all began within this many seconds of each other. CHOSEN, but not
+# arbitrary: the four that piled up behind a FORCE CHECKPOINT here started within 166 ms, because
+# they were not independent arrivals - they were released, or blocked, by one event. Independent
+# clients do not agree on a start time to the second.
+CONVOY_SPREAD_S = 2
+# And they have to have been there a while, or every burst of normal traffic is a convoy.
+CONVOY_MIN_AGE_S = 60
+CONVOY_MIN = 3
+
 
 def temp_split(sz, host):
     """Live spill vs files older than the process. The split, not the sum.
@@ -672,6 +681,110 @@ def search_findings(sr):
     return out
 
 
+def convoy(s):
+    """Active statements that all started within a moment of each other and none has moved since.
+
+    This server has no lock view - `pg_locks` returns 0 rows - so nothing can say "X is blocked by
+    Y". What it does have is start times, and independent clients do not agree on one to the second.
+    Four statements arriving within 166 ms and then sitting for 11.8 hours were not four slow
+    queries; they were one holder and three waiters, and the shape is visible without a lock view.
+
+    Deliberately does NOT name the blocker. The oldest member is the likeliest holder and saying so
+    would be inference presented as measurement - the finding gives the set and the ordering and
+    lets the reader draw it.
+    """
+    rows = [r for r in (s or {}).get("queries", [])
+            if len(r) > 3 and r[0] == "active" and "pg_stat_activity" not in r[1]
+            and (r[3] or 0) >= CONVOY_MIN_AGE_S]
+    out = []
+    for anchor in sorted(rows, key=lambda r: -(r[3] or 0)):
+        # Ages, not timestamps: `age` is seconds-since-start, so two statements that began together
+        # have ages that agree. Same comparison, and it survives a server whose clock is not ours.
+        near = [r for r in rows if abs((r[3] or 0) - (anchor[3] or 0)) <= CONVOY_SPREAD_S]
+        if len(near) < CONVOY_MIN:
+            continue
+        near.sort(key=lambda r: -(r[3] or 0))
+        pids = [r[5] for r in near if len(r) > 5 and r[5]]
+        kinds = [((r[1] or "").strip().lstrip("(").split(None, 1) or [""])[0].upper()
+                 for r in near]
+        out.append({
+            "kind": "activity",
+            "what": f"{len(near)} statements started within {CONVOY_SPREAD_S}s of each other and "
+                    f"none has finished",
+            "detail": f"all {len(near)} have been active for about "
+                      f"{human_time(near[0][3])}, and their start times agree to within "
+                      f"{CONVOY_SPREAD_S}s: {', '.join(kinds)}. Independent clients do not agree on "
+                      f"a start time that closely, so this is one event releasing or blocking them "
+                      f"together rather than several slow statements. This server has NO lock view "
+                      f"- pg_locks returns 0 rows - so the holder cannot be named from SQL; the "
+                      f"oldest member is where to look first. Note a FORCE CHECKPOINT holds "
+                      f"start_transaction_lock for its whole wait, which stops EVERY new "
+                      f"transaction, reads included.",
+            "pids": pids,
+            "statement_kinds": kinds,
+            "oldest_age_s": near[0][3],
+            "spread_s": CONVOY_SPREAD_S,
+            "threshold_is_chosen": True,
+            "fix": "find what the oldest one is waiting for. If a FORCE CHECKPOINT is among them, "
+                   "cancelling it is safe and releases the rest - it is interruptible, unlike a "
+                   "statement spinning in a loop that never polls.",
+            "verify": "select pid, state, query_start, "
+                      "round(extract(epoch from (now()-query_start))) age_s, query "
+                      "from pg_stat_activity where state = 'active' order by query_start",
+        })
+        break                        # one finding per convoy, anchored on the oldest
+    return out
+
+
+def bm25_exposure(sr):
+    """Deleted documents in an inverted index: one of the three ingredients of a known hang.
+
+    Deliberately narrow about what it claims. The hang needs a top-k scorer on the index, a query
+    with more than one term, and at least one deleted document. Only the third is readable here -
+    the index DDL is NOT recoverable from this server (pg_indexes.indexdef is empty and
+    duckdb_indexes().sql normalises the definition to `USING inverted ()`, dropping the WITH
+    clause), and nothing reports the shape of queries that have run. So this reports exposure, names
+    the two conditions it cannot check, and says how to check them.
+
+    Fires at ANY deletion rather than at a share, because twelve documents out of 14.6 million was
+    the whole trigger. The existing "deleted documents not reclaimed" finding is about wasted space
+    and has a 10% threshold; this is about a hang and has none.
+    """
+    out = []
+    for ix in (sr or {}).get("indexes", []) if (sr or {}).get("available") else []:
+        deleted = ix.get("deleted_docs") or 0
+        if deleted <= 0:
+            continue
+        out.append({
+            "kind": "search",
+            "what": f"search index {ix['relation_id']}: {deleted:,} deleted document(s), which arms "
+                    f"a known hang",
+            "detail": f"{deleted:,} of {ix.get('num_docs'):,} documents are deleted but still in the "
+                      f"index, so the segment carries a docs_mask. On 26.07.x/26.08.0 a mask over a "
+                      f"top-k (WAND) iterator makes a multi-term ranked query spin forever - it "
+                      f"cannot be cancelled and only a restart clears it. THIS FINDING CHECKS ONE "
+                      f"OF THREE INGREDIENTS. The other two are not readable from this server: "
+                      f"whether the index has a top-k scorer (the DDL is not recoverable - "
+                      f"pg_indexes.indexdef is empty and duckdb_indexes() drops the WITH clause), "
+                      f"and whether anything issues multi-term ranked queries against it. Exposure, "
+                      f"not a fault.",
+            "relation_id": ix["relation_id"],
+            "deleted_docs": deleted,
+            "num_docs": ix.get("num_docs"),
+            "num_segments": ix.get("num_segments"),
+            "ingredients_checked": 1,
+            "ingredients_total": 3,
+            "fix": "EXPLAIN a ranked query against this index: `Score: bm25(...)` in the "
+                   "IRESEARCH_SCAN node means the top-k scorer is present and you are exposed. "
+                   "Removing optimize_top_k from the index definition removes the exposure "
+                   "permanently; compaction clears it only until the next upsert, and measured 7h20m "
+                   "on a 77 GB index.",
+            "verify": "select relation_id, metric, value from sdb_metrics "
+                      "where metric in ('num_docs', 'num_live_docs')",
+        })
+    return out
+
+
 def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
     """Conditions that were MEASURED, each with the numbers behind it and how to check it.
 
@@ -759,6 +872,8 @@ def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
     out.extend(cpu_burn(s, host, tcpu))
     out.extend(checkpoint_waiting(s))
     out.extend({"kind": "search", **f} for f in search_findings(sr))
+    out.extend(bm25_exposure(sr))
+    out.extend(convoy(s))
     # Everything above is a comparison against a threshold that someone chose. These are against
     # the series' own recent past, so they catch the shapes no threshold can: a pool that has been
     # climbing all afternoon is not over any limit until it is.
