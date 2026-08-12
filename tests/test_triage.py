@@ -28,13 +28,13 @@ def evidence(monkeypatch):
         monkeypatch.setattr(m.system, "host_pid", lambda _cfg: 4242)
         calls = {"n": 0}
 
-        def hostinfo(_pid, _c):
+        def hostinfo(_pid, _c, root="/proc"):
             calls["n"] += 1
             return {"pid": 4242, "vol_switches": 0 if calls["n"] == 1 else vol_delta}
         monkeypatch.setattr(m.system, "hostinfo", hostinfo)
         # (rows, total, cur, now) - second call carries the cpu and a 1s interval.
         seq = iter([([], 0.0, {}, 100.0), ([], cpu, {}, 101.0)])
-        monkeypatch.setattr(m.system, "threads", lambda *a: next(seq))
+        monkeypatch.setattr(m.system, "threads", lambda *a, **kw: next(seq))
         monkeypatch.setattr(m.time, "sleep", lambda _s: None)
     return setup
 

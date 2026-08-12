@@ -52,19 +52,41 @@ def sysctl(name, root="/proc/sys"):
         return None
 
 
-def hostinfo(pid, container):
+def cpu_count(root="/proc"):
+    """Cores of the machine the SERVER runs on.
+
+    `os.cpu_count()` answers for this process, which is the wrong machine as soon as the server is
+    in a VM - and this number is the denominator under every thread percentage on the screen. A
+    thread at 100% of one core reads as 4% of a 24-core workstation and 25% of a 4-core guest, and
+    only one of those is the machine the work is happening on.
+    """
+    if root == "/proc":
+        return os.cpu_count() or 0
+    try:
+        with open(os.path.join(root, "cpuinfo")) as f:
+            n = sum(1 for ln in f if ln.startswith("processor"))
+        return n or os.cpu_count() or 0
+    except OSError:
+        return os.cpu_count() or 0
+
+
+def hostinfo(pid, container, root="/proc"):
     """The facts every other panel quietly assumes, and none of them state.
 
     A thread at 100% is 100% of ONE core — meaningless without the core count. `threads 24` is the
     store's setting, not how many OS threads exist (107 here, because pools, jemalloc and the wire
     layer all add their own). RSS is the number the OOM killer reads, which is not the number
     `duckdb_memory()` reports. All of it is free: three small reads under /proc.
+
+    `root` is where the server's /proc lives - this machine's unless the server is on another
+    kernel, in which case every number below would otherwise describe the wrong machine while
+    looking entirely healthy.
     """
-    d = {"container": container, "pid": pid, "cores": os.cpu_count() or 0, "load": [], "rss": 0,
+    d = {"container": container, "pid": pid, "cores": cpu_count(root), "load": [], "rss": 0,
          "threads": 0, "peak": 0, "swap": 0, "ram_total": 0, "vol_switches": 0,
          "nonvol_switches": 0}
     try:
-        with open("/proc/loadavg") as f:
+        with open(os.path.join(root, "loadavg")) as f:
             d["load"] = f.read().split()[:3]
     except OSError:
         pass
@@ -74,7 +96,7 @@ def hostinfo(pid, container):
     try:
         want = {"MemTotal:": "ram_total", "MemAvailable:": "ram_avail",
                 "SwapTotal:": "swap_total", "SwapFree:": "swap_free"}
-        with open("/proc/meminfo") as f:
+        with open(os.path.join(root, "meminfo")) as f:
             for ln in f:
                 k = ln.split(None, 1)[0] if ln else ""
                 if k in want:
@@ -83,7 +105,7 @@ def hostinfo(pid, container):
         pass
     if pid:
         try:
-            d["threads"] = len(os.listdir(f"/proc/{pid}/task"))
+            d["threads"] = len(os.listdir(f"{root}/{pid}/task"))
         except OSError:
             pass
         # RSS, its high-water mark, and swap. Swap is the one that changes a reading: a store that
@@ -92,7 +114,7 @@ def hostinfo(pid, container):
         # disk read that no query plan, cache-hit ratio or memory_limit will show you.
         try:
             want = {"VmRSS:": "rss", "VmHWM:": "peak", "VmSwap:": "swap"}
-            with open(f"/proc/{pid}/status") as f:
+            with open(f"{root}/{pid}/status") as f:
                 for ln in f:
                     k = ln.split(None, 1)[0] if ln else ""
                     if k in want:
@@ -109,7 +131,7 @@ def hostinfo(pid, container):
         # only on some kernels and the leader is usually the one thread NOT doing the work.
         try:
             vol = nonvol = 0
-            for t in os.scandir(f"/proc/{pid}/task"):
+            for t in os.scandir(f"{root}/{pid}/task"):
                 try:
                     with open(f"{t.path}/status") as f:
                         for ln in f:
@@ -126,9 +148,9 @@ def hostinfo(pid, container):
         # half of the subtraction. Worth having: "the WAL has not checkpointed in two days" reads
         # differently against a process that started an hour ago.
         try:
-            with open(f"/proc/{pid}/stat") as f:
+            with open(f"{root}/{pid}/stat") as f:
                 start = int(f.read().rsplit(") ", 1)[1].split()[19])
-            with open("/proc/uptime") as f:
+            with open(os.path.join(root, "uptime")) as f:
                 d["uptime"] = max(0.0, float(f.read().split()[0]) - start / os.sysconf("SC_CLK_TCK"))
         except (OSError, ValueError, IndexError):
             pass
@@ -205,8 +227,27 @@ def host_pid(cfg):
     exposes sessions, not threads, and a spin lives in a thread that owns no session."""
     try:
         tgt = cfg.get("target", "docker")
+        root = cfg.get("proc_root") or "/proc"
+        if root != "/proc":
+            # A /proc was supplied, so the server's pid is findable in it - by name, because
+            # nothing on this side can be asked. docker inspect and pgrep both answer about THIS
+            # machine, and a pid they return would index a different kernel's process table.
+            want = cfg.get("process") or "serened"
+            try:
+                for entry in os.scandir(root):
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        with open(f"{entry.path}/comm") as f:
+                            if f.read().strip() == want:
+                                return int(entry.name)
+                    except OSError:
+                        continue
+            except OSError:
+                return None
+            return None
         if tgt == "remote":
-            return None                      # no /proc to read across the wire
+            return None                      # no /proc to read across the wire, and none supplied
         argv = (["docker", "inspect", "-f", "{{.State.Pid}}", cfg["container"]] if tgt == "docker"
                 else ["pgrep", "-x", "-n", cfg.get("process") or "serened"])
         o = subprocess.run(argv, capture_output=True, text=True, timeout=10)
@@ -216,7 +257,7 @@ def host_pid(cfg):
         return None
 
 
-def threads(pid, prev, prev_t):
+def threads(pid, prev, prev_t, root="/proc"):
     """Per-thread CPU and state, newest first by CPU.
 
     Threads, not the process total. 100% of one core out of 24 reads as "4% busy" at process level
@@ -236,7 +277,7 @@ def threads(pid, prev, prev_t):
     # information and is kept; one that matches is dropped for the tid, which at least identifies
     # the row and is the key perf attributes samples to.
     try:
-        with open(f"/proc/{pid}/comm") as f:
+        with open(f"{root}/{pid}/comm") as f:
             pcomm = f.read().strip()
     except OSError:
         pcomm = ""
@@ -248,7 +289,7 @@ def threads(pid, prev, prev_t):
     # counters actually cover.
     seen = {}
     try:
-        for t in os.scandir(f"/proc/{pid}/task"):
+        for t in os.scandir(f"{root}/{pid}/task"):
             try:
                 with open(f"{t.path}/stat") as f:
                     fields = f.read().rsplit(") ", 1)

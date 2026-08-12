@@ -28,7 +28,8 @@ DEFAULTS = {
     #   local   a process on this machine. psql on the host, du on the host, pid from pgrep.
     #           Needs a psql client here; the container was supplying one before.
     #   remote  reachable only over the wire. The SQL panels work; anything that reads a filesystem
-    #           or /proc does not, and says so rather than rendering an empty box.
+    #           or /proc does not, and says so rather than rendering an empty box - unless
+    #           `proc_root` supplies one, which is what makes a server inside a VM readable.
     "target": "docker",
     "process": "serened",           # what to pgrep for when target = local
     "container": "serenedb",
@@ -38,6 +39,18 @@ DEFAULTS = {
     "database": "postgres",
     "password": "",
     "data": "/var/lib/serenedb",
+    # Where the SERVER's /proc is. "/proc" is this machine's, which is right whenever the server
+    # shares this kernel - a container does, and its pids are visible here.
+    #
+    # A VM does not. Its /proc belongs to another kernel, and reading this one instead does not
+    # fail: pid 1400 exists here too, belonging to something else entirely, so the panels fill with
+    # confident numbers about the wrong process. Point this at a mount of the guest's /proc and
+    # they describe the server again.
+    #
+    # Only the reads ABOUT THE SERVER follow this. Whether kernel symbols resolve, and which agent
+    # is calling the MCP server, are questions about the machine doing the looking, and those keep
+    # reading /proc directly.
+    "proc_root": "/proc",
     "perf_dir": os.path.join(os.environ.get("XDG_CACHE_HOME",
                                             os.path.expanduser("~/.cache")), "serenedash", "perf"),
     "interval": 5.0,
@@ -63,6 +76,7 @@ ENV = {
     "data": "SERENEDB_DATA", "perf_dir": "SERENEDASH_PERF_DIR", "interval": "SERENEDASH_INTERVAL",
     "symbol_paths": "SERENEDASH_SYMBOL_PATHS", "password_command": "SERENEDASH_PASSWORD_COMMAND",
     "target": "SERENEDB_TARGET", "host": "SERENEDB_HOST", "process": "SERENEDB_PROCESS",
+    "proc_root": "SERENEDASH_PROC_ROOT",
     "user": "SERENEDB_USER", "database": "SERENEDB_DATABASE", "mouse": "SERENEDASH_MOUSE",
 }
 

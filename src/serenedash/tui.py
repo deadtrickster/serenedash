@@ -481,7 +481,7 @@ def main():
     # nothing to subtract from and the panel came up empty — for the whole of a first tick that also
     # runs du and parses a capture, which is long enough to look broken rather than pending.
     if hpid:
-        _, _, tprev, tlast = threads(hpid, {}, tlast)
+        _, _, tprev, tlast = threads(hpid, {}, tlast, root=cfg.get("proc_root") or "/proc")
     signal.signal(signal.SIGUSR1, _on_usr1)
     # Turn a kill into an orderly exit so the finally block actually runs. Default SIGTERM/SIGHUP
     # handling ends the process without unwinding, which would leave the terminal on the alternate
@@ -571,8 +571,8 @@ def main():
                     hpid, tprev, tlast = None, {}, 0.0
                 hpid = hpid or host_pid(cfg)
                 if hpid:
-                    thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast)
-                hinfo = hostinfo(hpid, cfg["container"])
+                    thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast, root=cfg.get("proc_root") or "/proc")
+                hinfo = hostinfo(hpid, cfg["container"], root=cfg.get("proc_root") or "/proc")
                 # Voluntary switches per cpu-second: the signal that tells a spin from a block.
                 # A rate, so it needs two samples and the interval between them - which only this
                 # loop knows. tcpu is a share of ONE core, so tcpu/100 * dt is the cpu-seconds the

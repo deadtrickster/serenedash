@@ -48,6 +48,8 @@ from .hazards import HAZARDS
 CFG, _PROV = _config.load_config()
 CONTAINER, PORT, PASSWORD = CFG["container"], CFG["port"], CFG["password"]
 DATA, PERF = CFG["data"], CFG["perf_dir"]
+# Where the server's /proc is. "/proc" unless it is on another kernel - see config.
+PROC_ROOT = CFG.get("proc_root") or "/proc"
 
 
 VERSION = "0.1.0"
@@ -218,9 +220,9 @@ def _threads(window: float = 1.0):
     pid = _pid()
     if not pid:
         return [], 0.0, None
-    _, _, prev, t = system.threads(pid, {}, time.time())
+    _, _, prev, t = system.threads(pid, {}, time.time(), root=PROC_ROOT)
     time.sleep(window)
-    rows, total, _, _ = system.threads(pid, prev, t)
+    rows, total, _, _ = system.threads(pid, prev, t, root=PROC_ROOT)
     return rows, total, pid
 
 
@@ -257,7 +259,7 @@ def storage() -> dict:
     s, err = _sample()
     if err:
         return err
-    return snap.storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER),
+    return snap.storage(s, system.slow(CFG, DATA), system.hostinfo(_pid(), CONTAINER, root=PROC_ROOT),
                         db.temp_files_held(CFG))
 
 
@@ -275,7 +277,7 @@ def memory() -> dict:
     s, err = _sample()
     if err:
         return err
-    return snap.memory(s, system.hostinfo(_pid(), CONTAINER))
+    return snap.memory(s, system.hostinfo(_pid(), CONTAINER, root=PROC_ROOT))
 
 
 @server.tool()
@@ -356,7 +358,7 @@ def threads(window: float = 1.0) -> dict:
     if not pid:
         return {"error": f"cannot resolve the host pid for {CONTAINER}"}
     _, _, by_tid = perf.perf_window(PERF)
-    return snap.threads(rows, tcpu, by_tid, system.hostinfo(pid, CONTAINER), window)
+    return snap.threads(rows, tcpu, by_tid, system.hostinfo(pid, CONTAINER, root=PROC_ROOT), window)
 
 
 @server.tool()
@@ -401,7 +403,7 @@ def host() -> dict:
     s, err = _sample()
     if err:
         return err
-    return snap.hostinfo(system.hostinfo(_pid(), CONTAINER), s)
+    return snap.hostinfo(system.hostinfo(_pid(), CONTAINER, root=PROC_ROOT), s)
 
 
 @server.tool()
@@ -504,14 +506,14 @@ def triage(pid: str = "") -> dict:
     # them. One call to threads() with no previous sample returns 0.0 - the counters are there but
     # there is nothing to subtract them from.
     hpid = system.host_pid(CFG)
-    host = system.hostinfo(hpid, CFG.get("container"))
+    host = system.hostinfo(hpid, CFG.get("container"), root=PROC_ROOT)
     tcpu, volps = 0.0, None
     if hpid:
-        _rows, _tot, prev, last = system.threads(hpid, {}, 0.0)
+        _rows, _tot, prev, last = system.threads(hpid, {}, 0.0, root=PROC_ROOT)
         v0 = host.get("vol_switches") or 0
         time.sleep(1.0)
         _rows, tcpu, _cur, now = system.threads(hpid, prev, last)
-        host = system.hostinfo(hpid, CFG.get("container"))
+        host = system.hostinfo(hpid, CFG.get("container"), root=PROC_ROOT)
         cpu_s = (tcpu / 100.0) * max(0.001, now - last)
         if cpu_s > 0.05:
             volps = round(((host.get("vol_switches") or 0) - v0) / cpu_s, 1)

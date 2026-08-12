@@ -937,13 +937,15 @@ def collect(cfg, thread_window=1.0, query_head=400, hist=None):
     """
     s = db.sample(cfg, query_head=query_head)
     pid = system.host_pid(cfg)
-    host = system.hostinfo(pid, cfg["container"])
+    # Where the server's /proc is - this machine's unless it is on another kernel. See config.
+    proc_root = cfg.get("proc_root") or "/proc"
+    host = system.hostinfo(pid, cfg["container"], root=proc_root)
     sz = system.slow(cfg, cfg["data"])
     rows, tcpu = [], 0.0
     if pid:
-        _, _, prev, t0 = system.threads(pid, {}, time.time())
+        _, _, prev, t0 = system.threads(pid, {}, time.time(), root=proc_root)
         time.sleep(thread_window)
-        rows, tcpu, _, _ = system.threads(pid, prev, t0)
+        rows, tcpu, _, _ = system.threads(pid, prev, t0, root=proc_root)
     newest, tops, by_tid = perf.perf_window(cfg["perf_dir"])
 
     # Three more round trips, and they are not on the tick path - the TUI's 5s loop is db.sample().
