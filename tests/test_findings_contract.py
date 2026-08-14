@@ -199,36 +199,57 @@ def test_exposure_is_silent_when_the_metrics_are_unavailable():
     assert sn.bm25_exposure({"available": False, "reason": "sdb_metrics could not be read"}) == []
 
 
-def test_a_spin_is_told_from_a_block_by_yielding_not_by_cpu():
-    """CPU cannot separate them and neither can the thread count. A loop that never blocks never
-    yields, so voluntary switches per cpu-second collapse toward zero - 13 on the 55-hour hang -
-    while anything waiting on IO, a lock or a condvar reads in the thousands."""
+# (cpu%, name, state, tid, voluntary switches per cpu-second) - what threads() now returns.
+def _t(cpu, tid, switches):
+    return (cpu, f"tid {tid}", "R" if cpu > 90 else "S", str(tid), switches)
+
+
+# The live measurement that caught the scope bug: three threads pinned with ZERO switches, sitting
+# inside a process whose average read 171.6 because eighteen others were ingesting.
+REAL_SPIN = [_t(99.9, 2032003, 0.0), _t(99.9, 2031989, 0.0), _t(99.9, 2031986, 0.0),
+             _t(14.0, 2032000, 283.3), _t(12.0, 2097087, 955.6), _t(11.7, 2032002, 291.4)]
+
+
+def test_a_spin_is_told_from_a_block_per_thread_not_per_process():
+    """The bug this rule shipped with. Computed across the process it read 171.6 switches per
+    cpu-second and reported "not a spin" about a statement 49 hours into one, because the eighteen
+    threads doing ordinary ingestion drown out the three that are pinned. A spin is a property of a
+    thread, and the fix was the denominator, not the threshold."""
     from serenedash import snapshot as sn
-    spin = sn.spin_suspected({"volps": [12.0, 13.0, 13.0]}, 503)
-    assert len(spin) == 1 and spin[0]["switches_per_cpu_s"] == 13.0
-    assert spin[0]["cpu_cores_busy"] == 5.0
-    assert sn.spin_suspected({"volps": [3000, 2800, 3100]}, 503) == [], "blocked work is not a spin"
+    got = sn.spin_suspected(REAL_SPIN)
+    assert len(got) == 1
+    assert got[0]["threads_pinned"] == 3
+    assert set(got[0]["tids"]) == {"2032003", "2031989", "2031986"}
+    assert got[0]["worst_switches_per_cpu_s"] == 0.0
 
 
-def test_an_idle_server_is_not_a_spin():
-    # Zero switches and zero CPU is a server doing nothing, which trips a switches-only rule.
+def test_busy_threads_that_yield_are_not_a_spin():
     from serenedash import snapshot as sn
-    assert sn.spin_suspected({"volps": [0, 0, 0]}, 4) == []
+    busy = [_t(99.0, 1, 3000.0), _t(97.0, 2, 2500.0), _t(30.0, 3, 900.0)]
+    assert sn.spin_suspected(busy) == []
 
 
-def test_one_sample_is_not_enough_to_call_a_spin():
+def test_a_thread_that_does_not_yield_but_is_not_pinned_is_not_a_spin():
+    # Low CPU and no switches is a thread that is simply not doing much, not one in a loop.
     from serenedash import snapshot as sn
-    assert sn.spin_suspected({"volps": [1.0, 2.0]}, 503) == [], "a tick can catch anything mid-yield"
-    assert sn.spin_suspected({}, 503) == []
-    assert sn.spin_suspected(None, 503) == []
+    assert sn.spin_suspected([_t(4.0, 1, 0.0), _t(2.0, 2, 0.0)]) == []
+
+
+def test_no_threads_and_no_rate_produce_nothing():
+    from serenedash import snapshot as sn
+    assert sn.spin_suspected([]) == []
+    assert sn.spin_suspected(None) == []
+    # A row with no rate yet - first sample after a restart - must not be read as zero.
+    assert sn.spin_suspected([_t(99.9, 1, None)]) == []
 
 
 def test_the_spin_finding_reports_a_shape_and_not_a_cause():
     # A tight loop doing useful arithmetic looks identical. Naming a cause here would be the same
-    # error as the checkpoint finding's "the horizon keeps being re-pinned" - a plausible mechanism
-    # asserted from a measurement that does not reach it.
+    # error as the checkpoint finding's "the horizon keeps being re-pinned".
     from serenedash import snapshot as sn
-    f = sn.spin_suspected({"volps": [1.0, 1.0, 1.0]}, 200)[0]
+    f = sn.spin_suspected(REAL_SPIN)[0]
     assert "SHAPE, NOT A CAUSE" in f["detail"]
     assert f["threshold_is_chosen"] is True
     assert "perf-snap" in f["fix"], "it has to name the measurement that would settle it"
+    assert "PER THREAD" in f["detail"], "and say why the scope matters, since that was the bug"
+

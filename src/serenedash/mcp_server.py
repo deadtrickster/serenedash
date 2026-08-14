@@ -505,18 +505,22 @@ def triage(pid: str = "") -> dict:
     # CPU and the switch rate are both RATES, so both need two reads and the interval between
     # them. One call to threads() with no previous sample returns 0.0 - the counters are there but
     # there is nothing to subtract them from.
+    # PER THREAD. This computed the switch rate across the whole process and was wrong the first
+    # time anything else was busy: measured 2026-08-14, three threads at 99.9% with zero voluntary
+    # switches inside a process reading 171.6 per cpu-second, and this branch called it "not a
+    # spin" about a statement 49 hours into one. A spin is a property of a thread.
     hpid = system.host_pid(CFG)
-    host = system.hostinfo(hpid, CFG.get("container"), root=PROC_ROOT)
-    tcpu, volps = 0.0, None
+    # `trows` not `rows`: `rows` already holds the pg_stat_activity statements the convoy check
+    # indexes by age, and shadowing it made that comparison subtract an int from a thread name.
+    tcpu, trows = 0.0, []
     if hpid:
-        _rows, _tot, prev, last = system.threads(hpid, {}, 0.0, root=PROC_ROOT)
-        v0 = host.get("vol_switches") or 0
-        time.sleep(1.0)
-        _rows, tcpu, _cur, now = system.threads(hpid, prev, last)
-        host = system.hostinfo(hpid, CFG.get("container"), root=PROC_ROOT)
-        cpu_s = (tcpu / 100.0) * max(0.001, now - last)
-        if cpu_s > 0.05:
-            volps = round(((host.get("vol_switches") or 0) - v0) / cpu_s, 1)
+        _r, _tot, prev, last = system.threads(hpid, {}, 0.0, root=PROC_ROOT)
+        time.sleep(2.0)
+        trows, tcpu, _cur, _now = system.threads(hpid, prev, last, root=PROC_ROOT)
+    pinned = [r for r in trows
+              if len(r) > 4 and r[0] >= snap.SPIN_CPU and r[4] is not None
+              and r[4] < snap.SPIN_SWITCHES]
+    volps = min((r[4] for r in pinned), default=None)
 
     age = row[3] or 0
     near = [r for r in rows if abs((r[3] or 0) - age) <= snap.CONVOY_SPREAD_S]
@@ -526,7 +530,11 @@ def triage(pid: str = "") -> dict:
         "connection_age_s": row[4],
         "process_cpu_percent_of_one_core": round(tcpu, 1),
         "cores_busy": round(tcpu / 100.0, 1),
-        "voluntary_switches_per_cpu_s": volps,
+        "threads_pinned_and_not_yielding": len(pinned),
+        "pinned_tids": [r[3] for r in pinned],
+        "worst_switches_per_cpu_s": volps,
+        "note": "the switch rate is PER THREAD. Measured across the process it reads as yielding "
+                "whenever anything else on the server is busy, which hid a 49-hour spin.",
         "statements_starting_together": len(near),
     }
 
@@ -552,16 +560,17 @@ def triage(pid: str = "") -> dict:
             "next": ("cancel the FORCE CHECKPOINT - it is interruptible and releases the rest"
                      if forced else "triage the oldest member of the convoy"),
         }
-    if volps is not None and volps < snap.SPIN_SWITCHES and tcpu >= snap.SPIN_CPU:
+    if pinned:
         return {
             "verdict": "spinning",
             "confidence": "moderate",
             "evidence": ev,
-            "reasoning": f"{round(tcpu / 100.0, 1)} core(s) busy at {volps} voluntary context "
-                         f"switches per cpu-second, against a threshold of {snap.SPIN_SWITCHES}. A "
-                         f"loop that never blocks never yields; anything waiting on IO or a lock "
-                         f"reads in the thousands. This is a SHAPE - useful arithmetic in a tight "
-                         f"loop looks the same from here.",
+            "reasoning": f"{len(pinned)} thread(s) are each above {snap.SPIN_CPU}% of one core "
+                         f"with at most {volps} voluntary context switches per cpu-second, against "
+                         f"a threshold of {snap.SPIN_SWITCHES}. A loop that never blocks never "
+                         f"yields; anything waiting on IO or a lock reads in the hundreds or "
+                         f"thousands. This is a SHAPE - useful arithmetic in a tight loop looks the "
+                         f"same from here.",
             "what_would_settle_it": "two perf captures a few minutes apart. One dominant symbol AND "
                                     "no change between them is a spin; a profile that moves is work.",
             "next": "sudo ./perf-snap.sh --container "
@@ -572,9 +581,8 @@ def triage(pid: str = "") -> dict:
             "verdict": "working, or slow - not a spin",
             "confidence": "moderate",
             "evidence": ev,
-            "reasoning": f"CPU is busy and the process IS yielding "
-                         f"({volps} switches per cpu-second), which is what work blocked on IO, "
-                         f"locks or condvars looks like.",
+            "reasoning": "CPU is busy and no single thread is both pinned and refusing to yield, "
+                         "which is what work blocked on IO, locks or condvars looks like.",
             "what_would_settle_it": "explain(pid=...) for what the planner chose, and profile() for "
                                     "where the time goes.",
             "next": f"explain(pid='{row[5]}')",

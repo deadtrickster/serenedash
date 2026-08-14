@@ -689,40 +689,49 @@ def search_findings(sr):
     return out
 
 
-def spin_suspected(hist, tcpu, host=None):
-    """CPU burning without yielding. The shape of a loop that is not making progress.
+def spin_suspected(thr, hist=None, tcpu=None, host=None):
+    """Threads pinned and not yielding. Per THREAD, which is the scope a spin has.
 
-    Takes the recorded series rather than one reading, because a single tick catches a process
-    mid-anything; a spin holds the shape. Reports the SHAPE and names the measurement that would
-    settle it - a tight loop doing useful arithmetic looks exactly like this, and only a profile
-    tells them apart.
+    This rule shipped computing switches per cpu-second across the whole process, and it was wrong
+    the first time anything else was busy. Measured on a live recurrence 2026-08-14: three threads
+    at 99.9% with ZERO voluntary switches over three seconds, while the process-wide rate read 171.6
+    because eighteen other threads were ingesting and yielding constantly. It reported "not a spin"
+    about a statement that had been spinning for 49 hours.
+
+    That is the same error the doctrine at the top of this project warns about - a rate against the
+    wrong base - so the fix is not a better threshold, it is the right denominator. A thread that is
+    pinned and never yields reads 0 here no matter how busy the rest of the server is.
+
+    Reports the SHAPE and names what would settle it: a tight loop doing useful arithmetic looks
+    exactly like this.
     """
-    vps = [v for v in (hist or {}).get("volps", []) if v is not None]
-    if len(vps) < 3 or (tcpu or 0) < SPIN_CPU:
+    pinned = [r for r in (thr or [])
+              if len(r) > 4 and r[0] >= SPIN_CPU and r[4] is not None and r[4] < SPIN_SWITCHES]
+    if not pinned:
         return []
-    recent = vps[-3:]
-    if max(recent) >= SPIN_SWITCHES:
-        return []
-    cores = round((tcpu or 0) / 100.0, 1)
+    tids = [r[3] for r in pinned]
+    worst = max(r[4] for r in pinned)
     return [{
         "kind": "cpu",
-        "what": f"{cores} core(s) busy with almost no yielding - a spin, not work",
-        "detail": f"voluntary context switches are {recent[-1]:.0f} per cpu-second over the last "
-                  f"{len(recent)} samples (max {max(recent):.0f}), against a threshold of "
-                  f"{SPIN_SWITCHES}. A loop that never blocks does not yield, so this collapses "
-                  f"toward zero; anything waiting on IO, a lock or a condvar yields constantly and "
-                  f"reads in the thousands. Same cpu%, same thread count, opposite diagnosis - and "
-                  f"no other cheap signal separates them. Measured on the 55-hour hang here: 13. "
-                  f"THIS IS A SHAPE, NOT A CAUSE: a tight loop doing useful arithmetic looks "
-                  f"identical.",
-        "switches_per_cpu_s": recent[-1],
-        "samples": len(recent),
-        "cpu_cores_busy": cores,
+        "what": f"{len(pinned)} thread(s) pinned at ~100% and not yielding - a spin, not work",
+        "detail": f"tids {', '.join(str(t) for t in tids)} are each above {SPIN_CPU}% of one core "
+                  f"with at most {worst:.1f} voluntary context switches per cpu-second, against a "
+                  f"threshold of {SPIN_SWITCHES}. A loop that never blocks never yields; anything "
+                  f"waiting on IO, a lock or a condvar yields constantly and reads in the hundreds "
+                  f"or thousands. Measured PER THREAD on purpose: the process-wide rate hides this "
+                  f"completely whenever anything else on the server is busy - on 2026-08-14 three "
+                  f"threads at 0.0 sat inside a process reading 171.6. THIS IS A SHAPE, NOT A "
+                  f"CAUSE: a tight loop doing useful arithmetic looks identical.",
+        "tids": tids,
+        "threads_pinned": len(pinned),
+        "worst_switches_per_cpu_s": worst,
         "threshold_switches": SPIN_SWITCHES,
+        "threshold_cpu": SPIN_CPU,
         "threshold_is_chosen": True,
         "fix": "take a profile - `sudo ./perf-snap.sh --container <name>` - and read which symbol "
-               "holds it. If one symbol dominates and the profile does not change between two "
-               "captures minutes apart, it is a spin and the statement will not finish on its own.",
+               "holds those tids. One dominant symbol AND no change between two captures minutes "
+               "apart is a spin, and a spin whose loop never polls cannot be cancelled: "
+               "pg_terminate_backend returns true and the statement keeps running.",
         "verify": "select pid, round(extract(epoch from (now()-query_start))) age_s, query "
                   "from pg_stat_activity where state = 'active' order by query_start",
     }]
@@ -832,7 +841,7 @@ def bm25_exposure(sr):
     return out
 
 
-def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
+def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None, thr=None):
     """Conditions that were MEASURED, each with the numbers behind it and how to check it.
 
     Not a severity list and not a verdict: an entry is here because a specific comparison came out a
@@ -921,7 +930,7 @@ def findings(s, sz, host, hist=None, sr=None, held=None, tcpu=None):
     out.extend({"kind": "search", **f} for f in search_findings(sr))
     out.extend(bm25_exposure(sr))
     out.extend(convoy(s))
-    out.extend(spin_suspected(hist, tcpu, host))
+    out.extend(spin_suspected(thr, hist, tcpu, host))
     # Everything above is a comparison against a threshold that someone chose. These are against
     # the series' own recent past, so they catch the shapes no threshold can: a pool that has been
     # climbing all afternoon is not over any limit until it is.
@@ -957,7 +966,7 @@ def collect(cfg, thread_window=1.0, query_head=400, hist=None):
     prog = db.progress(cfg) if s is not None else None
 
     out = {
-        "findings": findings(s, sz, host, hist, sr=sr, held=held, tcpu=tcpu),
+        "findings": findings(s, sz, host, hist, sr=sr, held=held, tcpu=tcpu, thr=rows),
         "threads": threads(rows, tcpu, by_tid, host, thread_window),
         "profile": profile(newest, tops),
         "host": hostinfo(host, s),

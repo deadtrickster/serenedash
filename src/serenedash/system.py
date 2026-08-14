@@ -295,7 +295,20 @@ def threads(pid, prev, prev_t, root="/proc"):
                     fields = f.read().rsplit(") ", 1)
                 comm = fields[0].split("(", 1)[1]
                 rest = fields[1].split()
-                seen[t.name] = (int(rest[11]) + int(rest[12]), rest[0], comm)
+                # Voluntary switches per THREAD, in the same pass. The spin rule used to compute
+                # this across the whole process, which reads as "yielding" whenever anything else
+                # on the server is busy - measured 2026-08-14: three threads at 99.9% with zero
+                # switches, and a process-wide rate of 171.6 that called it not a spin.
+                vol = 0
+                try:
+                    with open(f"{t.path}/status") as f:
+                        for ln in f:
+                            if ln.startswith("voluntary_ctxt_switches:"):
+                                vol = int(ln.split()[1])
+                                break
+                except (OSError, ValueError, IndexError):
+                    pass
+                seen[t.name] = (int(rest[11]) + int(rest[12]), rest[0], comm, vol)
             except (OSError, IndexError, ValueError):
                 continue
     except OSError:
@@ -307,12 +320,15 @@ def threads(pid, prev, prev_t, root="/proc"):
     now = time.time()
     dt = now - prev_t if prev_t else 0.0
     total = 0.0
-    for tid, (ticks, st, comm) in seen.items():
-        cur[tid] = ticks
-        if prev and tid in prev and dt > 0:
+    for tid, (ticks, st, comm, vol) in seen.items():
+        # (ticks, switches) so the caller can rate BOTH against the same interval.
+        cur[tid] = (ticks, vol)
+        was = prev.get(tid) if prev else None
+        was_ticks = was[0] if isinstance(was, tuple) else was
+        if was_ticks is not None and dt > 0:
             # Clamped at one core: the remaining error is sub-tick quantisation, and a bar that
             # overfills its own scale is a worse lie than a rounded 100.0%.
-            pct = min(100.0, (ticks - prev[tid]) / os.sysconf("SC_CLK_TCK") / dt * 100)
+            pct = min(100.0, (ticks - was_ticks) / os.sysconf("SC_CLK_TCK") / dt * 100)
             # Summed over EVERY thread, before the display filter. `top` says serened is at 300% and
             # the rows say 8%, 6%, 6% — both true, three cores spread over a hundred threads, and
             # with no total on screen the panel looked like it was missing the work.
@@ -320,7 +336,11 @@ def threads(pid, prev, prev_t, root="/proc"):
             if pct > 1:
                 name = (comm[:18] if comm != pcomm else
                         "main" if tid == str(pid) else f"tid {tid}")
-                out.append((pct, name, st, tid))
+                # Switches per cpu-second for THIS thread. A thread that is pinned and not yielding
+                # reads 0 here however busy the rest of the process is.
+                dv = vol - (was[1] if isinstance(was, tuple) else 0)
+                cpu_s = (pct / 100.0) * dt
+                out.append((pct, name, st, tid, round(dv / cpu_s, 1) if cpu_s > 0.01 else None))
     # Every thread that cleared the filter, not the top 32: the main panel slices to what fits, and
     # the `t` view wants the rest. A cap here would have silently limited both.
     return sorted(out, reverse=True), total, cur, now

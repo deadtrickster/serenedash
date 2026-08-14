@@ -77,6 +77,10 @@ def test_the_search_engine_series_are_recorded():
     from serenedash import tui
     src = inspect.getsource(tui)
     assert 'hist["wal"]' in src, "the WAL is not recorded"
+    # spinners, not a process-wide switch rate: the rate averaged across the process reads as
+    # yielding whenever anything else is busy, which hid a 49-hour spin on 2026-08-14.
+    assert 'hist["spinners"]' in src, "the spinner count is not recorded"
+    assert '"volps"' not in src, "the process-wide rate was the wrong scope and must not come back"
     assert 'f"ix:{rel}:{name}"' in src, "the per-index series are not recorded"
     for metric in ("deleted", "consolidation_ms", "segments"):
         assert f'"{metric}"' in src, f"{metric} is not recorded"

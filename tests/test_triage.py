@@ -22,7 +22,7 @@ LONE = [("active", "WITH lex AS (SELECT id, BM25(", 68209, 199000, 199000, "1265
 @pytest.fixture
 def evidence(monkeypatch):
     """Point the tool at fabricated /proc and pg_stat_activity."""
-    def setup(rows, cpu, vol_delta):
+    def setup(rows, cpu, switches_per_cpu_s):
         monkeypatch.setattr(m, "_sample", lambda **kw: ({"queries": rows}, None))
         monkeypatch.setattr(m.db, "full_queries", lambda _cfg: rows)
         monkeypatch.setattr(m.system, "host_pid", lambda _cfg: 4242)
@@ -30,17 +30,22 @@ def evidence(monkeypatch):
 
         def hostinfo(_pid, _c, root="/proc"):
             calls["n"] += 1
-            return {"pid": 4242, "vol_switches": 0 if calls["n"] == 1 else vol_delta}
+            return {"pid": 4242, "vol_switches": 0 if calls["n"] == 1 else switches_per_cpu_s}
         monkeypatch.setattr(m.system, "hostinfo", hostinfo)
         # (rows, total, cur, now) - second call carries the cpu and a 1s interval.
-        seq = iter([([], 0.0, {}, 100.0), ([], cpu, {}, 101.0)])
+        # A thread row is (cpu%, name, state, tid, switches per cpu-second) - PER THREAD, which is
+        # the scope the spin branch reads. Computed across the process it reported "not a spin"
+        # about a 49-hour spin, because the threads doing ordinary work drown the pinned ones out.
+        trows = [(cpu / 2, "tid 1", "R", "1", float(switches_per_cpu_s)),
+                 (cpu / 2, "tid 2", "R", "2", float(switches_per_cpu_s))] if cpu > 10 else []
+        seq = iter([([], 0.0, {}, 100.0), (trows, cpu, {}, 101.0)])
         monkeypatch.setattr(m.system, "threads", lambda *a, **kw: next(seq))
         monkeypatch.setattr(m.time, "sleep", lambda _s: None)
     return setup
 
 
 def test_a_convoy_is_reported_as_blocked_and_names_the_checkpoint(evidence):
-    evidence(CONVOY, 5.0, 500)
+    evidence(CONVOY, 5.0, 500.0)
     out = m.triage()
     assert out["verdict"] == "blocked - a convoy"
     assert out["confidence"] == "strong", "a FORCE CHECKPOINT among them makes it strong"
@@ -51,10 +56,11 @@ def test_a_convoy_is_reported_as_blocked_and_names_the_checkpoint(evidence):
 
 def test_a_lone_statement_burning_cpu_without_yielding_is_a_spin(evidence):
     # 5 cores busy, 13 voluntary switches per cpu-second: the 55-hour hang.
-    evidence(LONE, 503.0, 65)
+    evidence(LONE, 503.0, 13)
     out = m.triage()
     assert out["verdict"] == "spinning"
-    assert out["evidence"]["voluntary_switches_per_cpu_s"] < 50
+    assert out["evidence"]["worst_switches_per_cpu_s"] < 50
+    assert out["evidence"]["threads_pinned_and_not_yielding"] >= 1
     assert "perf-snap.sh" in out["next"], "it has to name what would settle it"
 
 
@@ -76,7 +82,7 @@ def test_idle_but_old_is_reported_weakly_rather_than_guessed(evidence):
 def test_triage_never_reports_a_cause(evidence):
     # Every verdict is a shape. A tight loop doing useful arithmetic looks like a spin from here,
     # and the tree must not promote a shape into a diagnosis.
-    for rows, cpu, vol in ((CONVOY, 5.0, 500), (LONE, 503.0, 65), (LONE, 503.0, 40000)):
+    for rows, cpu, vol in ((CONVOY, 5.0, 500.0), (LONE, 503.0, 13), (LONE, 503.0, 40000)):
         evidence(rows, cpu, vol)
         out = m.triage()
         assert "what_would_settle_it" in out, f"{out['verdict']} claims certainty it does not have"

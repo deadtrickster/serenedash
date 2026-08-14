@@ -369,7 +369,7 @@ def export(a, cfg, lines, s, sz, hist, perf, thr, tcpu, hinfo, sea, held, w):
              ("profile", profile_frame(perf, col, w, 0)),
              ("host", host_frame(hinfo, s, col, w, 0)),
              ("findings", findings_frame(
-                 [*snap.findings(s, sz, hinfo, None, sr=snap.search(sea), held=held),
+                 [*snap.findings(s, sz, hinfo, None, sr=snap.search(sea), held=held, thr=thr),
                   *snap.setup_findings(*doctor(cfg, a.perf_dir))], col, w, 0, 0, 44)),
              ("legend", legend_frame(col, w, 0))]
     when = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -475,7 +475,6 @@ def main():
     # frame for a move that lands on the same row saying the same thing is pure heat.
     mouse = cfg["mouse"] and not a.once and sys.stdout.isatty()
     tip, tipkey, tipon, tipage, mpos = None, None, False, 0, (0, 0)
-    vprev = None                     # (voluntary switch count, when) for the rate above
     hpid = host_pid(cfg)
     # Prime the tick counters before the first frame. Percentages are deltas, so a cold start has
     # nothing to subtract from and the panel came up empty — for the whole of a first tick that also
@@ -571,20 +570,19 @@ def main():
                     hpid, tprev, tlast = None, {}, 0.0
                 hpid = hpid or host_pid(cfg)
                 if hpid:
-                    thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast, root=cfg.get("proc_root") or "/proc")
+                    thr, tcpu, tprev, tlast = threads(hpid, tprev, tlast,
+                                                      root=cfg.get("proc_root") or "/proc")
                 hinfo = hostinfo(hpid, cfg["container"], root=cfg.get("proc_root") or "/proc")
-                # Voluntary switches per cpu-second: the signal that tells a spin from a block.
-                # A rate, so it needs two samples and the interval between them - which only this
-                # loop knows. tcpu is a share of ONE core, so tcpu/100 * dt is the cpu-seconds the
-                # process actually consumed over the tick, and the ratio is independent of how many
-                # threads were busy.
-                vol, vnow = hinfo.get("vol_switches") or 0, time.time()
-                if vprev and vol >= vprev[0] and vnow > vprev[1]:
-                    cpu_s = (tcpu / 100.0) * (vnow - vprev[1])
-                    hist["volps"] = (hist.get("volps", [])
-                                     + [round((vol - vprev[0]) / cpu_s, 1) if cpu_s > 0.05
-                                        else 0.0])[-HIST:]
-                vprev = (vol, vnow)
+                # How many threads are pinned AND not yielding. This used to record the switch
+                # rate across the whole process, which is the wrong scope: measured 2026-08-14,
+                # three threads at 99.9% with zero switches sat inside a process reading 171.6,
+                # because eighteen others were ingesting and yielding constantly. threads() now
+                # carries the rate per thread, so the series is a count of spinners - which is the
+                # thing worth trending anyway, since one appearing is the event.
+                hist["spinners"] = (hist.get("spinners", []) + [sum(
+                    1 for r in thr
+                    if len(r) > 4 and r[0] >= snap.SPIN_CPU
+                    and r[4] is not None and r[4] < snap.SPIN_SWITCHES)])[-HIST:]
                 for key, val in (("cpu", tcpu), ("rss", hinfo.get("rss") or 0),
                                  ("swap", hinfo.get("swap") or 0)):
                     hist[key] = (hist.get(key, []) + [val])[-HIST:]
@@ -759,7 +757,7 @@ def main():
                 # The same list `status()` returns, from the data this tick already has. One
                 # producer, so the screen and the MCP tool cannot disagree about what tripped.
                 try:
-                    hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea),
+                    hazards = snap.findings(s, sz, hinfo, hist, sr=snap.search(sea), thr=thr,
                                             held=held, tcpu=tcpu)
                 except Exception:                                # noqa: BLE001
                     hazards = []      # a findings screen must not be able to take the frame down
