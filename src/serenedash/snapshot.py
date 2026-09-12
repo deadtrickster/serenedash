@@ -345,8 +345,9 @@ def threads(rows, tcpu, by_tid, host, window):
         "threads": [
             {"tid": tid, "name": name, "cpu_percent_of_one_core": round(pct, 1),
              "state": st, "blocked_in_io": st == "D",
+             "switches_per_cpu_s": sw,
              "symbol": (by_tid.get(tid) or [None])[0]}
-            for pct, name, st, tid in rows
+            for pct, name, st, tid, sw in rows
         ],
     }
 
