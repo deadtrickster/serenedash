@@ -129,7 +129,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install -e ".[browser]"
+      - run: pip install -e ".[browser,mcp]"
       # Chromium only. Firefox and WebKit would triple the download to test a page whose whole
       # surface is an <svg>, an EventSource and one <input>.
       - run: playwright install --with-deps chromium
